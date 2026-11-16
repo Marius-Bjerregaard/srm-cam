@@ -166,3 +166,26 @@ def test_a_few_seconds_in_the_estimate_still_speaks():
     c.progress("a", 0.01)
     s = c.snapshot()
     assert s["step_left_s"] == pytest.approx(198.0)
+
+
+def test_a_step_run_again_starts_its_bar_and_time_from_nothing():
+    """"Cut the traces again": the same step, a second time. It used to
+    keep the first pass's place on its path and sit at the end."""
+    t = [0.0]
+    c = RunClock([("a", "A", 100), ("b", "B", 300)], now=lambda: t[0])
+    c.step("a", "running"); t[0] = 100; c.step("a", "done")
+    c.step("b", "running")
+    t[0] = 400
+    c.progress("b", 0.99)
+    c.step("b", "done")
+    c.wait(True); t[0] = 1000; c.wait(False)       # looked at the board
+    c.step("b", "running")                         # ...and cut it again
+    s = c.snapshot()
+    assert s["step_fraction"] == 0.0
+    assert s["step_elapsed_s"] == 0.0
+    assert s["label"] == "B"
+    t[0] = 1150
+    c.progress("b", 0.5)
+    s = c.snapshot()
+    assert s["step_fraction"] == pytest.approx(0.5)
+    assert s["step_left_s"] == pytest.approx(150.0)
