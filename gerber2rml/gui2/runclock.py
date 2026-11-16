@@ -60,7 +60,13 @@ class RunClock:
             return
         t = self._now()
         if state == "running":
+            # A step can run more than once - the traces cut again, deeper,
+            # from the check. Each time it starts from nothing: what the
+            # last pass took and how far it got are not this one's.
             s["state"], s["t0"] = "running", t
+            s["took"] = None
+            s.pop("frac", None)
+            s.pop("waited", None)
             return
         if s["state"] == "running" and s["t0"] is not None:
             s["took"] = max(0.0, t - s["t0"] - self._wait_inside(s))
