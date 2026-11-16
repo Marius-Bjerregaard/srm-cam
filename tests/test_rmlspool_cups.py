@@ -136,14 +136,48 @@ def test_mill_uri_is_found_in_lpinfo():
     assert rmlspool.cups_mill_uris("network ipp\n") == []
 
 
-def test_setup_makes_an_enabled_raw_queue(monkeypatch):
+REFUSED = (1, "", "lpadmin: Forbidden")
+
+
+def test_setup_makes_an_enabled_raw_queue_with_no_password_for_an_admin():
+    """A macOS administrator is in _lpadmin: CUPS takes the commands as they
+    are. No sudo, no dialog - the setup used to ask for a password twice."""
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): (0, "", ""),
+                   ("cupsenable",): (0, "", ""), ("cupsaccept",): (0, "", "")})
+    assert rmlspool.setup_mill_queue(run=run, say=lambda m: None,
+                                     admin="gui") == "SRM-20"
+    argvs = [c[0] for c in run.calls]
+    assert argvs[1] == ["lpadmin", "-p", "SRM-20", "-E", "-v",
+                        "usb://Roland%20DG/SRM-20?serial=ZHA1234", "-m", "raw"]
+    assert argvs[2:] == [["cupsenable", "SRM-20"], ["cupsaccept", "SRM-20"]]
+    assert not any(a[0] in ("sudo", "osascript") for a in argvs)
+
+
+def test_setup_without_a_model_when_cups_refuses_raw_still_asks_nothing():
+    class NoRaw(FakeRun):
+        def __call__(self, argv, **kw):
+            if argv[0] == "lpadmin" and "raw" in argv:
+                self.calls.append((list(argv), None))
+                return subprocess.CompletedProcess(
+                    argv, 1, b"", b"lpadmin: raw queues are not supported")
+            return super().__call__(argv, **kw)
+
+    run = NoRaw({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): (0, "", ""),
+                 ("cupsenable",): (0, "", ""), ("cupsaccept",): (0, "", "")})
+    rmlspool.setup_mill_queue(run=run, say=lambda m: None, admin="gui")
+    argvs = [c[0] for c in run.calls]
+    assert [a for a in argvs if a[0] == "lpadmin"][-1][-2:] != ["-m", "raw"]
+    assert not any(a[0] in ("sudo", "osascript") for a in argvs)
+
+
+def test_setup_in_a_terminal_falls_back_to_sudo_when_refused(monkeypatch):
     monkeypatch.setattr(rmlspool.os, "geteuid", lambda: 501, raising=False)
-    run = FakeRun({("lpinfo",): (0, LPINFO, ""),
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): REFUSED,
                    ("sudo",): (0, "", "")})
     assert rmlspool.setup_mill_queue(run=run, say=lambda m: None) == "SRM-20"
     argvs = [c[0] for c in run.calls]
-    assert argvs[1] == ["sudo", "lpadmin", "-p", "SRM-20", "-E", "-v",
-                        "usb://Roland%20DG/SRM-20?serial=ZHA1234", "-m", "raw"]
+    assert ["sudo", "lpadmin", "-p", "SRM-20", "-E", "-v",
+            "usb://Roland%20DG/SRM-20?serial=ZHA1234", "-m", "raw"] in argvs
     assert ["sudo", "cupsenable", "SRM-20"] in argvs
     assert ["sudo", "cupsaccept", "SRM-20"] in argvs
 
@@ -179,23 +213,26 @@ def test_stop_purges_cups_then_still_aborts_over_the_arduino(monkeypatch,
                    "send_abort"]
 
 
-def test_setup_from_the_app_asks_once_through_the_macos_dialog():
-    """The app has no terminal: one osascript call, macOS's own password
-    dialog, every admin step inside it."""
-    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("osascript",): (0, "", "")})
+def test_setup_from_the_app_asks_once_when_it_has_to_ask_at_all():
+    """Not an administrator: CUPS refuses, and macOS's own password dialog
+    comes up - once, with both forms of lpadmin inside it. It used to come
+    up a second time whenever the first form was the one refused."""
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): REFUSED,
+                   ("osascript",): (0, "", "")})
     rmlspool.setup_mill_queue(run=run, say=lambda m: None, admin="gui")
     argvs = [c[0] for c in run.calls]
     assert argvs[0][:3] == ["lpinfo", "--include-schemes", "usb"]
-    assert len(argvs) == 2 and argvs[1][:2] == ["osascript", "-e"]
-    script = argvs[1][2]
+    asked = [a for a in argvs if a[0] == "osascript"]
+    assert len(asked) == 1
+    script = asked[0][2]
     assert script.endswith("with administrator privileges")
-    for step in ("lpadmin -p SRM-20 -E -v", "-m raw", "cupsenable SRM-20",
+    for step in ("lpadmin -p SRM-20 -E -v", "-m raw ||", "cupsenable SRM-20",
                  "cupsaccept SRM-20"):
         assert step in script
 
 
 def test_a_cancelled_password_dialog_is_not_retried():
-    run = FakeRun({("lpinfo",): (0, LPINFO, ""),
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): REFUSED,
                    ("osascript",): (1, "", "execution error: User canceled. "
                                            "(-128)")})
     with pytest.raises(SpoolError, match="cancelled"):
@@ -222,11 +259,20 @@ def test_state_of_a_missing_queue():
     assert CupsPrinter("SRM-20", run=run).state()["exists"] is False
 
 
-def test_resume_enables_and_accepts():
-    run = FakeRun({("osascript",): (0, "", "")})
+def test_resume_enables_and_accepts_with_no_password_for_an_admin():
+    run = FakeRun({("cupsenable",): (0, "", ""), ("cupsaccept",): (0, "", "")})
     rmlspool.resume_queue(run=run, admin="gui")
-    script = run.calls[0][0][2]
-    assert "cupsenable SRM-20" in script and "cupsaccept SRM-20" in script
+    assert [c[0] for c in run.calls] == [["cupsenable", "SRM-20"],
+                                         ["cupsaccept", "SRM-20"]]
+
+
+def test_resume_asks_once_when_cups_refuses():
+    run = FakeRun({("cupsenable",): (1, "", "cupsenable: Forbidden"),
+                   ("osascript",): (0, "", "")})
+    rmlspool.resume_queue(run=run, admin="gui")
+    asked = [c[0] for c in run.calls if c[0][0] == "osascript"]
+    assert len(asked) == 1
+    assert "cupsenable SRM-20" in asked[0][2] and "cupsaccept SRM-20" in asked[0][2]
 
 
 class _StuckQueue:

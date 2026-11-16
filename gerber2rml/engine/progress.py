@@ -54,7 +54,14 @@ class RunProgress:
     """
 
     def __init__(self, toolpaths, xy_feed, plunge_feed, rapid_feed=DEFAULT_RAPID,
-                 window=400):
+                 window=400, from_start=False, max_dist=None):
+        # ``from_start``: the job is followed from its first move, so the
+        # first match is looked for at the start of the path and not all
+        # along it. ``max_dist`` (mm): a position further than this from the
+        # path is not on it yet - the head on its way there - and is not
+        # matched at all. Without the two, a head coming in over the board
+        # latched on to whatever part of the path it passed nearest.
+        self._from_start, self._max_dist = from_start, max_dist
         self.pts = []                       # path vertices (x, y, z) in order
         self.cum = []                       # cumulative seconds reaching each vertex
         cx = cy = cz = None
@@ -86,7 +93,9 @@ class RunProgress:
         if self.total <= 0.0 or n < 2:
             return (1.0, self.total, 0.0)
         p = (x, y, z)
-        if not self._latched:               # first read: search the whole path
+        if not self._latched and self._from_start:
+            lo, hi = 0, min(n - 1, self._window)
+        elif not self._latched:             # first read: search the whole path
             lo, hi = 0, n - 1
         else:
             lo = self._i
@@ -100,6 +109,9 @@ class RunProgress:
                 best_d = d
                 best_i = k
                 best_t = self.cum[k] + tt * (self.cum[k + 1] - self.cum[k])
+        if (best_d is not None and self._max_dist is not None
+                and best_d > self._max_dist):
+            best_d = None                   # not on the path: no match
         if best_d is not None:
             self._latched = True
             if best_t > self._elapsed:      # forward-only: never rewind the bar

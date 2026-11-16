@@ -281,6 +281,24 @@ when milling both versions out of the sheet on paper shows the same nets on
 the same pieces of copper; if a track at the very edge would end up joined
 to the pour, the whole pass is kept and the checks say which nets.
 
+A board that **is** the sheet - single-sided, the size of the piece of
+stock, which the run cuts with its edge left as it is (`fills_stock`) - has
+no edge of its own either, ticked or not, and its edge pass is left out the
+same way (`window.edgeless`). Before, that pass ran under the bracket's
+tongue and the run refused the board.
+
+The check stays. With a cut-out the run stops before it, so the traces can
+be looked at and cut again - in dragged boxes, or all of them, deeper - while
+the board still lies where it lay. A board left in the sheet has no cut-out
+to stop before, and needs the stop more: it is as big as its sheet, and the
+copper is rarely flat that far. So *Stop after the traces, so I can check
+them* stops after the last job of the side instead (before the flip, and at
+the end), with the same boxes, *Recut*, *Drill the holes again* and
+*Stop here*; the button that ends it reads *They are fine - go on*.
+*Start at ▸ Rework: check the board, recut spots* goes straight to that
+check on a board that has already been run: the stock is found and probed
+again, nothing is cut, and the run waits with the boxes.
+
 The outline is not cut, so it may also hang off the copper: only the work
 has to be on it. The copper check
 and the run both measure what is cut - both layers' copper, the holes, the
@@ -386,6 +404,20 @@ macOS lock file yet, so the build installs `packaging/requirements-build.txt`
 
 An ad-hoc build opens without a warning on the Mac that built it. On another
 Mac the first launch needs right-click → **Open** - unless it is a release.
+
+A plain build is signed with an **Apple Development** certificate when the
+keychain has one (Xcode makes one for a free Apple ID: Settings ▸ Accounts ▸
+Manage Certificates), and ad-hoc otherwise. The difference shows after every
+rebuild: an ad-hoc signature is a hash of that build, so macOS takes each
+one for a new app and asks again for the Documents folder and everything
+else; signed with a certificate the answers keep. The first build signed
+this way asks once more (it is a new identity), and the keychain may ask
+whether `codesign` may use the key - *Always Allow*. `SRM_CAM_ADHOC=1`
+forces an ad-hoc signature.
+
+Setting up the mill's queue asks for no password when the account is an
+administrator (macOS puts those in `_lpadmin`, for whom `lpadmin` simply
+works); otherwise macOS asks once.
 
 ### Signed releases (once per Mac)
 

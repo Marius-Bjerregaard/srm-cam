@@ -47,3 +47,17 @@ def test_empty_job_is_safe():
     rp = RunProgress([], xy_feed=4.0, plunge_feed=1.0)
     assert rp.total == 0.0
     assert rp.update(1.0, 2.0, 3.0) == (1.0, 0.0, 0.0)
+
+
+def test_followed_from_the_start_a_head_on_its_way_in_matches_nothing():
+    from gerber2rml.toolpath import Move
+    path = [[Move(0, 0, 2, rapid=True), Move(0, 0, -0.1), Move(50, 0, -0.1),
+             Move(50, 0, 2, rapid=True)]]
+    p = RunProgress(path, 4.0, 1.0, from_start=True, max_dist=1.5)
+    # High over the far end of the cut on its way to the start: not on it.
+    assert p.update(50, 0, 30)[0] == 0.0
+    assert p.update(25, 0, 30)[0] == 0.0
+    assert p.update(0, 0, 2)[0] == 0.0               # at the start
+    f = p.update(25, 0, -0.1)[0]
+    assert 0.3 < f < 0.7
+    assert p.update(50, 0, 1.0)[0] > f

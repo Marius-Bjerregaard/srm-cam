@@ -425,6 +425,18 @@ def _align_drill(drill, dowels, align_depth, board_thickness,
     return replace(drill, total_depth=align_depth, single_bit=True), align_depth
 
 
+def holes_not_aligned(holes, align_holes, tol=0.02):
+    """``holes`` less those the align job already cuts: a board hole with a
+    reference hole of its own size on it. That is the board's own mounting
+    holes used as the reference holes (engine/mountfid.py) - the align job
+    takes them through the stock, and drilling the board made each of them a
+    second time for nothing."""
+    done = [(x, y, d) for x, y, d in (align_holes or [])]
+    return [h for h in (holes or [])
+            if not any(abs(h[0] - x) <= tol and abs(h[1] - y) <= tol
+                       and abs(h[2] - d) <= tol for x, y, d in done)]
+
+
 def _fiducial_align_drill(drill, fiducials, board_thickness):
     """Drill spec for fiducial holes: through the stock + a small breakthrough,
     single bit. NO bed bite (that is the dowel-only behaviour)."""
@@ -527,7 +539,9 @@ def build_double_sided(folder, out_dir, name, trace=None, drill=None, cutout=Non
     # the flip on the other face, so they are NOT leveled.
     _write(f"{name}_align{ext}", drill_single_bit(lay.align_holes, align_drill),
            align_drill, leveled=True)
-    bottom_drill_files = drill_jobs(lay.holes, drill, f"{name}_bottom_drill", ext=ext)
+    bottom_drill_files = drill_jobs(
+        holes_not_aligned(lay.holes, lay.align_holes), drill,
+        f"{name}_bottom_drill", ext=ext)
     for fname, paths in bottom_drill_files:
         _write(fname, paths, drill, leveled=True)
     _write(f"{name}_bottom_traces{ext}",

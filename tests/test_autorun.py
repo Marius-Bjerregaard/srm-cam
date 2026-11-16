@@ -421,14 +421,56 @@ def test_one_closed_fiducial_is_skipped_and_the_rest_still_fit(monkeypatch):
 
     def locate(x, y, search_um=None):
         tries.append(search_um)
-        if len(tries) == 3:
+        if len(tries) in (3, 4):             # the third hole, both searches
             raise RunFailed("fiducial not found within 1.0 mm of %.1f, %.1f" % (x, y))
         return x, y
     monkeypatch.setattr(run, "_locate", locate)
     assert run._fiducials() is not None
     assert any("Fiducial 3 skipped" in n for n in notes)
     assert any("3 of 4 found" in n for n in notes)
-    assert tries[2] == tries[3] == 1000      # short, once the fit knows where
+    # Short, once the fit knows where - and the full search before a hole
+    # is given up.
+    assert tries[2:] == [1000, 2500, 1000]
+
+
+def test_a_hole_past_the_short_search_is_found_by_the_full_one(monkeypatch):
+    m, ser, board, log, run = _run(True)
+    _pose_for_fiducials(run)
+    board.fiducials = lambda: (BOTTOM, TOP)
+    notes = []
+    log.note = notes.append
+
+    def locate(x, y, search_um=None):
+        if search_um == 1000:
+            raise RunFailed("fiducial not found within 1.0 mm")
+        return x, y
+    monkeypatch.setattr(run, "_locate", locate)
+    assert run._fiducials() is not None
+    assert any("4 of 4 found" in n for n in notes)
+    assert not any("skipped" in n for n in notes)
+
+
+def test_a_rim_reading_does_not_give_the_hole_up(monkeypatch):
+    """The first spot that reads "no copper" turns out to be the rim: the
+    centre finder refuses it, and the search goes on to the hole itself."""
+    from gerber2rml.engine import autorun as arun
+    from gerber2rml.engine.spi_probe import ProbeError
+    m, ser, board, log, run = _run(True)
+    _pose_for_fiducials(run)
+    monkeypatch.setattr(run, "_hop", lambda *a, **k: None)
+    monkeypatch.setattr(stockfind, "reference_at", lambda *a, **k: 0)
+    monkeypatch.setattr(arun, "hole_test", lambda ser, x, y, **k: False)
+    asked = []
+
+    def centre(ser, x, y, should_abort=None):
+        asked.append((x, y))
+        if len(asked) == 1:
+            raise ProbeError("copper contact at the start point")
+        return (x + 0.1, y)
+    monkeypatch.setattr(arun, "find_hole_center", centre)
+    assert run._locate(50.0, 40.0) == pytest.approx((asked[1][0] + 0.1,
+                                                     asked[1][1]))
+    assert len(asked) == 2 and asked[0] == (50.0, 40.0)
 
 
 def test_too_few_fiducials_stop_before_the_top_is_cut(monkeypatch):
@@ -522,3 +564,164 @@ def test_a_whole_stock_board_cutting_past_the_edge_is_still_refused():
                   level=False)
     with pytest.raises(RunFailed, match="hangs off the stock"):
         run.run()
+
+
+class PutBackBoard(Board):
+    """The board of a first run, put back in the mill: the stock's edges
+    now put the job a little off where it was cut."""
+    OFF = (0.7, -0.5)
+
+    def place(self, pose, margin_mm):
+        super().place(pose, margin_mm)
+        self.off = (self.off[0] + self.OFF[0], self.off[1] + self.OFF[1])
+
+    def board_holes(self):
+        return [(*self._p(15, 15), 1.6), (*self._p(25, 15), 1.6)]
+
+    def set_turn(self, t):
+        self.turn = t
+
+
+def _cut_then_put_back(**kw):
+    m, ser, board, log, run = _run(False, level=False)
+    log.check = lambda label, deeper: ("stop", 0.0)
+    with pytest.raises(RunStopped):
+        run.run()                            # drilled and traced, not cut out
+    was = run.rotation.apply(*board._p(15, 15))
+    again, log2 = PutBackBoard(False), Log()
+    log2.check = lambda label, deeper: ("stop", 0.0)
+    notes = []
+    log2.note = notes.append
+    run2 = AutoRun(ser, sm.printer(), again, log2, click_mm=(90, 70),
+                   stock_mm=(100, 80), double=False, runner_opts=FAST,
+                   level=False, start_at=START_AT_CHECK, **kw)
+    return was, again, run2, notes
+
+
+def test_a_board_put_back_for_rework_is_found_by_its_own_holes():
+    was, again, run2, notes = _cut_then_put_back(by_holes=True)
+    with pytest.raises(RunStopped):
+        run2.run()
+    now = run2.rotation.apply(*again._p(15, 15))
+    assert math.dist(now, was) < 0.1         # where it was cut, not 0.86 off
+    assert again.turn is run2.rotation
+    assert any("found by 2 of its holes" in n for n in notes)
+
+
+def test_without_its_holes_a_board_put_back_goes_by_the_stock():
+    was, again, run2, notes = _cut_then_put_back()
+    with pytest.raises(RunStopped):
+        run2.run()
+    now = run2.rotation.apply(*again._p(15, 15))
+    assert math.dist(now, was) == pytest.approx(math.hypot(0.7, 0.5), abs=0.1)
+
+
+def test_a_board_with_no_holes_to_find_it_by_is_not_cut():
+    was, again, run2, notes = _cut_then_put_back(by_holes=True)
+    again.board_holes = lambda: []
+    with pytest.raises(RunFailed, match="no holes it can be found by"):
+        run2.run()
+
+
+class HoleOnATouch(Board):
+    """A hole exactly where the surface grid's first touch falls (the grid
+    is set 2 mm in from the board's edge)."""
+    def toolpaths(self, key):
+        if key == "drill":
+            return [ring(*self._p(2, 2)), ring(*self._p(25, 15))], 4.0, 1.0
+        return super().toolpaths(key)
+
+
+def test_a_surface_touch_is_moved_off_a_hole(monkeypatch):
+    from gerber2rml.engine import autorun as arun
+    from shapely.geometry import Point
+    m = sm.machine(speedup=1e6, corner=(41300, 27800), angle_deg=1.2,
+                   size=(100000, 80000))
+    ser = spi_probe.open_link("SIM")
+    board, log = HoleOnATouch(False), Log()
+    notes, seen = [], []
+    log.note = notes.append
+    real = arun.level_targets
+
+    def spy(points, zones, reach=None):
+        out = real(points, zones, reach)
+        seen.append((list(points), out, zones))
+        return out
+    monkeypatch.setattr(arun, "level_targets", spy)
+    run = AutoRun(ser, sm.printer(), board, log, click_mm=(90, 70),
+                  stock_mm=(100, 80), double=False, runner_opts=FAST)
+    assert run.run() is True
+    points, targets, zones = seen[0]
+    hole = run.rotation.apply(*board._p(2, 2))
+    assert math.dist(points[0], hole) < 0.01          # the grid asked for it
+    assert math.dist(targets[0], hole) >= 0.8 + 0.4   # and was moved off it
+    assert not any(z.intersects(Point(t)) for z in zones for t in targets)
+    # Only those on a hole moved: this one, and the one a millimetre from
+    # the other hole.
+    other = run.rotation.apply(*board._p(25, 15))
+    for p, t in zip(points, targets):
+        near = min(math.dist(p, hole), math.dist(p, other)) < 1.2
+        assert (t != p) == near
+    assert any("moved off a no-go zone or a cut" in n for n in notes)
+
+
+def test_the_surface_touches_keep_off_holes_and_never_off_traces():
+    m, ser, board, log, run = _run(False, level=False)
+    run.rotation = about(0.0, 0.0, 0.0)
+    from shapely.geometry import Point
+    on_trace, on_hole = Point(board._p(20, 10)), Point(board._p(15, 15))
+    for start in (None, START_AT_CHECK):
+        run.start_at = start
+        zone = run._cut_already("bottom", run.rotation)
+        assert zone.intersects(on_hole) and not zone.intersects(on_trace)
+
+
+class HoleAtTheBracket(Board):
+    """A hole 15 mm in from the stock's corner: where the bracket's one
+    touch for the copper's height comes down."""
+    def toolpaths(self, key):
+        if key == "drill":
+            return [ring(*self._p(15, 15)), ring(*self._p(25, 15))], 4.0, 1.0
+        return super().toolpaths(key)
+
+    def place(self, pose, margin_mm):
+        self.off = (pose.x, pose.y)          # flush in the corner
+
+
+def test_the_height_touch_in_the_bracket_is_moved_off_a_hole(monkeypatch):
+    sm.machine(speedup=1e6, corner=(30000, 20000), angle_deg=0.0,
+               size=(100000, 80000))
+    ser = spi_probe.open_link("SIM")
+    board, log = HoleAtTheBracket(False), Log()
+    notes, touched = [], []
+    log.note = notes.append
+    real = stockfind.from_datum
+
+    def spy(*a, **k):
+        touched.append(k.get("touch"))
+        return real(*a, **k)
+    monkeypatch.setattr(stockfind, "from_datum", spy)
+    run = AutoRun(ser, sm.printer(), board, log, click_mm=(0, 0),
+                  stock_mm=(100, 80), double=False, runner_opts=FAST,
+                  level=False, datum=(30.0, 20.0, "front-left"))
+    run._find_stock("stock")
+    assert math.dist(touched[0], (45.0, 35.0)) >= 0.8 + 0.4   # off the hole
+    assert math.dist(touched[0], (45.0, 35.0)) <= 2.0         # and near it
+    assert any("on one of the board's holes" in n for n in notes)
+    # A board with no hole there is touched where it always was.
+    board.toolpaths = lambda key: Board.toolpaths(board, "traces")
+    run._find_stock("stock")
+    assert touched[1] == stockfind.datum_touch((30.0, 20.0), "front-left",
+                                               (100, 80))
+
+
+def test_a_job_reports_how_far_the_head_is_along_its_path():
+    m, ser, board, log, run = _run(False, level=False)
+    seen = {}
+    log.progress = lambda key, f: seen.setdefault(key, []).append(f)
+    assert run.run() is True
+    for key in ("drill", "traces", "cutout"):
+        got = seen.get(key) or []
+        assert got, key                           # it was followed at all
+        assert got == sorted(got)                 # and never went back
+        assert 0.0 <= got[0] and got[-1] <= 1.0

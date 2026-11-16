@@ -280,6 +280,26 @@ class WindowSource(ar.JobSource):
     def set_top_fit(self, t):
         self.gui(lambda: self.w.set_top_fit(t))
 
+    def board_holes(self):
+        return self.gui(lambda: rework_holes(self.w))
+
+    def set_turn(self, t):
+        self.gui(lambda: self.w.set_stock_turn(t))
+
+
+def rework_holes(w):
+    """The holes a single-sided board is found again by when it is put back
+    for rework: ``[(x, y, d)]`` as placed, or [] when it has none that will
+    do. The bit in the spindle then is the one that cut the traces, so it is
+    the one that has to drop into them - mounting holes, or solder holes
+    when the bit is fine enough (engine/mountfid.py)."""
+    from gerber2rml.engine import mountfid
+    b = w.state.board
+    if b is None or w._double or not b.holes or b.outline is None:
+        return []
+    return mountfid.pick(b.holes, b.outline.bounds,
+                         bit_mm=w.cutting_trace().effective_diameter())
+
 
 class _Events(QObject, ar.Events):
     note_sig = Signal(str)
@@ -290,6 +310,7 @@ class _Events(QObject, ar.Events):
     level_sig = Signal(str, object, int, int)
     fit_sig = Signal(object, object, object)
     job_sig = Signal(str, str, str)
+    progress_sig = Signal(str, float)
 
     def __init__(self):
         super().__init__()
@@ -300,6 +321,9 @@ class _Events(QObject, ar.Events):
 
     def note(self, text):
         self.note_sig.emit(text)
+
+    def progress(self, key, fraction):
+        self.progress_sig.emit(key, float(fraction))
 
     def step(self, key, state):
         self.step_sig.emit(key, state)
@@ -553,11 +577,34 @@ class AutoRunPage(inspector.Page):
         h.setSpacing(theme.GAP_S)
         h.addWidget(QLabel("Start at"))
         self.start_box = QComboBox()
+        self.start_box.currentIndexChanged.connect(
+            lambda _i: self._sync_rework_tools()
+            if hasattr(self, "rework_tools") else None)
         self.start_box.setToolTip(
             "To finish a board that stopped part-way: the steps before this "
-            "one are skipped. The stock must not have moved.")
+            "one are skipped. The stock must not have moved.\n\n"
+            "Rework goes straight to the check: the stock is found and "
+            "probed again, nothing is cut, and the run waits with the boxes "
+            "- drag one over each shallow spot and recut it, or recut "
+            "everything deeper, or drill the holes again.")
         h.addWidget(self.start_box, 1)
         stock.add(srow)
+        from gerber2rml.gui2 import workspace as _ws
+        self.holes_chk = QCheckBox("Find the board by its own holes")
+        self.holes_chk.setChecked(
+            str(_ws.setting("autorun/rework_holes", "1")) != "0")
+        self.holes_chk.toggled.connect(
+            lambda on: _ws.set_setting("autorun/rework_holes",
+                                       "1" if on else "0"))
+        self.holes_chk.setToolTip(
+            "For a board put back in the mill. The stock never goes back "
+            "quite where it lay, and going by its edges alone the re-cut "
+            "can land beside the first one. Ticked, the bit drops into the "
+            "board's mounting holes (or solder holes wide enough for it) "
+            "before anything is cut, and the job is laid on where they "
+            "really are. If they are not found, nothing is cut.")
+        self.holes_chk.setVisible(False)
+        stock.add(self.holes_chk)
         self.dry_chk = QCheckBox("Dry run: spindle off, every cut 5 mm "
                                  "above the copper")
         self.dry_chk.setToolTip(
@@ -592,8 +639,9 @@ class AutoRunPage(inspector.Page):
                 "a box.")
         self.nogo_btn.setCheckable(True)
         self.nogo_btn.toggled.connect(self._arm_nogo)
-        self.nogo_clear_btn = widgets.button("Clear zones",
-                                             on=self._clear_nogo)
+        self.nogo_clear_btn = widgets.button(
+            "Clear all", tip="Takes every zone and every clamp off the bed.",
+            on=self._clear_nogo)
         nh.addWidget(self.nogo_btn)
         nh.addWidget(self.nogo_clear_btn)
         nh.addStretch(1)
@@ -661,7 +709,41 @@ class AutoRunPage(inspector.Page):
         self.box_btn.toggled.connect(self._arm_boxes)
         self.clear_boxes_btn = widgets.button("Clear boxes",
                                               on=self._clear_boxes)
-        _row(self.box_btn, self.clear_boxes_btn)
+        # The boxes, and the photo that shows where they belong, are their
+        # own block: wanted BEFORE the run as well, when it is started at
+        # Rework - the board is in the mill, the shallow spots are known,
+        # and the place to mark them is here, not at a stop that has not
+        # come yet. So they are not inside the check's own panel.
+        self.rework_tools = QWidget()
+        rl = QVBoxLayout(self.rework_tools)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(theme.GAP_S)
+        self.rework_hint = widgets.hint(
+            "Rework: drag a box over each spot that came out shallow. A "
+            "photo of the board, laid on the bed, shows where they are. "
+            "The run stops at the check with these boxes ready.")
+        rl.addWidget(self.rework_hint)
+        self.photo_phone_btn = widgets.button(
+            "Photo from the phone…",
+            on=lambda: self.ctl.action_phone_photo(),
+            tip="Shows a QR code: scan it, take a picture of the board in "
+                "the mill, and it is laid on the bed here once two points "
+                "on it have been matched to the design.")
+        self.photo_file_btn = widgets.button(
+            "Photo from a file…", on=lambda: self.ctl.action_load_photo())
+
+        def _tool_row(*ws):
+            r = QWidget()
+            h = QHBoxLayout(r)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(theme.GAP_S)
+            for w_ in ws:
+                h.addWidget(w_)
+            h.addStretch(1)
+            rl.addWidget(r)
+        _tool_row(self.photo_phone_btn, self.photo_file_btn)
+        _tool_row(self.box_btn, self.clear_boxes_btn)
+        self.rework_tools.setVisible(False)
         self.again_btn = widgets.button(
             "Recut all traces", on=self._recut)
         self.deeper_spin = self._spin(0.05, 0.01, 0.5, 2)
@@ -683,6 +765,7 @@ class AutoRunPage(inspector.Page):
             "Stop here", on=lambda: self._answer("stop", 0.0))
         _row(self.cut_btn, self.stop_here_btn)
         self.check_box.setVisible(False)
+        run.add(self.rework_tools)
         run.add(self.check_box)
         # How far, and how long still: a bar, the step in hand, the time
         # left and the time of day it should be done. The checklist below
@@ -938,8 +1021,14 @@ class AutoRunPage(inspector.Page):
         self.nocut_chk.blockSignals(True)
         self.nocut_chk.setChecked(bool(getattr(ctl, "_no_cutout", False)))
         self.nocut_chk.blockSignals(False)
-        # Nothing to stop before when nothing is cut out.
-        self.check_chk.setEnabled(not self.no_cutout())
+        # With no cut-out there is nothing to stop BEFORE, and the stop is
+        # wanted all the same: the traces are checked, and re-cut in boxes
+        # or deeper, while the stock still lies where it lay. It comes after
+        # the traces instead, and the tick says so.
+        self.check_chk.setEnabled(True)
+        self.check_chk.setText(
+            "Stop after the traces, so I can check them" if self.no_cutout()
+            else "Stop before the cut-out, so I can check the traces")
 
     def _corner_args(self):
         """What :func:`bracket.corner_place` needs, or None without a board."""
@@ -1168,8 +1257,11 @@ class AutoRunPage(inspector.Page):
                                    ar.START_AT_FIDUCIALS)
         for k, t in top:
             self.start_box.addItem(t, k)
-        self.start_box.addItem("Check the board (traces are cut)",
-                               ar.START_AT_CHECK)
+        # Called what it is used for. "Check the board" was this entry's
+        # name, and nobody looking for a way to re-cut a shallow spot on a
+        # board that was already run found it under that.
+        self.start_box.addItem("Rework: check the board, recut spots "
+                               "(traces are cut)", ar.START_AT_CHECK)
         i = self.start_box.findData(keep)
         self.start_box.setCurrentIndex(max(0, i))
 
@@ -1221,34 +1313,48 @@ class AutoRunPage(inspector.Page):
 
     def _tick(self):
         """Once a second while a run is going: the bar, the line under it,
-        and the same line on the machine bar."""
+        and the same line on the machine bar.
+
+        The bar and the first time are the step in hand - that is what
+        moves while somebody watches, and a bar for the whole run stood
+        still for minutes on a long isolation pass. The whole run is the
+        estimate beside it."""
         if self._clock is None:
             return
         from datetime import datetime, timedelta
         from gerber2rml.engine.estimate import format_duration
         s = self._clock.snapshot()
-        self.progress.setValue(int(round(s["fraction"] * 1000)))
-        pct = int(s["fraction"] * 100)
+        self.progress.setValue(int(round(s["step_fraction"] * 1000)))
+        pct = int(s["step_fraction"] * 100)
         where = ("Step %d of %d · %s" % (s["index"], s["count"], s["label"])
                  if s["index"] else "Starting")
+        left = format_duration(s["left_s"])
         if s["waiting"]:
-            line = "%s · %d%% · waiting for you - the clock is stopped" % (
-                where, pct)
-            short = "%d%% · waiting for you" % pct
+            line = ("%s · %d%% · waiting for you - the clock is stopped · "
+                    "whole run: about %s left" % (where, pct, left))
+            short = "%s · %d%% · waiting for you" % (where, pct)
         else:
-            left = format_duration(s["left_s"])
             at = (datetime.now() + timedelta(seconds=s["left_s"])).strftime(
                 "%H:%M")
             more = "at least " if s["over"] else "about "
-            line = "%s · %d%% · %s%s left · done %s%s · %s so far" % (
-                where, pct, more, left, "after " if s["over"] else "about ",
-                at, format_duration(s["elapsed_s"]))
-            short = "%s · %d%% · %s%s left · done ~%s" % (
-                where, pct, more, left, at)
+            this = ("past its estimate" if s["over"] else
+                    "about %s left of this step"
+                    % format_duration(s["step_left_s"]))
+            line = ("%s · %d%% · %s · whole run: %s%s left, done %s%s, "
+                    "%s so far" % (
+                        where, pct, this, more, left,
+                        "after " if s["over"] else "about ", at,
+                        format_duration(s["elapsed_s"])))
+            short = "%s · %d%% · %s · whole run %s%s left" % (
+                where, pct, this, more, left)
         self.progress_lbl.setText(line)
         bar = getattr(self.ctl, "bar", None)
         if bar is not None and hasattr(bar, "set_run_progress"):
             bar.set_run_progress(short)
+
+    def _on_progress(self, key, fraction):
+        if self._clock is not None:
+            self._clock.progress(key, fraction)
 
     def _clock_wait(self, on):
         if self._clock is not None:
@@ -1400,6 +1506,7 @@ class AutoRunPage(inspector.Page):
         ev.level_sig.connect(self._on_level)
         ev.fit_sig.connect(self._on_fit)
         ev.job_sig.connect(self._on_job)
+        ev.progress_sig.connect(self._on_progress)
         self._new_run_dir()
         # In the run's folder with its programs: Novice has no export to carry
         # it, and a file that did not get made must not stop the run. The
@@ -1429,6 +1536,8 @@ class AutoRunPage(inspector.Page):
         check_cut = self.check_chk.isChecked()
         no_cut = self.no_cutout() and datum is not None
         start_at = self.start_box.currentData()
+        self._sync_holes_chk()
+        by_holes = self.by_holes()
         nogo = self.nogo()
         level_margin = self.level_margin_spin.value()
         from gerber2rml.gui2 import workspace
@@ -1456,9 +1565,10 @@ class AutoRunPage(inspector.Page):
                                  leave_under=no_cut,
                                  margin_mm=(0.0 if no_cut
                                             else ar.PLACE_MARGIN_MM),
-                                 check_cut=check_cut and not no_cut,
+                                 check_cut=check_cut,
                                  start_at=start_at, nogo=nogo,
-                                 level_margin=level_margin)
+                                 level_margin=level_margin,
+                                 by_holes=by_holes)
                 try:
                     ok = run.run()
                 finally:
@@ -1600,17 +1710,27 @@ class AutoRunPage(inspector.Page):
 
     def _on_check(self, traces_label, deeper):
         self._clock_wait(True)
+        leave = self.no_cutout()
         self.check_lbl.setText(
             "%s done%s. The board is at the view position. Is every trace "
-            "through the copper, and every hole through the board? Then cut it "
-            "out. If not, cut them again a little deeper: as long as the stock "
+            "through the copper, and every hole through the board? Then %s. "
+            "If not, cut them again a little deeper: as long as the stock "
             "has not moved, they land in the same place. Close the lid first; "
-            "the run waits for it." % (traces_label, "" if not deeper else
-                               ", %.2f mm deeper" % deeper))
-        self._boxes = []
+            "the run waits for it." % (
+                traces_label, "" if not deeper else
+                ", %.2f mm deeper" % deeper,
+                "go on" if leave else "cut it out"))
+        # The board stays in the sheet: there is nothing to cut out, and the
+        # button that ends the check says what it does.
+        self.cut_btn.setText("They are fine - go on" if leave
+                             else "Cut it out")
+        # Boxes drawn before the stop - a run started at Rework - are what
+        # the stop is for: they stay. An answer clears them (_answer).
         self._show_boxes()
         self.check_box.setVisible(True)
-        self.ctl.say("warn", "Check the traces before the cut-out.")
+        self._sync_rework_tools()
+        self.ctl.say("warn", "Check the traces." if leave
+                     else "Check the traces before the cut-out.")
         self._log("waiting: check the traces (%.2f mm deeper so far)" % deeper)
 
     # -- boxes over the shallow spots ----------------------------------------
@@ -1649,6 +1769,18 @@ class AutoRunPage(inspector.Page):
         from gerber2rml.engine.nogo import zone_shape
         g = bit / 2.0 + ar.NOGO_CLEAR_MM
         zones = [zone_shape(z, g) for z in self._nogo]
+        # And off the board's holes, as the run keeps off them
+        # (AutoRun._cut_already): the cut's half, the bit's, and a little.
+        from shapely.geometry import Point
+        if ctl._double:
+            lay = ctl._ds_layout()
+            holes = (list(lay.holes) + list(lay.align_holes)
+                     if lay is not None else [])
+        else:
+            holes = list(ctl.state.board.holes or [])
+        zones += [Point(x, y).buffer(max(d, bit) / 2.0 + bit / 2.0
+                                     + ar.WORK_CLEAR_MM, 8)
+                  for x, y, d in holes]
         return [t for t in ar.level_targets(pts, zones) if t is not None]
 
     def _show_touches(self):
@@ -1719,6 +1851,68 @@ class AutoRunPage(inspector.Page):
             return
         self.remove_nogo(index)
 
+    def project_state(self):
+        """What this page holds, for a project file (window.export_project):
+        the stock and how it is held, and what was measured here. Most of it
+        is kept with this PC and not with a job - the fixture does not move
+        between boards - which is exactly why a project has to carry it."""
+        from gerber2rml.gui2 import workspace
+        return {
+            "size": [self.w_spin.value(), self.h_spin.value()],
+            "where": self.where.currentData(),
+            "bracket": br.to_text(self._bracket),
+            "click": list(self._click) if self._click else None,
+            "centre": self.centre_chk.isChecked(),
+            "no_cutout": self.nocut_chk.isChecked(),
+            "level": self.level_chk.isChecked(),
+            "level_margin": self.level_margin_spin.value(),
+            "check": self.check_chk.isChecked(),
+            "rework_holes": self.holes_chk.isChecked(),
+            "nogo": nogo_to_text(self._nogo),
+            "surface_z": str(workspace.setting("autorun/surface_z", "") or ""),
+        }
+
+    def restore_project(self, d):
+        """Put back what :meth:`project_state` wrote. Anything missing or
+        unreadable is left as it is here."""
+        from gerber2rml.gui2 import workspace
+        if not isinstance(d, dict):
+            return
+        b = br.from_text(str(d.get("bracket") or ""))
+        if b is not None:
+            self.set_bracket(b)
+        i = self.where.findData(d.get("where"))
+        if i >= 0:
+            self.where.setCurrentIndex(i)
+        try:
+            w, h = (float(v) for v in d.get("size"))
+            self.w_spin.setValue(w)
+            self.h_spin.setValue(h)
+        except (TypeError, ValueError):
+            pass
+        for box, key in ((self.centre_chk, "centre"),
+                         (self.nocut_chk, "no_cutout"),
+                         (self.level_chk, "level"),
+                         (self.check_chk, "check"),
+                         (self.holes_chk, "rework_holes")):
+            if key in d:
+                box.setChecked(bool(d[key]))
+        try:
+            self.level_margin_spin.setValue(float(d["level_margin"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        if "nogo" in d:
+            # Boxes and clamps both (engine/nogo.py); a project carries
+            # them although a session on its own does not keep them.
+            self._nogo = nogo_from_text(d.get("nogo", ""))
+            self._save_nogo()
+        try:
+            workspace.set_setting("autorun/surface_z",
+                                  "%.3f" % float(d["surface_z"]))
+        except (KeyError, TypeError, ValueError):
+            pass
+        self._sync_outline()
+
     def _save_nogo(self):
         """The zones changed: show them. They live only as long as this
         session (see where ``_nogo`` is made)."""
@@ -1764,9 +1958,38 @@ class AutoRunPage(inspector.Page):
         self._answer("again", self.deeper_spin.value(),
                      list(self._boxes) or None)
 
+    def _sync_rework_tools(self, *_):
+        """The boxes and the photo buttons: there while the run waits at
+        the check, and beforehand when the run is to start at Rework."""
+        self.rework_tools.setVisible(
+            not self.check_box.isHidden()
+            or self.start_box.currentData() == ar.START_AT_CHECK)
+        self._sync_holes_chk()
+
+    def _sync_holes_chk(self):
+        """Finding the board by its holes: offered for a single-sided board
+        started at Rework (a double-sided one is found by its reference
+        holes anyway), and only when it has holes that will do."""
+        rework = (self.start_box.currentData() == ar.START_AT_CHECK
+                  and not self.ctl._double)
+        self.holes_chk.setVisible(rework)
+        if not rework:
+            return
+        n = len(rework_holes(self.ctl))
+        self.holes_chk.setEnabled(n >= 2)
+        self.holes_chk.setText(
+            "Find the board by its own holes (%d of them)" % n if n >= 2
+            else "Find the board by its own holes - it has none wide "
+                 "enough and far enough apart")
+
+    def by_holes(self):
+        return (not self.holes_chk.isHidden() and self.holes_chk.isEnabled()
+                and self.holes_chk.isChecked())
+
     def _answer(self, what, mm, boxes=None):
         self._clock_wait(False)
         self.check_box.setVisible(False)
+        self._sync_rework_tools()
         self.box_btn.setChecked(False)
         boxes_shown = bool(self._boxes)
         self._boxes = []
@@ -1802,6 +2025,7 @@ class AutoRunPage(inspector.Page):
         self.start_btn.setEnabled(True)
         self.flip_btn.setVisible(False)
         self.check_box.setVisible(False)
+        self._sync_rework_tools()
         if self.box_btn.isChecked():
             self.box_btn.setChecked(False)
         if self._events is not None:

@@ -434,7 +434,7 @@ def datum_touch(datum_mm, corner, size_mm):
 
 
 def from_datum(ser, datum_mm, corner, size_mm, should_abort=None, note=None,
-               hint_mm=None, hint_fresh=False):
+               hint_mm=None, hint_fresh=False, touch=None):
     """The stock pushed into a fixed corner bracket: its outline is that
     corner and the typed size, so only the copper's height is measured - one
     touch, 15 mm in from the bracket corner (always copper, whatever the
@@ -448,7 +448,8 @@ def from_datum(ser, datum_mm, corner, size_mm, should_abort=None, note=None,
     w, h = size_mm
     dx, dy = datum_mm
     x0, y0 = datum_outline(datum_mm, corner, size_mm)
-    sx, sy = datum_touch(datum_mm, corner, size_mm)
+    # ``touch``: the run's own spot, when the usual one is on a hole.
+    sx, sy = touch or datum_touch(datum_mm, corner, size_mm)
     note("Touching the copper at X %.1f, Y %.1f…" % (sx, sy))
     z = seek_surface(ser, int(sx * 1000), int(sy * 1000), should_abort, note,
                      None if hint_mm is None else int(hint_mm * 1000),

@@ -721,6 +721,8 @@ class MainWindow(QMainWindow):
         f.addSeparator()
         self._act(f, "Save the setup…", self.action_save_setup, "Ctrl+S")
         self._act(f, "Load a setup…", self.action_load_setup)
+        self._act(f, "Export the whole project…", self.action_export_project)
+        self._act(f, "Open a project…", self.action_import_project)
         f.addSeparator()
         self.export_act = self._act(f, "Export the job…", self.action_export,
                                     "Ctrl+E")
@@ -1504,7 +1506,11 @@ class MainWindow(QMainWindow):
         if self._double and self.state.board is not None:
             lay = self._ds_layout()
             if lay is not None:
-                holes, align = lay.holes, lay.align_holes
+                from gerber2rml.doublesided import holes_not_aligned
+                align = lay.align_holes
+                # A board hole that is a reference hole is cut by the
+                # align job: the drill job leaves it out.
+                holes = holes_not_aligned(lay.holes, align)
         self.plan = runplan.build(self.state, double_sided=self._double,
                                   registration=self._registration, holes=holes,
                                   align_holes=align, dowels=self.dowel_spec(),
@@ -1739,8 +1745,10 @@ class MainWindow(QMainWindow):
             return drill_single_bit(lay.align_holes, aj), None, aj.bit_diameter
         if step.op == "drill":
             dj = self.cutting_drill()
-            paths = (drill_single_bit(lay.holes, dj) if st.drill.single_bit
-                     else drill_holes(lay.holes, dj))
+            from gerber2rml.doublesided import holes_not_aligned
+            todo = holes_not_aligned(lay.holes, lay.align_holes)
+            paths = (drill_single_bit(todo, dj) if st.drill.single_bit
+                     else drill_holes(todo, dj))
             return paths, None, st.drill.bit_diameter
         if step.op == "cutout":
             return (cut_outline(lay.outline, self.cutting_cutout()),
@@ -1761,6 +1769,29 @@ class MainWindow(QMainWindow):
                                        st.board.copper, lay.bottom_copper)),
                 None, width)
 
+    def edgeless(self):
+        """Has this board no edge of its own to isolate from?
+
+        Two ways. It is left in the sheet (the operator said so). Or it IS
+        the sheet: a single-sided board the size of the piece of stock,
+        which the run cuts with its edge left as it is (engine/autorun.py,
+        ``fills_stock``) whether or not anyone ticked anything - its edge
+        is the sheet's edge, already cut by whoever cut the sheet. In both,
+        a pour's own outline is a groove along a perimeter nothing will
+        ever be cut free from; in the second it also ran under the
+        bracket's tongue, and the run refused a board it had been taught
+        to accept (the lab mill, 2026-11-15)."""
+        if self._no_cutout:
+            return True
+        if self._double or not self._stock_set or self.state.board is None:
+            return False
+        b = self.work_bounds()
+        if b is None:
+            return False
+        from gerber2rml.engine.autorun import fills_stock
+        return fills_stock(b[2] - b[0], b[3] - b[1],
+                           self.stock[2], self.stock[3])
+
     def _edge_free(self, key, paths, outline, copper, nets):
         """An isolation pass without the part along the board's edge, when
         the board is left in the sheet - and only when leaving it out is
@@ -1776,7 +1807,7 @@ class MainWindow(QMainWindow):
         careful reading: a track that would be left joined to the pour
         keeps the edge pass.
         """
-        if not self._no_cutout or outline is None or outline.is_empty:
+        if (not self.edgeless() or outline is None or outline.is_empty):
             self._edge_notes.pop(key, None)
             return paths
         from gerber2rml.engine.bracket import joined_nets, leave_edge
@@ -1810,7 +1841,7 @@ class MainWindow(QMainWindow):
             if joined:
                 out.append(diag.Check(
                     "warn", "The edge pass is kept",
-                    "the board is left in the sheet, but leaving out the "
+                    "the board has no edge of its own, but leaving out the "
                     "isolation along its edge would put these on one piece "
                     "of copper: %s. So that pass is cut as usual."
                     % "; ".join(" + ".join(j) for j in joined)))
@@ -1818,9 +1849,10 @@ class MainWindow(QMainWindow):
                 out.append(diag.Check(
                     "ok", "The board's edge is left uncut",
                     "%.0f mm of isolation along the board's edge is left "
-                    "out: the board stays in the sheet, so there is no edge "
-                    "to isolate from. Milled out on paper, it joins no "
-                    "nets." % uncut))
+                    "out: the board %s, so there is no edge to isolate "
+                    "from. Milled out on paper, it joins no nets."
+                    % (uncut, "stays in the sheet" if self._no_cutout
+                       else "is the whole piece of stock")))
         return out[:1] if out and all(c.level == "ok" for c in out) else out
 
     def _ds_layout(self):
@@ -1922,7 +1954,13 @@ class MainWindow(QMainWindow):
                     self._fit_geom(lay.top_outline),
                     self._fit_holes(
                         reflect_holes(lay.holes, lay.axis, lay.flip_pos)),
-                    align_holes=self._fit_holes(lay.align_holes))
+                    # Turned over with the board, like its own holes: they
+                    # are holes in it. Drawn where they were on the bottom,
+                    # mounting holes used as reference holes stood beside
+                    # themselves (dowels are on the flip line, so for them
+                    # it is the same place either way).
+                    align_holes=self._fit_holes(reflect_holes(
+                        lay.align_holes, lay.axis, lay.flip_pos)))
                 # The top view is the board AFTER the flip, warped to a
                 # measured fit: a pin dragged there has no single place to
                 # go back to in the design. Drag them on a bottom-side step
@@ -2522,7 +2560,7 @@ class MainWindow(QMainWindow):
         for a board left in the sheet, all but those along the board's own
         edge, where nothing is cut any more (:meth:`_edge_free`)."""
         edges = copper.boundary
-        if (self._no_cutout and board.outline is not None
+        if (self.edgeless() and board.outline is not None
                 and not board.outline.is_empty
                 and not any(j for _u, j in self._edge_notes.values())):
             band = self.state.trace.effective_diameter()
@@ -2564,10 +2602,18 @@ class MainWindow(QMainWindow):
             # In the board's own frame, grown to where the cutter's EDGE
             # may not come: the tool's radius is in the cut, not the zone.
             g = NOGO_CLEAR_MM + r
-            zone = box(z[0] - dx - g, z[1] - dy - g,
-                       z[2] - dx + g, z[3] - dy + g)
-            where = "zone %d (X %.0f-%.0f, Y %.0f-%.0f)" % (
-                n, z[0], z[2], z[1], z[3])
+            # A box, or one of the cam clamps - a disc, with its own
+            # clearance (engine/nogo.py). Taking a clamp for a box raised
+            # an IndexError here the moment one was marked.
+            from shapely import affinity
+            from gerber2rml.engine.nogo import (is_clamp, zone_bounds,
+                                                zone_shape)
+            zone = affinity.translate(zone_shape(z, g), -dx, -dy)
+            zb = zone_bounds(z)
+            where = ("clamp %d (at X %.0f, Y %.0f)" % (n, z[0], z[1])
+                     if is_clamp(z) else
+                     "zone %d (X %.0f-%.0f, Y %.0f-%.0f)" % (
+                         n, zb[0], zb[2], zb[1], zb[3]))
             edges = [name for name, geom in (
                 ("bottom copper", board.copper),
                 ("top copper", getattr(board, "copper_top", None)))
@@ -2980,7 +3026,9 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
         QApplication.alert(self)
-        if str(path).lower().endswith(".srmcam"):
+        if str(path).lower().endswith(".srmproj"):
+            self.import_project(path)
+        elif str(path).lower().endswith(".srmcam"):
             self.load_setup(path)
         else:
             self.load_folder(path)
@@ -3243,9 +3291,12 @@ class MainWindow(QMainWindow):
         # The cut-out leaves out what lies on the sheet's edge, so it is the
         # one toolpath the sheet changes: drop it, or the preview keeps a ring
         # the cut no longer has.
+        # And whether the board fills the sheet decides whether its edge is
+        # isolated (edgeless): the trace passes go the same way.
         for s in (self.plan.steps if self.plan is not None else []):
-            if s.op == "cutout":
+            if s.op == "cutout" or "trace" in (s.op or ""):
                 self._paths_cache.pop(s.key, None)
+        self._edge_memo = {}
         if show is not None:
             self.show_stock = bool(show)
         self._draw_screws()
@@ -4909,8 +4960,16 @@ class MainWindow(QMainWindow):
             + f"/{self.state.name}.srmcam", "SRM-CAM setup (*.srmcam)")
         if not path:
             return
+        if self._write_setup(path, self._setup_data(path)):
+            workspace.remember_dir("session", path)
+            self.say("ok", "Setup saved.")
+
+    def _setup_data(self, path):
+        """Everything the setup file keeps, as the dict that is written.
+        ``path`` is where it will be written: the photo is copied beside
+        it."""
         from dataclasses import asdict
-        data = {
+        return {
             "version": 1, "name": self.state.name,
             "gerber_dir": str(self.state.gerber_dir or ""),
             "machine": self.state.machine, "mirror": self.state.mirror,
@@ -4963,14 +5022,145 @@ class MainWindow(QMainWindow):
                        for m in self.state.boards],
             "current": self.state.current,
         }
+
+    def _write_setup(self, path, data):
         try:
             Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError as e:
             self.report_error("The setup could not be saved", e,
                               "Pick a folder you can write to.")
+            return False
+        return True
+
+    # ------------------------------------------------------------- projects
+    # A setup file points at the Gerber folder and remembers this job's
+    # numbers. A project is the whole of it in one file that can be moved
+    # to another computer, or opened next month: the Gerber files
+    # themselves, the setup (height map, measured flip, rework boxes, the
+    # photo), and what the Run it page holds - the stock, the bracket, the
+    # clamps and no-go zones, the copper's height. A zip, so it can be
+    # looked into.
+    PROJECT_SETUP = "setup.srmcam"
+    PROJECT_FILE_MAX = 64 * 1024 * 1024      # bytes; nothing in a job is
+
+    def action_export_project(self):
+        if self.state.board is None:
+            self.say("warn", "Open a board first - there is nothing to "
+                             "export yet.")
             return
-        workspace.remember_dir("session", path)
-        self.say("ok", "Setup saved.")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export the whole project",
+            workspace.remembered_dir("project", "sessions")
+            + f"/{self.state.name}.srmproj", "SRM-CAM project (*.srmproj)")
+        if not path:
+            return
+        if not path.lower().endswith(".srmproj"):
+            path += ".srmproj"
+        if self.export_project(path):
+            workspace.remember_dir("project", path)
+
+    def export_project(self, path):
+        """Write the project to ``path``. True when it was written."""
+        import shutil
+        import tempfile
+        import zipfile
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                data = self._setup_data(tmp / self.PROJECT_SETUP)
+                left_out = []
+                for i, b in enumerate(data["boards"]):
+                    src = Path(b["gerber_dir"])
+                    rel = "gerber/%d_%s" % (i, clean_name(src.name) or "board")
+                    (tmp / rel).mkdir(parents=True)
+                    for f in sorted(src.iterdir()) if src.is_dir() else []:
+                        if not f.is_file() or f.name.startswith("."):
+                            continue
+                        if f.stat().st_size > self.PROJECT_FILE_MAX:
+                            left_out.append(f.name)
+                            continue
+                        shutil.copy2(f, tmp / rel / f.name)
+                    b["gerber_dir"] = rel
+                cur = min(max(int(data.get("current", 0)), 0),
+                          len(data["boards"]) - 1)
+                data["gerber_dir"] = (data["boards"][cur]["gerber_dir"]
+                                      if data["boards"] else "")
+                data["project"] = 1
+                data["autorun"] = self.autorun_page.project_state()
+                (tmp / self.PROJECT_SETUP).write_text(
+                    json.dumps(data, indent=2), encoding="utf-8")
+                part = Path(str(path) + ".part")
+                with zipfile.ZipFile(part, "w", zipfile.ZIP_DEFLATED) as z:
+                    for f in sorted(tmp.rglob("*")):
+                        if f.is_file():
+                            z.write(f, f.relative_to(tmp).as_posix())
+                part.replace(path)
+        except OSError as e:
+            self.report_error("The project could not be exported", e,
+                              "Pick a folder you can write to.")
+            return False
+        self.say("ok" if not left_out else "warn",
+                 "Project exported: the Gerber files, the setup, the "
+                 "measurements and the Run it page, in one file."
+                 + (" Left out as too big: %s." % ", ".join(left_out)
+                    if left_out else ""))
+        return True
+
+    def action_import_project(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open a project",
+            workspace.remembered_dir("project", "sessions"),
+            "SRM-CAM project (*.srmproj);;All files (*)")
+        if path:
+            self.import_project(path)
+
+    def import_project(self, path):
+        """Unpack a project into the workspace and open it. True when it
+        opened. The files stay there: the job reads its Gerbers from them
+        from then on, wherever the project file itself goes."""
+        import zipfile
+        path = Path(path)
+        base = workspace.workspace_root() / "projects"
+        dest = base / (clean_name(path.stem) or "project")
+        n = 2
+        while dest.exists():
+            dest = base / ("%s-%d" % (clean_name(path.stem) or "project", n))
+            n += 1
+        try:
+            with zipfile.ZipFile(path) as z:
+                names = z.namelist()
+                if self.PROJECT_SETUP not in names:
+                    raise ValueError("no %s in it" % self.PROJECT_SETUP)
+                dest.mkdir(parents=True)
+                root = dest.resolve()
+                for info in z.infolist():
+                    out = (dest / info.filename).resolve()
+                    # Nothing is written outside the project's own folder,
+                    # whatever a name in the file says.
+                    if root != out and root not in out.parents:
+                        raise ValueError("a file in it points outside the "
+                                         "project: %s" % info.filename)
+                    if info.is_dir():
+                        continue
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    out.write_bytes(z.read(info))
+            data = json.loads((dest / self.PROJECT_SETUP).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError, zipfile.BadZipFile) as e:
+            self.report_error(
+                "That is not a project this app wrote", e,
+                "Project files end in .srmproj and are written by File ▸ "
+                "Export the whole project.")
+            return False
+        self.load_setup(dest / self.PROJECT_SETUP)
+        try:
+            self.autorun_page.restore_project(data.get("autorun"))
+        except Exception as e:                  # noqa: BLE001 - said, not fatal
+            self.say("warn", "The project opened, but the Run it page's "
+                             "part of it could not be read (%s) - check the "
+                             "stock, the bracket and the clamps." % e)
+        workspace.remember_dir("project", str(path))
+        return True
 
     def action_load_setup(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -5010,6 +5200,17 @@ class MainWindow(QMainWindow):
                     # machine: kept out, and said so.
                     foreign.append("%s: %s" % (key, ", ".join(refused)))
         boards = data.get("boards") or []
+        # A project keeps its Gerber folders beside the setup, by relative
+        # path: they are wherever the project was unpacked.
+        here = Path(path).resolve().parent
+
+        def _abs(d):
+            return str(here / d) if d and not Path(d).is_absolute() else d
+        if data.get("gerber_dir"):
+            data["gerber_dir"] = _abs(str(data["gerber_dir"]))
+        for b in boards:
+            if isinstance(b, dict) and b.get("gerber_dir"):
+                b["gerber_dir"] = _abs(str(b["gerber_dir"]))
         self._double = bool(data.get("double_sided", False))
         if self._double and len(boards) > 1:
             # A sheet of several boards is single-sided. A file that says
