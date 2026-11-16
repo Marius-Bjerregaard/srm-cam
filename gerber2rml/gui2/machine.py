@@ -63,6 +63,9 @@ SHOW_SIM = False
 # motion path next to a spinning tool - does not apply to it.
 
 
+RESCAN_MS = 2000             # how often the ports are looked for again
+
+
 def list_ports(sim_only=False):
     """``[(device, why), ...]``, most-likely-Arduino first, or [] with a reason.
 
@@ -894,7 +897,17 @@ class MachineBar(QWidget):
         self._timer = QTimer(self)
         self._timer.timeout.connect(link.poll)
         self._touching = False
+        self._held = False
+        self._connecting_until = 0.0
         self.refresh_ports()
+        # The ports are looked for again every couple of seconds while
+        # nothing is linked: an Arduino plugged in, or a mill switched on,
+        # after the program was started used to stay unseen until it was
+        # closed and opened again (the lab, 2026-11-16).
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(RESCAN_MS)
+        self._scan_timer.timeout.connect(self._auto_rescan)
+        self._scan_timer.start()
 
         # Page Up / Page Down nudge Z, as the two buttons' tooltips promise.
         # On the window rather than on a focused control: you are looking at
@@ -922,17 +935,49 @@ class MachineBar(QWidget):
         return self._do_toggle_connect()
 
     # -- ports -------------------------------------------------------------
-    def _refresh_ports(self):
-        ports, why = list_ports(self.sim_only)
+    def _refresh_ports(self, ports=None, why=""):
+        if ports is None:
+            ports, why = list_ports(self.sim_only)
+        keep = self.port_combo.currentData()
         self.port_combo.clear()
         for device, chip in ports:
             self.port_combo.addItem(f"{device} · {chip}", device)
+        # The port that was chosen stays chosen when it is still there.
+        i = self.port_combo.findData(keep)
+        if i >= 0:
+            self.port_combo.setCurrentIndex(i)
         self.port_combo.setEnabled(bool(ports))
         self.connect_btn.setEnabled(bool(ports))
         if why:
-            self.offline_note.setText(
+            self._no_ports_note = (
                 f"No machine link: {why} Everything except probing works "
                 f"without it — export the files and send them from VPanel.")
+            self.offline_note.setText(self._no_ports_note)
+        elif self.offline_note.text() == getattr(self, "_no_ports_note", None):
+            # A port has turned up: the note that said there was none goes.
+            self.offline_note.setText(OFFLINE_SIM_ONLY if self.sim_only
+                                      else OFFLINE_PRO)
+
+    def _auto_rescan(self):
+        """Look for the ports again, and redraw the list only when it has
+        changed. Not while the link or a run has a port, a connect is under
+        way, or the list is open under the mouse."""
+        import time
+        if (self._held or self.link.is_connected()
+                or time.monotonic() < self._connecting_until
+                or self.port_combo.view().isVisible()):
+            return
+        ports, why = list_ports(self.sim_only)
+        had = [self.port_combo.itemData(i)
+               for i in range(self.port_combo.count())]
+        now = [d for d, _chip in ports]
+        if now == had:
+            return
+        self._refresh_ports(ports, why)
+        new = [d for d in now if d not in had and not simmachine.is_sim(d)]
+        if new:
+            self.message.emit("info", "Found %s. Press Connect to link to "
+                                      "the machine." % ", ".join(new))
 
     # -- actions -----------------------------------------------------------
     def _do_toggle_connect(self):
@@ -947,6 +992,8 @@ class MachineBar(QWidget):
                 return
             self.chip.set("Connecting…", "busy")
             self.connect_btn.setEnabled(False)
+            import time
+            self._connecting_until = time.monotonic() + 15.0
             self.link.connect_to(port)
 
     def _jog(self, direction):
@@ -1057,6 +1104,7 @@ class MachineBar(QWidget):
 
     def _on_unlinked(self, reason):
         self._timer.stop()
+        self._connecting_until = 0.0
         self.chip.set("Machine offline", "idle")
         self.connect_btn.setText("Connect")
         self.connect_btn.setEnabled(True)
@@ -1079,6 +1127,7 @@ class MachineBar(QWidget):
     def set_held_by_run(self, on):
         """Automatic mode has taken the port. "Offline" and a Connect button
         would be wrong for as long as it has it; STOP still reaches the run."""
+        self._held = bool(on)
         self.connect_btn.setEnabled(not on)
         self.port_combo.setEnabled(not on)
         if on:
@@ -1096,7 +1145,7 @@ class MachineBar(QWidget):
         from every page: the run holds the machine, so the readouts are
         gone and this line is what the bar has to say. Empty puts back the
         plain "the run has the machine"."""
-        if not self.connect_btn.isEnabled():        # only while a run holds it
+        if self._held:                  # only while a run holds it
             # "The run has the machine" stays: it is why Connect is grey.
             self.offline_note.setText(
                 "The run has the machine. "

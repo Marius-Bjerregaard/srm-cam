@@ -146,8 +146,25 @@ elif [ -n "$SIGN_ID" ]; then
   echo "[3/5] Signing with $SIGN_ID (hardened runtime, not notarised)..."
   sign_release "$SIGN_ID"
 else
-  echo "[3/5] Ad-hoc codesign..."
-  codesign --force --deep -s - "$APP"
+  # An ad-hoc signature is a hash of this very build, so to macOS every
+  # rebuild is a different app: it asks again for the Documents folder, the
+  # USB device, and everything else it had already been told. Signed with a
+  # certificate the app is "SRM-CAM from this developer" and the answers
+  # keep. Any "Apple Development" certificate will do for that (Xcode makes
+  # one for a free Apple ID); it is not a release signature and another Mac
+  # still needs right-click > Open. SRM_CAM_ADHOC=1 forces the old way.
+  DEV_ID=""
+  if [ "${SRM_CAM_ADHOC:-0}" != 1 ]; then
+    DEV_ID="$(security find-identity -v -p codesigning \
+      | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -1)"
+  fi
+  if [ -n "$DEV_ID" ]; then
+    echo "[3/5] Signing with a development certificate (permissions keep between builds)..."
+    codesign --force --deep --timestamp=none -s "$DEV_ID" "$APP"
+  else
+    echo "[3/5] Ad-hoc codesign (macOS will ask for its permissions again after each build)..."
+    codesign --force --deep -s - "$APP"
+  fi
 fi
 codesign --verify --deep --strict "$APP"
 echo "  signature verified"

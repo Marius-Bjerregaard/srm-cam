@@ -70,10 +70,12 @@ def test_the_line_says_the_step_the_percent_and_the_time_left(page):
     page._tick()
     text = page.progress_lbl.text()
     assert "Step 2 of 3 · Drill" in text
-    assert "14%" in text
-    assert "about 14m 20s left" in text
+    # The bar and the first time are the step in hand...
+    assert "50%" in text and "about 1m 40s left of this step" in text
+    assert page.progress.value() == 500
+    # ...and the whole run is the estimate beside it.
+    assert "whole run: about 14m 20s left" in text
     assert "done about " in text and "so far" in text
-    assert page.progress.value() == 140
 
 
 def test_the_machine_bar_says_it_too_while_the_run_holds_the_machine(page):
@@ -106,7 +108,8 @@ def test_waiting_at_the_flip_says_so_and_stops_the_clock(page):
     t.t = 620
     page._tick()
     assert "waiting for you" in page.progress_lbl.text()
-    assert page.progress.value() == 20               # where it was
+    assert page.progress.value() == 500              # where it was
+    assert "whole run: about" in page.progress_lbl.text()
     page._clock_wait(False)
     page._tick()
     assert "waiting" not in page.progress_lbl.text()

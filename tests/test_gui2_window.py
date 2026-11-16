@@ -954,3 +954,50 @@ def test_the_machine_menu_actions_work_where_the_link_does_run(win):
     win.bar.refresh_ports()
     assert win.bar.current_port() == win.bar.port_combo.currentData()
 
+
+
+def test_a_port_plugged_in_after_the_start_is_found_without_a_restart(
+        qt_app, monkeypatch):
+    """The Arduino plugged in, or the mill switched on, once the program is
+    already open: the list fills by itself, and says so."""
+    from gerber2rml.gui2 import machine
+    import serial.tools.list_ports as lp
+    monkeypatch.setattr(machine, "SHOW_SIM", False)
+    there = []
+    monkeypatch.setattr(lp, "comports", lambda: list(there))
+
+    class _Port:
+        def __init__(self, device):
+            self.device, self.hwid = device, "USB VID:PID=2341:0043"
+    bar = machine.MachineBar(machine.MachineLink())
+    said = []
+    bar.message.connect(lambda level, text: said.append(text))
+    assert bar._scan_timer.isActive()
+    assert bar.port_combo.count() == 0 and not bar.connect_btn.isEnabled()
+    assert "no serial ports" in bar.offline_note.text()
+    bar._auto_rescan()                       # still nothing: nothing said
+    assert said == []
+    there.append(_Port("/dev/cu.usbmodem1"))
+    bar._auto_rescan()
+    assert bar.current_port() == "/dev/cu.usbmodem1"
+    assert bar.connect_btn.isEnabled()
+    assert "Found /dev/cu.usbmodem1" in said[-1]
+    assert "no serial ports" not in bar.offline_note.text()
+    # A second one turning up does not take the choice away from the first.
+    there.append(_Port("/dev/cu.usbmodem2"))
+    bar.port_combo.setCurrentIndex(bar.port_combo.findData("/dev/cu.usbmodem1"))
+    bar._auto_rescan()
+    assert bar.port_combo.count() == 2
+    assert bar.current_port() == "/dev/cu.usbmodem1"
+    # Nothing changed: the list is left alone, and nothing more is said.
+    n = len(said)
+    bar._auto_rescan()
+    assert len(said) == n
+    # While a run has the machine the list is not touched.
+    bar.set_held_by_run(True)
+    del there[:]
+    bar._auto_rescan()
+    assert bar.port_combo.count() == 2
+    bar.set_held_by_run(False)
+    bar._auto_rescan()                       # unplugged: gone from the list
+    assert bar.port_combo.count() == 0 and not bar.connect_btn.isEnabled()

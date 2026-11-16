@@ -711,7 +711,36 @@ def test_the_boards_own_holes_are_the_reference_holes_through_a_flip(
     at = {(round(x, 2), round(y, 2)) for x, y, _d in lay.holes}
     for x, y, d in lay.align_holes:              # each IS one of its holes
         assert (round(x, 2), round(y, 2)) in at and d == pytest.approx(1.52)
+    # The align job cuts them, so the drill job does not cut them again.
+    drill = next(st for st in win.plan.steps if st.op == "drill")
+    cut = [(m.x, m.y) for tp in win._toolpaths_for(drill)[0] for m in tp
+           if m.z < 0]
+    assert cut                                   # the other holes are there
+    for x, y, d in lay.align_holes:
+        assert all(math.hypot(cx - x, cy - y) > d for cx, cy in cut)
+    align = next(st for st in win.plan.steps if st.op == "align")
+    assert len(win._toolpaths_for(align)[0]) >= len(lay.align_holes)
     assert not win._pins_draggable()             # not pins to pull about
+    # Seen from the top they are still the same holes: drawn turned over
+    # with the board, on its own holes, not left where the bottom had them.
+    drawn = {}
+    real_set = win.stage.set_board
+    monkeypatch.setattr(win.stage, "set_board", lambda *a, **k: (
+        drawn.update(holes=a[2], align=k.get("align_holes")),
+        real_set(*a, **k))[1])
+    win._auto_top = True
+    win.select_step("autorun")
+    win.refresh_preview()
+    for _ in range(200):
+        qt_app.processEvents()
+        if drawn:
+            break
+        time.sleep(0.01)
+    top = {(round(x, 2), round(y, 2)) for x, y, _d in drawn["holes"]}
+    assert drawn["align"] and all(
+        (round(x, 2), round(y, 2)) in top for x, y, _d in drawn["align"])
+    win._auto_top = False
+    monkeypatch.setattr(win.stage, "set_board", real_set)
     win.link.connect_to("SIM")
     assert _wait(qt_app, win.link.is_connected, 10)
     win.select_step("autorun")
@@ -792,7 +821,10 @@ def test_left_in_the_sheet_it_runs_with_no_cut_out_right_up_to_the_bracket(
         win, qt_app, monkeypatch):
     page = _tight_sheet(win, qt_app)
     page.nocut_chk.setChecked(True)
-    assert win._no_cutout and not page.check_chk.isEnabled()
+    # The stop is still offered: after the traces, there being no cut-out
+    # to stop before. (Unticked here, as the fixture leaves it.)
+    assert win._no_cutout and page.check_chk.isEnabled()
+    assert page.check_chk.text().startswith("Stop after the traces")
     assert not any("cutout" in k for k, _t in page._plan_rows())
     b, (sx, sy, sw, sh) = win.work_extent(), win.stock
     assert (b[0], b[1]) == pytest.approx((sx, sy))     # the far corner
@@ -876,3 +908,125 @@ def test_left_in_the_sheet_a_double_sided_board_is_flipped_and_finished(
     assert any("top" in k for k in jobs)
     assert not any("cutout" in k for k in jobs)
     page.nocut_chk.setChecked(False)
+
+
+def test_left_in_the_sheet_the_traces_are_checked_and_recut_in_a_box(
+        win, qt_app):
+    """No cut-out to stop before - so the stop comes after the traces, with
+    the same boxes, and the button that ends it says "go on"."""
+    page = _tight_sheet(win, qt_app)
+    page.nocut_chk.setChecked(True)
+    page.check_chk.setChecked(True)
+    done = []
+    page.finished.connect(lambda ok, msg: done.append((ok, msg)))
+    page.start()
+    assert _wait(qt_app, lambda: not page.check_box.isHidden() or bool(done),
+                 180), page.status.text()
+    assert not done, done
+    assert page.cut_btn.text() == "They are fine - go on"
+    assert "go on" in page.check_lbl.text()
+    assert "cut it out" not in page.check_lbl.text()
+    page.box_btn.setChecked(True)
+    b = win.work_bounds()
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    win._on_region(cx - 10, cy - 10, cx + 10, cy + 10)
+    assert page.again_btn.text() == "Recut 1 box"
+    page.again_btn.click()
+    assert _wait(qt_app, lambda: not page.check_box.isHidden() or bool(done),
+                 180)
+    assert not done, done
+    page.cut_btn.click()
+    assert _wait(qt_app, lambda: bool(done), 120), "the run never finished"
+    assert done[0][0], done[0][1]
+    assert len(list(page.run_dir.glob("*traces*.nc"))) == 2   # whole, then box
+    page.check_chk.setChecked(False)
+    page.nocut_chk.setChecked(False)                   # as it was found
+    assert page.check_chk.text().startswith("Stop before the cut-out")
+
+
+def test_started_at_rework_boxes_drawn_beforehand_are_there_at_the_check(
+        win, qt_app, monkeypatch):
+    """The board is in the mill and the shallow spots are known: Start at
+    Rework, mark them on the bed - from a photo, if there is one - and
+    press Start. The run cuts nothing, stops at the check, and the boxes
+    are the ones that were drawn."""
+    page = _tight_sheet(win, qt_app)
+    page.nocut_chk.setChecked(True)
+    assert page.rework_tools.isHidden()               # not a rework run yet
+    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
+    assert not page.rework_tools.isHidden()
+    # The photo comes through the window's own two ways in.
+    called = []
+    monkeypatch.setattr(win, "action_phone_photo",
+                        lambda: called.append("phone"))
+    monkeypatch.setattr(win, "action_load_photo",
+                        lambda *a: called.append("file"))
+    page.photo_phone_btn.click()
+    page.photo_file_btn.click()
+    assert called == ["phone", "file"]
+    page.box_btn.setChecked(True)
+    b = win.work_bounds()
+    cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+    win._on_region(cx - 10, cy - 10, cx + 10, cy + 10)
+    assert page.again_btn.text() == "Recut 1 box"
+    jobs = []
+    real = ar.AutoRun._job
+
+    def spy(self, key, *a, **k):
+        jobs.append(key)
+        return real(self, key, *a, **k)
+    monkeypatch.setattr(ar.AutoRun, "_job", spy)
+    done = []
+    page.finished.connect(lambda ok, msg: done.append((ok, msg)))
+    page.start()
+    assert _wait(qt_app, lambda: not page.check_box.isHidden() or bool(done),
+                 180), page.status.text()
+    assert not done, done
+    assert jobs == []                                 # nothing was cut
+    assert page.again_btn.text() == "Recut 1 box"     # the box survived
+    page.again_btn.click()
+    assert _wait(qt_app, lambda: not page.check_box.isHidden() or bool(done),
+                 180)
+    assert not done, done
+    assert len(jobs) == 1 and "traces" in jobs[0]
+    page.cut_btn.click()
+    assert _wait(qt_app, lambda: bool(done), 120), "the run never finished"
+    assert done[0][0], done[0][1]
+    page.start_box.setCurrentIndex(0)
+    assert page.rework_tools.isHidden()
+    page.nocut_chk.setChecked(False)
+
+
+def test_rework_on_a_single_sided_board_offers_to_find_it_by_its_holes(
+        win, qt_app, monkeypatch):
+    """Put back the day after, a board is not where the stock's edges say:
+    started at Rework it is found by its own holes, and the run is told."""
+    from gerber2rml.engine import mountfid
+    from gerber2rml.gui2.autorun import rework_holes
+    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 0.7)
+    win.select_step("autorun")
+    page = win.autorun_page
+    page._fill_rows()
+    assert page.holes_chk.isHidden() and not page.by_holes()
+    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
+    assert not page.holes_chk.isHidden()
+    holes = rework_holes(win)
+    assert len(holes) >= 2 and page.holes_chk.isEnabled()
+    at = {(round(x, 2), round(y, 2)) for x, y, _d in win.state.board.holes}
+    assert all((round(x, 2), round(y, 2)) in at for x, y, _d in holes)
+    page.holes_chk.setChecked(True)
+    assert page.by_holes()
+    page.holes_chk.setChecked(False)
+    assert not page.by_holes()
+    page.holes_chk.setChecked(True)
+    # No holes the bit drops into: said so, and the run goes by the stock.
+    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 50.0)
+    page._sync_holes_chk()
+    assert not page.holes_chk.isEnabled() and not page.by_holes()
+    # A double-sided board has its reference holes for this already.
+    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 0.7)
+    win.action_double_sided(True)
+    page._fill_rows()
+    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
+    page._sync_holes_chk()
+    assert page.holes_chk.isHidden() and not page.by_holes()

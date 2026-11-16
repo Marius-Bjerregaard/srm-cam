@@ -108,3 +108,61 @@ def test_a_step_the_plan_did_not_list_changes_nothing():
     c, t = _clock()
     c.step("holes_again", "running")
     assert c.snapshot()["fraction"] == 0.0
+
+
+def test_the_step_in_hand_has_its_own_fraction_and_time_left():
+    t = [0.0]
+    c = RunClock([("a", "A", 40), ("b", "B", 200), ("c", "C", 760)],
+                 now=lambda: t[0])
+    s = c.snapshot()
+    assert s["step_fraction"] == 0.0 and s["step_left_s"] == 0.0
+    c.step("a", "running")
+    t[0] = 10
+    s = c.snapshot()
+    assert s["step_fraction"] == pytest.approx(0.25)
+    assert s["step_left_s"] == pytest.approx(30.0)
+    assert s["step_elapsed_s"] == pytest.approx(10.0)
+    t[0] = 40
+    c.step("a", "done")
+    assert c.snapshot()["step_fraction"] == 1.0      # between steps: full
+    c.step("b", "running")
+    t[0] = 90
+    s = c.snapshot()
+    assert s["step_fraction"] == pytest.approx(0.25)
+    assert s["step_left_s"] == pytest.approx(150.0)
+    assert s["fraction"] == pytest.approx(0.09)      # the whole run, beside
+
+
+def test_a_step_measured_off_the_machine_does_not_run_out_early():
+    """The estimate said 200 s; the mill is half as fast. By the clock alone
+    the step was 'done' at 200 s and sat at "at least"; measured, it is at
+    half, with as long again to go."""
+    t = [0.0]
+    c = RunClock([("a", "A", 200), ("b", "B", 800)], now=lambda: t[0])
+    c.step("a", "running")
+    t[0] = 200
+    c.progress("a", 0.5)
+    s = c.snapshot()
+    assert not s["over"]
+    assert s["step_fraction"] == pytest.approx(0.5)
+    assert s["step_left_s"] == pytest.approx(200.0)
+    # The step after it is expected at the speed this one is going.
+    assert s["left_s"] == pytest.approx(200.0 + 800 * 2.0)
+    # It never goes back, and it is not this step's to report on another.
+    c.progress("a", 0.2)
+    c.progress("b", 0.9)
+    assert c.snapshot()["step_fraction"] == pytest.approx(0.5)
+    t[0] = 300
+    c.progress("a", 0.75)
+    s = c.snapshot()
+    assert s["step_left_s"] == pytest.approx(100.0)
+
+
+def test_a_few_seconds_in_the_estimate_still_speaks():
+    t = [0.0]
+    c = RunClock([("a", "A", 200)], now=lambda: t[0])
+    c.step("a", "running")
+    t[0] = 2
+    c.progress("a", 0.01)
+    s = c.snapshot()
+    assert s["step_left_s"] == pytest.approx(198.0)

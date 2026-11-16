@@ -372,3 +372,91 @@ def test_a_drill_job_whose_hop_crosses_a_clamp_is_run_not_refused():
     assert ("drill", "done") in log.steps
     assert seen and all(path_hit(p, clamp, run._nogo_grow()) is None
                         for p in seen)
+
+
+# --- left in the sheet, the check comes after the traces ----------------------
+
+class NoCutOut(Board):
+    """Drilled and isolated, never cut out."""
+
+    def bottom_steps(self):
+        return [("drill", "Drilling"), ("traces", "Traces")]
+
+
+def _checked(answers, **kw):
+    m, ser, board, log, run = _run(NoCutOut(False), leave_under=True,
+                                   margin_mm=0.0, level=False, **kw)
+    asked, jobs = [], []
+    replies = list(answers)
+
+    def check(label, deeper):
+        asked.append((label, round(deeper, 3)))
+        return replies.pop(0)
+
+    log.check = check
+    real = run._job
+
+    def spy(key, label, t, hmap, deeper=0.0, boxes=None):
+        jobs.append((key, round(deeper, 3), boxes))
+        return real(key, label, t, hmap, deeper, boxes)
+
+    run._job = spy
+    return run, log, asked, jobs
+
+
+def test_left_in_the_sheet_the_run_stops_after_the_traces_to_be_checked():
+    run, log, asked, jobs = _checked([("go", 0.0)])
+    assert run.run() is True
+    assert asked == [("Traces", 0.0)]
+    assert [j[0] for j in jobs] == ["drill", "traces"]
+
+
+def test_shallow_spots_are_cut_again_in_boxes_then_it_goes_on():
+    """The trace runs along Y 40.8 from X 54.3 to 74.3."""
+    spot = [(58.0, 38.0, 64.0, 44.0)]
+    run, log, asked, jobs = _checked([("again", 0.05, spot), ("go", 0.0)])
+    assert run.run() is True
+    assert asked == [("Traces", 0.0), ("Traces", 0.05)]
+    assert jobs == [("drill", 0.0, None), ("traces", 0.0, None),
+                    ("traces", 0.05, spot)]
+
+
+def test_the_holes_can_be_drilled_again_from_the_check():
+    from gerber2rml.engine.autorun import HOLES_AGAIN
+    board_holes = []
+    run, log, asked, jobs = _checked([("holes", 0.3), ("go", 0.0)])
+    src_paths = run.src.toolpaths
+    run.src.toolpaths = lambda key: (src_paths("drill") if key == HOLES_AGAIN
+                                     else src_paths(key))
+    assert run.run() is True
+    assert (HOLES_AGAIN, 0.3, None) in jobs
+
+
+def test_stopping_at_the_check_stops_the_run():
+    from gerber2rml.engine.runner import RunStopped
+    run, log, asked, jobs = _checked([("stop", 0.0)])
+    with pytest.raises(RunStopped, match="stopped at the check"):
+        run.run()
+
+
+def test_with_the_stop_unticked_the_run_goes_straight_through():
+    run, log, asked, jobs = _checked([], check_cut=False)
+    assert run.run() is True
+    assert asked == []
+
+
+def test_a_board_that_is_cut_out_is_still_checked_before_the_cut_out_only():
+    """Nothing changes for it: one check, before the cut-out."""
+    m, ser, board, log, run = _run(Board(False), level=False)
+    asked = []
+    log.check = lambda label, deeper: asked.append(label) or ("go", 0.0)
+    assert run.run() is True
+    assert asked == ["Traces"]
+    assert [k for k, s in log.steps if s == "done"][-1] == "cutout"
+
+
+def test_starting_at_the_check_goes_straight_to_it_with_no_cut_out():
+    from gerber2rml.engine.autorun import START_AT_CHECK
+    run, log, asked, jobs = _checked([("go", 0.0)], start_at=START_AT_CHECK)
+    assert run.run() is True
+    assert asked == [("Traces", 0.0)] and jobs == []

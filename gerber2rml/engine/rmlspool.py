@@ -295,14 +295,29 @@ def cups_mill_uris(lpinfo_text):
     return uris
 
 
-def _applescript_admin(commands):
+def _shell_line(commands, either=None):
+    """One shell line that runs ``commands`` (argv lists) in order, stopping
+    at the first that fails. ``either`` is two argv lists of which the
+    second is tried only if the first fails; it goes first."""
+    import shlex
+
+    def one(c):
+        return " ".join(shlex.quote(a) for a in c)
+    parts = [one(c) for c in commands]
+    if either:
+        parts.insert(0, "(%s || %s)" % (one(either[0]), one(either[1])))
+    return " && ".join(parts)
+
+
+def _applescript_admin(commands, either=None):
     """``osascript`` argv that runs ``commands`` (argv lists) as admin.
 
     macOS's own password dialog asks; nothing here sees the password. The
-    commands are joined into one shell line so the dialog comes up once.
+    commands are joined into one shell line so the dialog comes up once -
+    and with ``either`` (see :func:`_shell_line`) it still comes up once
+    when the first form of a command is refused and the second is needed.
     """
-    import shlex
-    line = " && ".join(" ".join(shlex.quote(a) for a in c) for c in commands)
+    line = _shell_line(commands, either)
     quoted = line.replace("\\", "\\\\").replace('"', '\\"')
     return ["osascript", "-e",
             f'do shell script "{quoted}" with administrator privileges']
@@ -322,6 +337,19 @@ def _as_admin(commands, run=None, admin="sudo", timeout=300):
         _cups(sudo + c, run=run, timeout=timeout)
 
 
+def _plain(commands, run=None):
+    """Run each argv in ``commands`` as the user, with no password asked.
+
+    On macOS an administrator's account is in the ``_lpadmin`` group, and
+    for that group ``lpadmin``, ``cupsenable`` and ``cupsaccept`` simply
+    work. Asking such a user for their password - twice, the way the setup
+    used to - was asking for something CUPS never wanted. Raises
+    :class:`SpoolError` at the first command that is refused, so the caller
+    can fall back to asking."""
+    for c in commands:
+        _cups(c, run=run, timeout=60)
+
+
 def find_mill_uri(run=None):
     """The mill's USB URI as CUPS sees it, or None when it is not plugged in.
 
@@ -337,11 +365,15 @@ def find_mill_uri(run=None):
 def setup_mill_queue(queue=CUPS_QUEUE, run=None, say=print, admin="sudo"):
     """Make the raw CUPS queue the mill is sent to. Returns the queue name.
 
-    Needs the mill on and plugged in, and admin rights (see :func:`_as_admin`).
-    CUPS may warn that raw queues are deprecated; on macOS they still work,
-    and are exactly what the Windows spooler does with the Roland driver's
-    "RAW" datatype. Newer CUPS refuses "-m raw"; no model at all is the same
-    raw queue, so that is the fallback.
+    Needs the mill on and plugged in. First without a password: a macOS
+    administrator may manage printers as they are (:func:`_plain`). Only if
+    CUPS refuses that is admin right asked for (see :func:`_as_admin`) -
+    once, with both forms of the command inside the one dialog.
+
+    Two forms because CUPS may warn that raw queues are deprecated; on macOS
+    they still work, and are exactly what the Windows spooler does with the
+    Roland driver's "RAW" datatype. Newer CUPS refuses "-m raw"; no model at
+    all is the same raw queue, so that is the fallback.
     """
     uri = find_mill_uri(run=run)
     if uri is None:
@@ -349,21 +381,42 @@ def setup_mill_queue(queue=CUPS_QUEUE, run=None, say=print, admin="sudo"):
                          "mill switched on and its USB cable plugged in?")
     say(f"Mill found at {uri}")
     add = ["lpadmin", "-p", queue, "-E", "-v", uri]
+    raw = add + ["-m", "raw"]
     rest = [["cupsenable", queue], ["cupsaccept", queue]]
-    try:
-        _as_admin([add + ["-m", "raw"]] + rest, run=run, admin=admin)
-    except SpoolError as e:
-        if "cancel" in str(e).lower() or "-128" in str(e):
-            raise SpoolError("cancelled - no password was given") from e
-        _as_admin([add] + rest, run=run, admin=admin)
+    done = False
+    for first in (raw, add):
+        try:
+            _plain([first] + rest, run=run)
+            done = True
+            break
+        except SpoolError:
+            continue
+    if not done and admin == "gui":
+        try:
+            _cups(_applescript_admin(rest, either=(raw, add)), run=run,
+                  timeout=300)
+        except SpoolError as e:
+            if "cancel" in str(e).lower() or "-128" in str(e):
+                raise SpoolError("cancelled - no password was given") from e
+            raise
+    elif not done:
+        try:
+            _as_admin([raw] + rest, run=run, admin=admin)
+        except SpoolError:
+            _as_admin([add] + rest, run=run, admin=admin)
     say(f"Queue {queue} is ready. Check with:  lpstat -p {queue}")
     return queue
 
 
 def resume_queue(queue=CUPS_QUEUE, run=None, admin="sudo"):
-    """Start a queue CUPS stopped after a failed job, and let it take jobs."""
-    _as_admin([["cupsenable", queue], ["cupsaccept", queue]], run=run,
-              admin=admin)
+    """Start a queue CUPS stopped after a failed job, and let it take jobs.
+    Without a password where the user may (:func:`_plain`); asking only when
+    CUPS refuses."""
+    steps = [["cupsenable", queue], ["cupsaccept", queue]]
+    try:
+        _plain(steps, run=run)
+    except SpoolError:
+        _as_admin(steps, run=run, admin=admin)
 
 
 if MACOS:

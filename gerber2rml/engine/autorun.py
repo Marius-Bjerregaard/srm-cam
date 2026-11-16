@@ -105,6 +105,33 @@ def level_grid(area, margin, keepout=None, bit=0.8, stock=None):
             (x0, y0, x1, y1))
 
 
+WORK_CLEAR_MM = 0.4          # a surface touch stays this far off a cut
+
+
+def cut_zone(paths, grow):
+    """Where ``paths`` cut, as one shape grown by ``grow`` mm - or None.
+    What a surface touch has to stay off once those paths have been cut: in
+    a hole the bit finds no copper, or finds the rim with its side and
+    reads the surface low."""
+    from shapely.geometry import LineString, Point
+    from shapely.ops import unary_union
+    parts = []
+    for tp in paths or []:
+        run = []
+        for m in list(tp) + [None]:
+            if m is not None and not m.rapid and m.z < 0:
+                run.append((m.x, m.y))
+                continue
+            if len(run) == 1 or (run and len(set(run)) == 1):
+                parts.append(Point(run[0]))
+            elif run:
+                parts.append(LineString(run))
+            run = []
+    if not parts:
+        return None
+    return unary_union(parts).buffer(grow, 8)
+
+
 def level_targets(points, zones, reach=None):
     """Where each of ``points`` is really touched, given the no-go
     ``zones`` (shapely shapes the tool's centre stays out of).
@@ -202,6 +229,16 @@ class JobSource:
     def set_top_fit(self, t):
         pass
 
+    def board_holes(self):
+        """``[(x, y, d)]``: holes of a single-sided board that it can be
+        found again by, in the frame of its bottom toolpaths; [] when it
+        has none that will do (engine/mountfid.py)."""
+        return []
+
+    def set_turn(self, t):
+        """The board was found by its holes: ``t`` puts the job where it
+        really lies. For the drawing; the run applies it itself."""
+
 
 class Events:
     """What the run tells the window. All optional."""
@@ -235,6 +272,10 @@ class Events:
 
     def job(self, key, label, rml):
         """A job is about to be sent: its program, exactly as sent."""
+
+    def progress(self, key, fraction):
+        """How far along its path the job ``key`` has got, 0..1, read off
+        where the head is - not off a clock."""
 
     def check(self, traces_label, deeper_mm):
         """The traces are done and the cut-out is next: block until the
@@ -290,7 +331,8 @@ class AutoRun:
                  should_abort=None, should_pause=None, dry_run=False,
                  runner_opts=None, level=True, surface_hint=None,
                  datum=None, check_cut=True, start_at=None, keepout=None,
-                 arms=None, leave_under=False, nogo=None, level_margin=2.0):
+                 arms=None, leave_under=False, nogo=None, level_margin=2.0,
+                 by_holes=False):
         self.ser, self.printer = ser, printer
         self.src, self.ev = source, events
         self.click, self.size = click_mm, stock_mm
@@ -333,6 +375,12 @@ class AutoRun:
         # Skip every job before this one (finishing a board that stopped).
         self.start_at = start_at
         self._skipping = start_at is not None
+        # A single-sided board put back in the mill for rework: found again
+        # by its own holes, not by where the stock's edges say it should be.
+        # The stock never goes back quite where it lay, and the cuts are
+        # 0.2 mm wide (a board was lost to this the day after it was cut,
+        # 2026-11-16).
+        self.by_holes = bool(by_holes)
         self.pose = self.pose_top = None
         self.rotation = None
         self.fit = None
@@ -432,6 +480,8 @@ class AutoRun:
             for key, _l in bottom:
                 self._step(key, "skipped")
         else:
+            if self.by_holes and not self.double and self.start_at is not None:
+                self._find_by_holes()
             hmap = self._level("level", "bottom", self.rotation)
             self._jobs(bottom, self.rotation, hmap)
         if not self.double:
@@ -460,8 +510,16 @@ class AutoRun:
 
     def _jobs(self, steps, t, hmap):
         """Run ``steps`` in order; before a cut-out, let the traces be
-        checked - and cut again, deeper, as often as asked."""
+        checked - and cut again, deeper, as often as asked.
+
+        A board left in the sheet has no cut-out to stop before, and it is
+        the board that most needs the stop: it is as big as its sheet, the
+        copper is rarely flat that far, and a spot that came out shallow can
+        only be cut again while the stock lies where it lay. So for such a
+        board the same check comes after the last job of the side instead -
+        before the flip, and at the end."""
         traces = None
+        cut_out = False
         for key, label in steps:
             if self._skipping:
                 if not (key == self.start_at or (
@@ -471,32 +529,47 @@ class AutoRun:
                         traces = (key, label)
                     continue
                 self._skipping = False
-            if "cutout" in key and traces is not None and (
-                    self.check_cut or self.start_at == START_AT_CHECK):
-                deeper = 0.0
-                while True:
-                    self._to_view()
-                    answer = self.ev.check(traces[1], deeper)
-                    what, mm = answer[0], answer[1]
-                    boxes = answer[2] if len(answer) > 2 else None
-                    if what == "stop":
-                        raise RunStopped("stopped before the cut-out")
-                    self._wait_for_lid()
-                    if what == "holes":
-                        self.ev.note("Drilling the holes again, %.2f mm deeper…"
-                                     % float(mm))
-                        self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
-                        continue
-                    if what != "again":
-                        break
-                    deeper += float(mm)
-                    self.ev.note("%s again%s, %.2f mm deeper…" % (
-                        traces[1], " in %d boxes" % len(boxes) if boxes
-                        else "", deeper))
-                    self._job(traces[0], traces[1], t, hmap, deeper, boxes)
+            if "cutout" in key:
+                cut_out = True
+                if traces is not None and (
+                        self.check_cut or self.start_at == START_AT_CHECK):
+                    self._check_traces(traces, t, hmap,
+                                       "stopped before the cut-out")
             self._job(key, label, t, hmap)
             if "traces" in key:
                 traces = (key, label)
+        if self.leave_under and traces is not None and not cut_out:
+            if self.start_at == START_AT_CHECK:
+                self._skipping = False      # every job was skipped to here
+            if not self._skipping and (self.check_cut
+                                       or self.start_at == START_AT_CHECK):
+                self._check_traces(traces, t, hmap, "stopped at the check")
+
+    def _check_traces(self, traces, t, hmap, stopped):
+        """Park, let the operator look, and cut again what they ask for -
+        the traces deeper, in boxes or whole, or the holes - until they say
+        go. Raises :class:`RunStopped` with ``stopped`` if they stop."""
+        deeper = 0.0
+        while True:
+            self._to_view()
+            answer = self.ev.check(traces[1], deeper)
+            what, mm = answer[0], answer[1]
+            boxes = answer[2] if len(answer) > 2 else None
+            if what == "stop":
+                raise RunStopped(stopped)
+            self._wait_for_lid()
+            if what == "holes":
+                self.ev.note("Drilling the holes again, %.2f mm deeper…"
+                             % float(mm))
+                self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
+                continue
+            if what != "again":
+                return
+            deeper += float(mm)
+            self.ev.note("%s again%s, %.2f mm deeper…" % (
+                traces[1], " in %d boxes" % len(boxes) if boxes
+                else "", deeper))
+            self._job(traces[0], traces[1], t, hmap, deeper, boxes)
 
     def _step(self, key, state):
         self.ev.step(key, state)
@@ -526,8 +599,9 @@ class AutoRun:
                     "edges, which is where clamps are. Put the stock in the "
                     "bracket, or clear the zones and hold it with tape.")
             if self.datum is not None:
-                tx, ty = stockfind.datum_touch(self.datum[:2], self.datum[2],
-                                               self.size)
+                tx, ty = self._touch_off_holes(
+                    *stockfind.datum_touch(self.datum[:2], self.datum[2],
+                                           self.size), again)
                 self._nogo_point(tx, ty, "the spot where the copper is "
                                          "touched to find its height")
                 self._hop(tx, ty)
@@ -539,7 +613,7 @@ class AutoRun:
                     hint_mm=self.pose.z if again else self.surface_hint,
                     # Flipped, the height is this run's own. The first time
                     # it is from another day, and the bit may be another.
-                    hint_fresh=again)
+                    hint_fresh=again, touch=(tx, ty))
             else:
                 pose = self._find_by_edges(click, again)
             if again:
@@ -551,6 +625,102 @@ class AutoRun:
                          % (pose.x, pose.y, pose.angle))
             return pose
         return self._guard(key, go)
+
+    def _holes_guess(self, again):
+        """Where the board's holes are before the stock has been touched,
+        as a shape (None: nowhere known). In the bracket the stock's outline
+        is known without a touch, so the board can be laid on it first; the
+        second time, turned over, the holes are where a perfect flip puts
+        them, and the shape is a millimetre fatter for a flip that is not."""
+        from shapely import affinity
+        from shapely.ops import unary_union
+        if not again:
+            x0, y0 = stockfind.datum_outline(self.datum[:2], self.datum[2],
+                                             self.size)
+            w, h = self.size
+            ex = self.src.extent("bottom")
+            whole = not self.double and fills_stock(ex[2] - ex[0],
+                                                    ex[3] - ex[1], w, h)
+            # Exactly what _sequence does once the stock is found: the
+            # bracket gives the same outline both times.
+            self.src.place(stockfind.StockPose(x0, y0, 0.0, w, h, 0.0),
+                           0.0 if whole else self.margin)
+        shapes = []
+        for key, _label in self.src.bottom_steps():
+            if "drill" in key or key == "align":
+                z = cut_zone(self.src.toolpaths(key)[0],
+                             self.bit + WORK_CLEAR_MM + (1.0 if again else 0.0))
+                if z is not None:
+                    shapes.append(z)
+        if not shapes:
+            return None
+        zone = unary_union(shapes)
+        if again:
+            p = self.pose
+            zone = affinity.affine_transform(
+                zone, [-1.0, 0.0, 0.0, 1.0, 2.0 * p.x + p.w, 0.0])
+        elif self.double and self.start_at is not None:
+            # A run started part-way on a two-sided board may be on a sheet
+            # that is already turned over: off the holes both ways up.
+            zone = unary_union([zone, affinity.affine_transform(
+                zone, [-1.0, 0.0, 0.0, 1.0, 2.0 * x0 + w, 0.0])])
+        return zone
+
+    def _touch_off_holes(self, tx, ty, again):
+        """The spot where the copper is touched for its height, moved to
+        the nearest free one when it is on a hole of the board: there the
+        probe finds no copper and keeps going down (a board put back for
+        rework, and the top of any drilled board; the lab mill,
+        2026-11-16)."""
+        from shapely.geometry import Point
+        try:
+            zone = self._holes_guess(again)
+        except Exception as e:               # noqa: BLE001 - not worth a run
+            self.ev.note("Could not work out where the holes are (%s); "
+                         "touching the usual spot." % e)
+            return tx, ty
+        if zone is None or not zone.intersects(Point(tx, ty)):
+            return tx, ty
+        x0, y0 = stockfind.datum_outline(self.datum[:2], self.datum[2],
+                                         self.size)
+        w, h = self.size
+        inset = min(3.0, w / 4.0, h / 4.0)
+        mid = (x0 + w / 2.0, y0 + h / 2.0)
+
+        def free(x, y):
+            if not (x0 + inset <= x <= x0 + w - inset
+                    and y0 + inset <= y <= y0 + h - inset):
+                return False
+            if zone.intersects(Point(x, y)):
+                return False
+            if self.nogo and self._in_nogo(x, y):
+                return False
+            if self.keepout is not None:
+                g = self.bit + 1.5
+                k = self.keepout
+                if k[0] - g < x < k[2] + g and k[1] - g < y < k[3] + g:
+                    return False
+            return True
+
+        d = 1.0
+        while d <= LEVEL_MOVE_MM + 1e-9:
+            ring = []
+            for k in range(16):
+                a = k * math.pi / 8.0
+                x, y = tx + d * math.cos(a), ty + d * math.sin(a)
+                if free(x, y):
+                    ring.append((math.dist((x, y), mid),
+                                 (round(x, 3), round(y, 3))))
+            if ring:
+                x, y = min(ring)[1]
+                self.ev.note("The usual spot to touch the copper is on one "
+                             "of the board's holes: touching %.1f mm beside "
+                             "it instead." % d)
+                return x, y
+            d += 1.0
+        self.ev.note("The spot where the copper is touched is on one of the "
+                     "board's holes, and there is no free spot near it.")
+        return tx, ty
 
     def _find_by_edges(self, click, again):
         return stockfind.find_stock(self.ser, click, self.size,
@@ -1012,27 +1182,39 @@ class AutoRun:
             # spot near is not made, and takes the height of the nearest
             # touch that was. With too few left there is no map worth the
             # name, and the run says so instead of guessing.
-            targets = (level_targets(pts, self._nogo_boxes(),
-                                     reach=LEVEL_MOVE_MM) if self.nogo
-                       else list(pts))
+            # The same for a touch that would land on work already in the
+            # board - a hole, a trace cut on an earlier run: in a hole the
+            # bit reads nothing, or the rim, low (the lab mill, 2026-11-16).
+            work = self._cut_already(side, t)
+            zones = self._nogo_boxes() if self.nogo else []
+            if work is not None:
+                zones = zones + [work]
+            targets = (level_targets(pts, zones, reach=LEVEL_MOVE_MM)
+                       if zones else list(pts))
             open_i = [i for i, tg in enumerate(targets) if tg is not None]
             if len(open_i) < max(3, (len(pts) + 1) // 2):
                 raise RunFailed(
-                    "the no-go zones leave only %d of the %d surface points "
-                    "free - too few to know the copper's shape. Move a "
-                    "clamp off the board's area, or turn off Probe the "
-                    "surface first." % (len(open_i), len(pts)))
+                    "the no-go zones and the work already cut leave only %d "
+                    "of the %d surface points free - too few to know the "
+                    "copper's shape. Move a clamp off the board's area, or "
+                    "turn off Probe the surface first."
+                    % (len(open_i), len(pts)))
             moved = [math.dist(targets[i], pts[i]) for i in open_i
                      if targets[i] != pts[i]]
             if moved:
                 self.ev.note("%d of %d surface points moved off a no-go "
-                             "zone, by up to %.0f mm."
+                             "zone or a cut, by up to %.0f mm."
                              % (len(moved), len(pts), max(moved)))
             if len(open_i) < len(pts):
                 self.ev.note("%d of %d surface points are in a no-go zone "
-                             "with no free spot near and are not touched; "
-                             "each takes the height of the nearest one that "
-                             "is." % (len(pts) - len(open_i), len(pts)))
+                             "or on a cut with no free spot near and are "
+                             "not touched; each takes the height of the "
+                             "nearest one that is."
+                             % (len(pts) - len(open_i), len(pts)))
+            def on_work(x, y):
+                from shapely.geometry import Point
+                return work is not None and work.intersects(Point(x, y))
+
             ref_um = int((self.pose_top or self.pose).z * 1000)
             # A grid point can land on a hole the first side drilled (a
             # fiducial sits 2 mm in from the board corner, exactly where the
@@ -1042,6 +1224,8 @@ class AutoRun:
             for ox, oy in NUDGES:
                 fx, fy = targets[i0][0] + ox, targets[i0][1] + oy
                 if self.nogo and self._in_nogo(fx, fy):
+                    continue
+                if (ox or oy) and on_work(fx, fy):
                     continue
                 self._hop(fx, fy)
                 try:
@@ -1066,6 +1250,8 @@ class AutoRun:
                 for ox, oy in NUDGES:
                     px, py = x + ox, y + oy
                     if self.nogo and self._in_nogo(px, py):
+                        continue
+                    if (ox or oy) and on_work(px, py):
                         continue
                     if self.nogo and self._crosses_nogo(at, (px, py)):
                         # The firmware goes from touch to touch in a straight
@@ -1113,6 +1299,47 @@ class AutoRun:
             return HeightMap.from_points(rows, nx, ny)
         return self._guard(key, go)
 
+    def _cut_already(self, side, t):
+        """What is cut into this face of the board before the surface is
+        touched, as a shape the touches stay off (None: nothing).
+
+        The holes, and only the holes: on the top they came through from
+        the bottom, and on a board put back they are there; on a fresh sheet
+        keeping off where they will be costs nothing. The reference holes on
+        the top. NOT the traces, cut or not: they are everywhere on a board,
+        and keeping off them would move every touch off its grid point and
+        spoil the map; a touch across a 0.2 mm channel still lands on the
+        copper either side."""
+        from shapely.ops import unary_union
+        grow = self.bit + WORK_CLEAR_MM      # the cut's half and the bit's
+        shapes = []
+
+        def add(key, turn):
+            try:
+                paths = self.src.toolpaths(key)[0]
+            except Exception:                # noqa: BLE001 - no such job
+                return
+            if turn is not None:
+                paths = apply_to_toolpaths(paths, turn)
+            z = cut_zone(paths, grow)
+            if z is not None:
+                shapes.append(z)
+
+        steps = (self.src.bottom_steps() if side == "bottom"
+                 else self.src.top_steps())
+        if side == "top":
+            add(HOLES_AGAIN, None)
+            if self.fit is not None:
+                from shapely.geometry import Point
+                r = self.src.fiducial_clearance_um() / 1000.0 + grow
+                for x, y in self.src.fiducials()[1]:
+                    shapes.append(Point(self.fit.apply(x, y)).buffer(r, 8))
+        for key, _label in steps:
+            holes = "drill" in key or key == "align"
+            if holes and side == "bottom":
+                add(key, t)
+        return unary_union(shapes) if shapes else None
+
     def _flat(self, side):
         """No levelling: Z zero on the copper the stock finder touched."""
         pose = self.pose_top if side == "top" else self.pose
@@ -1157,7 +1384,7 @@ class AutoRun:
                     measured.append(None)
                     continue
                 try:
-                    found = self._locate(guess[0], guess[1], radius)
+                    found = self._locate_wider(guess[0], guess[1], radius)
                 except (RunFailed, ProbeError) as e:
                     if self.should_abort():
                         raise
@@ -1198,11 +1425,87 @@ class AutoRun:
             return t
         return self._guard("fiducials", go)
 
-    def _locate(self, x_mm, y_mm, search_um=None):
+    def _find_by_holes(self):
+        """Find a board that is already cut by its own holes, and put the
+        job on them: :attr:`rotation` becomes the fit of where the holes
+        are drawn to where they are. Nothing is cut here, and nothing after
+        it unless the holes agree."""
+        holes = self.src.board_holes()
+        if len(holes) < 2:
+            raise RunFailed(
+                "this board has no holes it can be found by - it takes two "
+                "of one size, wide enough for the bit to drop into, at "
+                "opposite ends of the board. Untick finding the board by "
+                "its holes to go by the stock's edges instead.")
+        nominal, seen = [], []
+        off_x = off_y = 0.0
+        for i, (x, y, d) in enumerate(holes):
+            self.ev.note("Finding hole %d of %d…" % (i + 1, len(holes)))
+            px, py = self.rotation.apply(x, y)
+            if len(seen) >= 2:
+                guess = fit_transform(nominal, seen,
+                                      allow_scale=False).apply(x, y)
+                radius = FITTED_SEARCH_UM
+            else:
+                guess = (px + off_x, py + off_y)
+                radius = HOLE_SEARCH_UM
+            clear = int(max(0.15, (d - self.bit) / 2.0) * 1000)
+            try:
+                found = self._locate_wider(guess[0], guess[1], radius, clear)
+            except (RunFailed, ProbeError) as e:
+                if self.should_abort():
+                    raise
+                self.ev.note("Hole %d skipped: %s." % (i + 1, e))
+                continue
+            nominal.append((x, y))
+            seen.append(found)
+            off_x, off_y = found[0] - px, found[1] - py
+            self.ev.note("Hole %d at X %.2f, Y %.2f: %+.2f, %+.2f from where "
+                         "the stock's edges put it."
+                         % (i + 1, found[0], found[1], off_x, off_y))
+        need = min(3, len(holes))
+        if len(seen) < need:
+            raise RunFailed(
+                "only %d of the board's %d holes were found, and it takes "
+                "%d to trust where it lies. Check they are open and not "
+                "full of swarf. Nothing was cut."
+                % (len(seen), len(holes), need))
+        t = fit_transform(nominal, seen, allow_scale=False)
+        worst = max(residuals(t, nominal, seen))
+        if worst > FIT_WORST_MM:
+            raise RunFailed("the board's holes disagree by %.2f mm - one was "
+                            "misread, or this is not the board the job is "
+                            "for. Nothing was cut." % worst)
+        self.rotation = t
+        self.src.set_turn(t)
+        self._check_keepout("bottom")
+        self._check_nogo("bottom")
+        self.ev.note("The board is found by %d of its holes, to within "
+                     "%.3f mm: the cuts go where they went."
+                     % (len(seen), worst))
+
+    def _locate_wider(self, x_mm, y_mm, search_um=None, clear_um=None):
+        """:meth:`_locate`, and when a short search - the one made once two
+        holes have said where the rest should be - finds nothing, the full
+        one. Two holes a little misread put the third a millimetre out at
+        the far end of the board, just past the short search."""
+        extra = () if clear_um is None else (clear_um,)
+        try:
+            return self._locate(x_mm, y_mm, search_um, *extra)
+        except RunFailed:
+            if (self.should_abort() or not search_um
+                    or search_um >= HOLE_SEARCH_UM):
+                raise
+            self.ev.note("Not within %.1f mm of where the others put it: "
+                         "looking %.1f mm round."
+                         % (search_um / 1000.0, HOLE_SEARCH_UM / 1000.0))
+            return self._locate(x_mm, y_mm, HOLE_SEARCH_UM, *extra)
+
+    def _locate(self, x_mm, y_mm, search_um=None, clear_um=None):
         """The centre of the hole near (x, y), mm."""
         search_um = search_um or HOLE_SEARCH_UM
         x0, y0 = int(x_mm * 1000), int(y_mm * 1000)
-        ref = int(self.pose_top.z * 1000)
+        ref = int((self.pose_top or self.pose).z * 1000)
         self._nogo_point(x_mm, y_mm, "a reference hole")
         for ox, oy in ((2500, 0), (-2500, 0), (0, 2500), (0, -2500)):
             if self.nogo and self._in_nogo(x_mm + ox / 1000.0,
@@ -1221,25 +1524,33 @@ class AutoRun:
                             % (x_mm, y_mm))
         # The bit drops in only near the middle, and a milled hole comes out a
         # little under size: rings closer than the nominal clearance, not gaps.
-        step = max(200, int(self.src.fiducial_clearance_um() * 0.75))
-        start = None
+        step = max(200, int((clear_um or self.src.fiducial_clearance_um())
+                            * 0.75))
+        # A spot that reads "no copper" once and "copper" the next time is
+        # the hole's rim, or a burr on it: the search goes on from there
+        # rather than giving the hole up (the first of four was lost to
+        # exactly that on a flipped board, 2026-11-16).
+        why = None
         for ring in range(0, search_um // step + 1):
             r = ring * step
             n = 1 if r == 0 else max(6, int(round(2 * math.pi * r / step)))
             for k in range(n):
                 a = 2 * math.pi * k / n
                 x, y = x0 + int(r * math.cos(a)), y0 + int(r * math.sin(a))
-                if not hole_test(self.ser, x, y,
-                                 should_abort=self.should_abort):
-                    start = (x, y)
-                    break
-            if start:
-                break
-        if start is None:
-            raise RunFailed("fiducial not found within %.1f mm of %.1f, %.1f"
-                            % (search_um / 1000, x_mm, y_mm))
-        return find_hole_center(self.ser, start[0] / 1000.0, start[1] / 1000.0,
-                                should_abort=self.should_abort)
+                if hole_test(self.ser, x, y, should_abort=self.should_abort):
+                    continue
+                try:
+                    return find_hole_center(self.ser, x / 1000.0, y / 1000.0,
+                                            should_abort=self.should_abort)
+                except ProbeError as e:
+                    if self.should_abort() or str(e) in ("stopped", "aborted"):
+                        raise
+                    why = e
+        if why is not None:
+            raise RunFailed("a hole was felt near %.1f, %.1f but its centre "
+                            "could not be found (%s)" % (x_mm, y_mm, why))
+        raise RunFailed("fiducial not found within %.1f mm of %.1f, %.1f"
+                        % (search_um / 1000, x_mm, y_mm))
 
     # -- jobs ----------------------------------------------------------------
     def _check_frame(self, x, y):
@@ -1314,9 +1625,31 @@ class AutoRun:
                 self._check_frame(first.x, first.y)
             self.ev.note("%s…" % label)
             self.ev.job(key, label, prog)
+            # How far the job has got is read off where the head is along
+            # its path. An estimate from the planned feeds ran out long
+            # before the mill did, and the bar then stood still saying "at
+            # least" (the lab mill, 2026-11-16).
+            from gerber2rml.engine.progress import RunProgress
+            z_off = self.z_surf + (DRY_AIR_MM if self.dry_run else 0.0)
+            try:
+                track = RunProgress(paths, xy, plunge, from_start=True,
+                                    max_dist=1.5)
+            except Exception:                # noqa: BLE001 - only a readout
+                track = None
+
+            def followed(pos):
+                if track is None:
+                    return
+                try:
+                    f = track.update(pos[0], pos[1], pos[2] - z_off)[0]
+                    self.ev.progress(key, f)
+                except Exception:            # noqa: BLE001 - only a readout
+                    pass
+
             JobRunner(self.ser, self.printer, self.should_abort,
                       self.should_pause, self.ev.note,
-                      **self.runner_opts).run(prog, label, end_mm=end)
+                      **self.runner_opts).run(prog, label, end_mm=end,
+                                              progress=followed)
             # The head ends high and somewhere; the next probe re-finds it.
             return True
         return self._guard(key, go)
