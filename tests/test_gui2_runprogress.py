@@ -68,14 +68,17 @@ def test_the_line_says_the_step_the_percent_and_the_time_left(page):
     page._clock.step("drill_run", "running")
     t.t = 140                                        # half of the drill
     page._tick()
-    text = page.progress_lbl.text()
-    assert "Step 2 of 3 · Drill" in text
-    # The bar and the first time are the step in hand...
-    assert "50%" in text and "about 1m 40s left of this step" in text
+    # The step in hand over the bar, its percent at the bar's end...
+    assert page.progress_head.text() == "Step 2 of 3 · Drill"
+    assert page.progress_pct.text() == "50 %"
     assert page.progress.value() == 500
-    # ...and the whole run is the estimate beside it.
-    assert "whole run: about 14m 20s left" in text
-    assert "done about " in text and "so far" in text
+    rows = {k: v.text() for k, (_n, v) in page._progress_rows.items()}
+    assert rows["step"] == "1m 40s left"
+    # ...and the whole run and the time so far in rows of their own.
+    assert rows["run"].startswith("14m 20s left") and "done about " in rows["run"]
+    assert rows["elapsed"] == "2m 20s"
+    assert [n.text() for n, _v in page._progress_rows.values()] == [
+        "This step", "Whole run", "Elapsed"]
 
 
 def test_the_machine_bar_says_it_too_while_the_run_holds_the_machine(page):
@@ -107,12 +110,12 @@ def test_waiting_at_the_flip_says_so_and_stops_the_clock(page):
     page._clock_wait(True)
     t.t = 620
     page._tick()
-    assert "waiting for you" in page.progress_lbl.text()
+    assert "Waiting for you" in page._progress_rows["step"][1].text()
     assert page.progress.value() == 500              # where it was
-    assert "whole run: about" in page.progress_lbl.text()
+    assert "left" in page._progress_rows["run"][1].text()
     page._clock_wait(False)
     page._tick()
-    assert "waiting" not in page.progress_lbl.text()
+    assert "aiting" not in page.progress_text()
 
 
 def test_a_step_past_its_estimate_says_at_least(page):
@@ -120,4 +123,19 @@ def test_a_step_past_its_estimate_says_at_least(page):
     page._clock.step("stock", "running")
     t.t = 400
     page._tick()
-    assert "at least" in page.progress_lbl.text()
+    assert page._progress_rows["step"][1].text() == "past its estimate"
+    assert page._progress_rows["run"][1].text().startswith("at least ")
+
+
+def test_a_finished_run_leaves_one_line_in_place_of_the_rows(page):
+    t = _clocked(page)
+    page._progress_running(True)
+    page._clock.step("stock", "running")
+    t.t = 40
+    page._tick()
+    page._on_finished(True, "The board is done.")
+    assert page.progress_lbl.text() == "Done in 40s."
+    assert not page.progress_lbl.isHidden()
+    assert page.progress_head.isHidden()
+    assert all(v.isHidden() for _n, v in page._progress_rows.values())
+    assert page.progress.value() == 1000 and page.progress_pct.text() == "100 %"
