@@ -776,11 +776,43 @@ class AutoRunPage(inspector.Page):
         self.progress.setRange(0, 1000)
         self.progress.setTextVisible(False)
         self.progress.setFixedHeight(8)
-        self.progress.setVisible(False)
-        run.add(self.progress)
+        # Laid out, not strung into one sentence: the step in hand and its
+        # time above the bar, the percent at the bar's end, and the whole
+        # run and the time so far in two rows under it - label left, number
+        # in a column, so the numbers change without moving sideways.
+        self.progress_box = QWidget()
+        pg = QGridLayout(self.progress_box)
+        pg.setContentsMargins(0, 0, 0, 0)
+        pg.setHorizontalSpacing(theme.GAP_M)
+        pg.setVerticalSpacing(theme.GAP_S)
+        pg.setColumnStretch(1, 1)
+        self.progress_head = widgets.body("", wrap=False)
+        pg.addWidget(self.progress_head, 0, 0, 1, 2)
+        self._progress_rows = {}
+        for row, key, title in ((1, "step", "This step"),
+                                (3, "run", "Whole run"),
+                                (4, "elapsed", "Elapsed")):
+            name = widgets.hint(title, wrap=False)
+            value = widgets.body("", wrap=False)
+            pg.addWidget(name, row, 0)
+            pg.addWidget(value, row, 1)
+            self._progress_rows[key] = (name, value)
+        brow = QWidget()
+        bh = QHBoxLayout(brow)
+        bh.setContentsMargins(0, 0, 0, 0)
+        bh.setSpacing(theme.GAP_S)
+        bh.addWidget(self.progress, 1)
+        self.progress_pct = widgets.body("", wrap=False)
+        self.progress_pct.setMinimumWidth(44)
+        self.progress_pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        bh.addWidget(self.progress_pct)
+        pg.addWidget(brow, 2, 0, 1, 2)
+        # The one line a finished run leaves: how long it took.
         self.progress_lbl = widgets.body("")
         self.progress_lbl.setVisible(False)
-        run.add(self.progress_lbl)
+        pg.addWidget(self.progress_lbl, 5, 0, 1, 2)
+        self.progress_box.setVisible(False)
+        run.add(self.progress_box)
         self._clock = None
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(1000)
@@ -1311,14 +1343,33 @@ class AutoRunPage(inspector.Page):
             out.append((key, label, s))
         return out
 
+    def _progress_running(self, on):
+        """While a run goes: the step, its time, the whole run, the time so
+        far. Afterwards one line in their place - how long it took."""
+        self.progress_head.setVisible(on)
+        for name, value in self._progress_rows.values():
+            name.setVisible(on)
+            value.setVisible(on)
+        self.progress_lbl.setVisible(not on)
+
+    def progress_text(self):
+        """Everything the progress display says, top to bottom, as one
+        string - for the log and the tests."""
+        if not self.progress_lbl.isHidden():
+            return self.progress_lbl.text()
+        parts = [self.progress_head.text(), self.progress_pct.text()]
+        parts += ["%s %s" % (n.text(), v.text())
+                  for n, v in self._progress_rows.values()]
+        return " | ".join(parts)
+
     def _tick(self):
-        """Once a second while a run is going: the bar, the line under it,
-        and the same line on the machine bar.
+        """Once a second while a run is going: the bar and what stands
+        round it, and one short line on the machine bar.
 
         The bar and the first time are the step in hand - that is what
         moves while somebody watches, and a bar for the whole run stood
         still for minutes on a long isolation pass. The whole run is the
-        estimate beside it."""
+        estimate under it."""
         if self._clock is None:
             return
         from datetime import datetime, timedelta
@@ -1329,25 +1380,26 @@ class AutoRunPage(inspector.Page):
         where = ("Step %d of %d · %s" % (s["index"], s["count"], s["label"])
                  if s["index"] else "Starting")
         left = format_duration(s["left_s"])
+        at = (datetime.now() + timedelta(seconds=s["left_s"])).strftime(
+            "%H:%M")
         if s["waiting"]:
-            line = ("%s · %d%% · waiting for you - the clock is stopped · "
-                    "whole run: about %s left" % (where, pct, left))
-            short = "%s · %d%% · waiting for you" % (where, pct)
+            this = "Waiting for you - the clock is stopped"
+            whole = "%s left" % left
+            short = "%s · %d %% · waiting for you" % (where, pct)
         else:
-            at = (datetime.now() + timedelta(seconds=s["left_s"])).strftime(
-                "%H:%M")
-            more = "at least " if s["over"] else "about "
             this = ("past its estimate" if s["over"] else
-                    "about %s left of this step"
-                    % format_duration(s["step_left_s"]))
-            line = ("%s · %d%% · %s · whole run: %s%s left, done %s%s, "
-                    "%s so far" % (
-                        where, pct, this, more, left,
-                        "after " if s["over"] else "about ", at,
-                        format_duration(s["elapsed_s"])))
-            short = "%s · %d%% · %s · whole run %s%s left" % (
-                where, pct, this, more, left)
-        self.progress_lbl.setText(line)
+                    "%s left" % format_duration(s["step_left_s"]))
+            whole = "%s%s left  ·  done %s %s" % (
+                "at least " if s["over"] else "", left,
+                "after" if s["over"] else "about", at)
+            short = "%s · %d %% · %s · whole run %s%s" % (
+                where, pct, this, "at least " if s["over"] else "", left)
+        self.progress_head.setText(where)
+        self.progress_pct.setText("%d %%" % pct)
+        self._progress_rows["step"][1].setText(this)
+        self._progress_rows["run"][1].setText(whole)
+        self._progress_rows["elapsed"][1].setText(
+            format_duration(s["elapsed_s"]))
         bar = getattr(self.ctl, "bar", None)
         if bar is not None and hasattr(bar, "set_run_progress"):
             bar.set_run_progress(short)
@@ -1493,8 +1545,8 @@ class AutoRunPage(inspector.Page):
         from gerber2rml.gui2.runclock import RunClock
         self._clock = RunClock(self._estimates(WindowSource(ctl, self._gui)))
         self.progress.setValue(0)
-        self.progress.setVisible(True)
-        self.progress_lbl.setVisible(True)
+        self._progress_running(True)
+        self.progress_box.setVisible(True)
         self._clock_timer.start()
         self._tick()
         self._events = ev = _Events()
@@ -2016,9 +2068,11 @@ class AutoRunPage(inspector.Page):
             s = self._clock.snapshot()
             if ok:
                 self.progress.setValue(1000)
+            self.progress_pct.setText("%d %%" % (self.progress.value() // 10))
             self.progress_lbl.setText(
                 ("Done in %s." if ok else "Stopped after %s.")
                 % format_duration(s["elapsed_s"]))
+            self._progress_running(False)
             self._clock = None
         self.ctl.bar.set_held_by_run(False)
         self._sync_offline()
