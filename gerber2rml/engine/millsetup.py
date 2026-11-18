@@ -356,10 +356,25 @@ def set_spindle_percent(dev, percent, **timing):
 
 # --- the real device --------------------------------------------------------
 
+from gerber2rml.platform import _is_linux, _is_windows  # noqa: E402
+
+WINDOWS = _is_windows()
+LINUX = _is_linux()
+
 USB_HINT = (
     "Reading the mill's settings needs direct USB access: the pyusb package "
-    "and libusb. From source, `pip install pyusb` and `brew install libusb`; "
-    "the packaged app carries both. See docs/vpanel-settings.md.")
+    "and libusb. From source, `pip install pyusb` and `brew install libusb` "
+    "(or your distribution's libusb-1.0); the packaged app carries both. See "
+    "docs/vpanel-settings.md.")
+
+# Linux lets a vendor request past the usblp driver without claiming
+# anything, but /dev/bus/usb is root's unless a udev rule says otherwise.
+UDEV_RULE = ('SUBSYSTEM=="usb", ATTR{idVendor}=="0b75", '
+             'ATTR{idProduct}=="039f", MODE="0666"')
+UDEV_HINT = (
+    "On Linux this needs permission to the mill's USB device: put the line "
+    + UDEV_RULE + " in /etc/udev/rules.d/60-srm20.rules, run `sudo udevadm "
+    "control --reload` and plug the mill in again.")
 
 
 def _libusb_backend():
@@ -385,18 +400,28 @@ def _libusb_backend():
     return libusb1.get_backend()
 
 
-def open_mill():
-    """The SRM-20 as a pyusb device, ready for the functions above.
+def _open_windows():
+    """Windows: through the USB printer driver the Roland driver sits on
+    (:mod:`gerber2rml.engine.usbprint_win`). The driver stays; the printer
+    queue the jobs go through is not touched."""
+    from gerber2rml.engine import usbprint_win
+    try:
+        dev = usbprint_win.open_device(ROLAND_VID, SRM20_PID)
+    except OSError as e:
+        raise SetupError(str(e)) from e
+    if dev is None:
+        raise SetupError("no SRM-20 among this PC's USB printers - is the "
+                         "mill switched on, its cable plugged into this PC, "
+                         "and Roland's driver installed?")
+    if not is_srm20(dev):
+        dev.close()
+        raise SetupError("the mill is on USB but did not answer its settings "
+                         "channel through the printer driver. Close VPanel "
+                         "if it is open, and try again.")
+    return dev
 
-    The device is not configured, claimed or detached from the system's
-    printer driver: control transfers on endpoint 0 need none of that, and
-    taking the printer interface away would break the queue the jobs go
-    through. That VPanel's own polling and a print job coexist on Windows is
-    the same arrangement.
 
-    Windows is not served: the Roland driver owns the device there and
-    libusb cannot open it. VPanel runs on Windows, so nothing is lost.
-    """
+def _open_libusb():
     try:
         import usb.core
     except ImportError as e:
@@ -415,5 +440,33 @@ def open_mill():
     if not is_srm20(dev):
         raise SetupError("the mill is on USB but does not answer its "
                          "settings channel. Another program may hold it, or "
-                         "this system does not let SRM-CAM talk to it.")
+                         "this system does not let SRM-CAM talk to it."
+                         + (" " + UDEV_HINT if LINUX else ""))
     return dev
+
+
+def open_mill():
+    """The SRM-20 as a device with pyusb's ``ctrl_transfer``, ready for the
+    functions above.
+
+    macOS and Linux: pyusb and libusb. The device is not configured, claimed
+    or detached from the system's printer driver: vendor control transfers
+    on endpoint 0 need none of that (Linux's usbfs lets vendor requests past
+    usblp unclaimed), and taking the printer interface away would break the
+    queue the jobs go through. That VPanel's own polling and a print job
+    coexist on Windows is the same arrangement.
+
+    Windows: the Roland driver owns the device and libusb cannot open it, so
+    the same transfers go through the USB printer driver's vendor-request
+    door instead (:func:`_open_windows`). Should that not find the mill,
+    libusb is tried too, for a PC where it can reach it.
+    """
+    if WINDOWS:
+        try:
+            return _open_windows()
+        except SetupError as first:
+            try:
+                return _open_libusb()
+            except SetupError:
+                raise first from None
+    return _open_libusb()

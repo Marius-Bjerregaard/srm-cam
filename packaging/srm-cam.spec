@@ -53,18 +53,24 @@ hiddenimports += collect_submodules("OpenGL")      # PyOpenGL platform/back ends
 hiddenimports += collect_submodules("gerbonara")
 hiddenimports += ["qrcode"]                        # phone photo QR (function-level import)
 
-# ---- macOS: pyusb and the libusb it loads --------------------------------
+# ---- macOS and Linux: pyusb and the libusb it loads ----------------------
 # engine/millsetup.py reads and sets the mill's own settings over USB control
 # transfers. pyusb is imported inside a function and loads libusb by name at
 # run time, so PyInstaller sees neither: the module is named here and the
 # library is copied in beside the executable, where millsetup looks first.
 # Without Homebrew's libusb the app still builds; the Machine menu then says
 # what is missing instead of reading the mill.
+# Linux the same, with the distribution's libusb. Windows needs neither: it
+# reaches the mill through the USB printer driver (engine/usbprint_win.py).
 binaries = []
-if sys.platform == "darwin":
+if sys.platform == "darwin" or sys.platform.startswith("linux"):
     hiddenimports += ["usb", "usb.core", "usb.backend.libusb1"]
     for _lib in (Path("/opt/homebrew/lib/libusb-1.0.0.dylib"),
-                 Path("/usr/local/lib/libusb-1.0.0.dylib")):
+                 Path("/usr/local/lib/libusb-1.0.0.dylib"),
+                 Path("/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0"),
+                 Path("/lib/x86_64-linux-gnu/libusb-1.0.so.0"),
+                 Path("/usr/lib64/libusb-1.0.so.0"),
+                 Path("/usr/lib/libusb-1.0.so.0")):
         if _lib.is_file():
             binaries.append((str(_lib), "."))
             break

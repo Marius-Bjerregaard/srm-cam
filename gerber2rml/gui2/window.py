@@ -1099,14 +1099,13 @@ class MainWindow(QMainWindow):
             from gerber2rml.gui2 import macmill
             self._act(m, "Set up the mill on this Mac…",
                       lambda: macmill.setup_sheet(self))
-        if not rmlspool.WINDOWS:
-            # Command Set and the spindle speed, which otherwise need VPanel
-            # on a Windows PC. Not offered on Windows: the Roland driver owns
-            # the device there and VPanel is at hand (engine/millsetup.py).
-            from gerber2rml.gui2 import millsettings
-            self._act(m, "The mill's settings…",
-                      lambda: millsettings.settings_sheet(self))
-            m.addSeparator()
+        # Command Set and the spindle speed, which otherwise need VPanel.
+        # Over libusb on macOS and Linux, through the USB printer driver on
+        # Windows (engine/millsetup.py).
+        from gerber2rml.gui2 import millsettings
+        self._act(m, "The mill's settings…",
+                  lambda: millsettings.settings_sheet(self))
+        m.addSeparator()
         self._act(m, "Rescan the serial ports", self.bar.refresh_ports)
         self._act(m, "Connect / disconnect", self.bar._toggle_connect, "Ctrl+L")
         m.addSeparator()
