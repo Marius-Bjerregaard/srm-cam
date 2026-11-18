@@ -432,3 +432,19 @@ def test_a_ledger_that_cannot_be_read_does_not_stop_the_export(loaded, tmp_path,
                         lambda *a, **k: (_ for _ in ()).throw(OSError("ro")))
     written = loaded.export_to(tmp_path)
     assert any(str(p).endswith(".nc") for p in written)
+
+
+def test_screwed_down_the_lift_follows_the_heads_whatever_comes_after(loaded):
+    """A profile applied after the screws were ticked put the lift back to
+    2 mm, and the checks then failed the job for it. The app sets it."""
+    from gerber2rml.engine import spoilboard
+    _on_a_sheet(loaded)
+    loaded.action_screws_toggled(True)
+    for job in (loaded.state.trace, loaded.state.drill, loaded.state.cutout):
+        job.travel_z = 2.0                       # what a profile writes
+    loaded.refresh_checks()
+    need = spoilboard.min_travel_z()
+    assert all(j.travel_z >= need for j in (
+        loaded.state.trace, loaded.state.drill, loaded.state.cutout))
+    assert not [c for c in loaded._checks
+                if c.title == "A rapid would hit a screw head"]

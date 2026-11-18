@@ -256,3 +256,78 @@ def test_older_firmware_with_no_known_height_drops_to_the_same_spot(
                         lambda s, timeout=1.5: (4, {"timedmove"}))
     assert stockfind.drop_to_hint(ser, None)
     assert m.pos[2] == surface + stockfind.STALE_ABOVE_UM
+
+
+class _Replies:
+    """A port that answers the surface search from a script, and keeps what
+    was sent: for the replies the simulator never gives."""
+    def __init__(self, p_replies, z=-30000):
+        self.p, self.z, self.sent, self.out = list(p_replies), z, [], []
+
+    def write(self, data):
+        line = data.decode().strip()
+        self.sent.append(line)
+        c = line[:1]
+        if c == "D":
+            self.out.append(b"D 100000 80000 %d\n" % self.z)
+        elif c == "P":
+            self.out.append(self.p.pop(0).encode() + b"\n")
+        elif c == "Q":
+            self.out.append(b"Q 100000 80000 %d 0\n" % self.z)
+        elif c == "N":
+            dz = int(line.split()[3])
+            self.z += dz
+            self.out.append(b"N 100 %d -1 100000 80000 %d\n" % (abs(dz), self.z))
+
+    def readline(self):
+        return self.out.pop(0) if self.out else b""
+
+    def flush(self):
+        pass
+
+    reset_input_buffer = flush
+
+    @property
+    def in_waiting(self):
+        return 0
+
+
+def _seek(monkeypatch, replies):
+    monkeypatch.setattr(stockfind, "travel", lambda *a, **k: None)
+    monkeypatch.setattr(stockfind, "drop_to_hint", lambda *a, **k: True)
+    ser = _Replies(replies)
+    return ser, lambda: stockfind.seek_surface(ser, 100000, 80000)
+
+
+def _lowered(ser):
+    return [s for s in ser.sent if s.startswith("N")]
+
+
+def test_a_touch_that_was_not_steady_never_takes_the_head_lower(monkeypatch):
+    """UNSTABLE means the copper WAS touched. The search used to answer it
+    with 5.5 mm down at the rapid, into the stock (2026-11-18, on Start)."""
+    ser, seek = _seek(monkeypatch, ["E 900 UNSTABLE"] * 3)
+    with pytest.raises(stockfind.ProbeError, match="not steady"):
+        seek()
+    assert _lowered(ser) == []
+
+
+def test_an_unsteady_touch_is_tried_again_from_the_same_height(monkeypatch):
+    ser, seek = _seek(monkeypatch, ["E 900 UNSTABLE", "R 900 0 0 -33000"])
+    assert seek() == -33000
+    assert _lowered(ser) == []
+
+
+@pytest.mark.parametrize("reply", ["E 900 ABORT", "E 900 RUNAWAY", "~ ok",
+                                   "E 900 NODATUM"])
+def test_only_a_clean_miss_takes_the_head_lower(monkeypatch, reply):
+    ser, seek = _seek(monkeypatch, [reply] * 12)
+    with pytest.raises(stockfind.ProbeError, match="not taken any lower"):
+        seek()
+    assert _lowered(ser) == []
+
+
+def test_a_clean_miss_goes_one_step_lower_and_finds_it(monkeypatch):
+    ser, seek = _seek(monkeypatch, ["E 900 NOTOUCH", "R 900 0 0 -38000"])
+    assert seek() == -38000
+    assert _lowered(ser) == ["N 0 0 -%d -1" % stockfind.DROP_STEP_UM]

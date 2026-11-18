@@ -578,7 +578,23 @@ class MainWindow(QMainWindow):
         self.refresh_plan()
         self._sync_window_title()
         self.select_step("setup")
-        self.resize(1400, 900)
+        self._fit_to_screen(1400, 900)
+
+    def _fit_to_screen(self, w, h):
+        """Open at ``w`` x ``h``, or the screen's free area if that is
+        smaller. A lab PC at 1920 x 1080 and 150 % scaling has 1280 x 680
+        of it: opened at 1400 x 900 regardless, the inspector's Start and
+        the bar's STOP were off the edge of the screen."""
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            self.resize(w, h)
+            return
+        free = screen.availableGeometry()
+        if w <= free.width() and h <= free.height():
+            self.resize(w, h)
+            return
+        self.resize(min(w, free.width()), min(h, free.height()))
+        self.setWindowState(self.windowState() | Qt.WindowMaximized)
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -896,10 +912,16 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QMenu, QToolButton
         bar = QWidget()
         bar.setObjectName("panel")
-        h = QHBoxLayout(bar)
+        # Wraps rather than sets the window's width: on one fixed row this
+        # bar asked for 713 px (more on Windows), and beside the rail and
+        # the inspector that made the window wider than a 1280 px screen,
+        # with Start and STOP the part that fell off its right edge.
+        h = widgets.FlowLayout(bar, theme.GAP_S)
         h.setContentsMargins(theme.GAP_M, theme.GAP_XS, theme.GAP_M,
                              theme.GAP_XS)
-        h.setSpacing(theme.GAP_S)
+        pol = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        pol.setHeightForWidth(True)
+        bar.setSizePolicy(pol)
         self.turn_left_btn = widgets.button(
             "Turn left", on=lambda: self.action_turn(90),
             tip="Turn the board a quarter turn anticlockwise (undoable).")
@@ -922,7 +944,6 @@ class MainWindow(QMainWindow):
         for w in (self.turn_left_btn, self.turn_right_btn, self.mirror_btn,
                   self.centre_btn, self.undo_btn):
             h.addWidget(w)
-        h.addSpacing(theme.GAP_S)
         h.addWidget(widgets.vrule())
         self.photo_btn = QToolButton()
         self.photo_btn.setText("Photo ▾")
@@ -2738,6 +2759,7 @@ class MainWindow(QMainWindow):
         return nets
 
     def refresh_checks(self):
+        self._lift_for_screws()
         st = self.state
         if st.board is None:
             self._checks, self._shorts, self._gaps = [], [], None
@@ -3035,6 +3057,7 @@ class MainWindow(QMainWindow):
 
     def cutting_trace(self):
         """The trace job as it will actually be cut, margin included."""
+        self._lift_for_screws()
         from dataclasses import replace
         m = self._flex_margin()
         if not m:
@@ -3060,6 +3083,7 @@ class MainWindow(QMainWindow):
         on ``total_depth``: ``cut_depth`` is the peck increment and means
         something else.
         """
+        self._lift_for_screws()
         from dataclasses import replace
         m = self._flex_margin()
         if not m:
@@ -3074,6 +3098,7 @@ class MainWindow(QMainWindow):
         board completely: stopping short leaves it attached by a film that
         tears rather than cuts when the tabs are broken.
         """
+        self._lift_for_screws()
         from dataclasses import replace
         m = self._flex_margin()
         if not m:
@@ -5130,23 +5155,34 @@ class MainWindow(QMainWindow):
         self.say("ok", f"{path.name} rewritten - the dowel holes only. Keep the "
                        f"same XY origin so it lands on the existing holes.")
 
+    def _lift_for_screws(self):
+        """With the copper screwed down, every job's travel height clears the
+        screw heads - set here, not asked of the operator.
+
+        It used to be raised once, when the box was ticked, and then a
+        profile applied or a setup loaded afterwards put it back to 2 mm and
+        the checks failed the job for it. Called before every check and
+        every job is built, so there is no order of doing things that leaves
+        a lift too low. Only ever raises: a higher value set on purpose is
+        kept. Returns the jobs it raised."""
+        if not getattr(self, "screwed", False):
+            return []
+        need = spoilboard.min_travel_z()
+        raised = []
+        for job, label in ((self.state.trace, "traces"),
+                           (self.state.drill, "drill"),
+                           (self.state.cutout, "cut-out")):
+            if job.travel_z < need:
+                job.travel_z = need
+                raised.append(label)
+        return raised
+
     def action_screws_toggled(self, on):
         self.screwed = bool(on)
-        if on:
-            # Only ever raises. A higher value someone set on purpose is kept.
-            need = spoilboard.min_travel_z()
-            raised = []
-            for job, label in ((self.state.trace, "traces"),
-                               (self.state.drill, "drill"),
-                               (self.state.cutout, "cut-out")):
-                if job.travel_z < need:
-                    job.travel_z = need
-                    raised.append(label)
-            if raised:
-                self.say("warn", f"Lift raised to {need:g} mm on "
-                                 f"{', '.join(raised)} — the screw heads stand "
-                                 f"{spoilboard.M4_HEAD_H:g} mm proud and the "
-                                 f"old lift would have driven into one.")
+        raised = self._lift_for_screws()
+        if raised:
+            self.say("ok", f"Lift set to {spoilboard.min_travel_z():g} mm on "
+                           f"{', '.join(raised)}, clear of the screw heads.")
         self._after_params()
 
     def action_toggle_done(self, key):

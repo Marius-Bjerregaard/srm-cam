@@ -138,3 +138,27 @@ def test_a_file_name_gives_up_characters_not_width(qt_app):
     label.resize(120, 20)
     assert label.text() == name, "text() is the whole name, for anything that reads it"
     assert label.toolTip() == name
+
+
+def test_the_window_fits_a_1280_px_screen_with_start_and_stop_on_it(
+        qt_app, monkeypatch):
+    """A lab PC at 1920 x 1080 and 150 % has 1280 px across. The bed's own
+    tool row was one fixed row of 713 px, the window could not be narrower
+    than 1388, and Start and STOP were off the right edge on Windows."""
+    from pathlib import Path
+    from PySide6.QtCore import Qt
+    from gerber2rml.gui2.window import MainWindow
+    monkeypatch.setenv("SRM_CAM_MODE", "novice")
+    w = MainWindow()
+    w.load_folder(str(Path(__file__).parent / "fixtures" / "mosfet_test"))
+    w.select_step("autorun")
+    # Windows draws text wider than this runner: leave it room.
+    assert w.minimumSizeHint().width() <= 1160
+    w.setWindowState(Qt.WindowNoState)
+    w.resize(1180, 680)
+    w.show()
+    qt_app.processEvents()
+    stop = w.bar.stop_btn
+    corner = stop.mapTo(w, stop.rect().bottomRight())
+    assert corner.x() < w.width() and corner.y() < w.height()
+    w.close()

@@ -692,6 +692,7 @@ class AutoRunPage(inspector.Page):
         # are typed, so what is drawn is where the run will think it is.
         for sp in (self.w_spin, self.h_spin):
             sp.valueChanged.connect(self._sync_outline)
+            sp.valueChanged.connect(self._mirror_size)
         self.corner_box.currentIndexChanged.connect(self._corner_changed)
         self.kind_box.currentIndexChanged.connect(self._kind_changed)
         self.where.currentIndexChanged.connect(self._sync_outline)
@@ -1356,6 +1357,18 @@ class AutoRunPage(inspector.Page):
         if off:
             ctl.action_move_job(sx + ar.PLACE_MARGIN_MM - b[0],
                                 sy + ar.PLACE_MARGIN_MM - b[1])
+
+    def _mirror_size(self, *_):
+        """Novice also has the sheet's size on Your board: the same number,
+        so it shows what was typed here (and does not send it back)."""
+        setup = getattr(getattr(self.ctl, "inspector", None), "setup", None)
+        if setup is None:
+            return
+        for spin, v in ((setup.stock_w, self.w_spin.value()),
+                        (setup.stock_h, self.h_spin.value())):
+            spin.blockSignals(True)
+            spin.setValue(v)
+            spin.blockSignals(False)
 
     def _sync_outline(self, *_):
         # Only while this page is the one open: it must not move the sheet
