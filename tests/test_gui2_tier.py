@@ -336,3 +336,26 @@ def test_the_menu_says_exactly_what_the_other_tier_adds():
     assert len(tier.KEPT_IN_ESSENTIAL) >= 4
     for name, why in tier.KEPT_IN_ESSENTIAL:
         assert name and len(why) > 40, name
+
+
+
+def test_novice_sets_the_sheet_size_and_cut_depth_on_your_board(
+        qt_app, monkeypatch):
+    w = _window(monkeypatch, "novice")
+    setup, run = w.inspector.setup, w.autorun_page
+    assert not setup.sheet_w_field.isHidden()
+    assert not setup.sheet_h_field.isHidden()
+    assert not setup.trace_depth_field.isHidden()
+    setup.stock_w.setValue(120.0)
+    setup.stock_h.setValue(90.0)
+    assert (run.w_spin.value(), run.h_spin.value()) == (120.0, 90.0)
+    assert tuple(w.stock[2:4]) == (120.0, 90.0)
+    run.w_spin.setValue(110.0)                    # and back the other way
+    assert setup.stock_w.value() == 110.0
+    setup.trace_depth.setValue(0.15)
+    assert w.state.trace.cut_depth == pytest.approx(0.15)
+
+
+def test_pro_keeps_cut_depth_on_the_traces_step(qt_app, monkeypatch):
+    w = _window(monkeypatch, "pro")
+    assert w.inspector.setup.trace_depth_field.isHidden()

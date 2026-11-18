@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QSize, QRectF, Signal, QPointF
 from PySide6.QtGui import QPainter, QPen, QBrush, QColor, QPainterPath, QPolygonF
 from PySide6.QtWidgets import (
     QLabel, QFrame, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QSizePolicy,
-    QGraphicsOpacityEffect, QButtonGroup)
+    QGraphicsOpacityEffect, QButtonGroup, QLayout)
 
 from gerber2rml.gui2 import theme
 
@@ -628,3 +628,109 @@ def caution_mark(painter, rect, colour):
     painter.drawLine(QPointF(x, rect.top() + rect.height() * 0.38),
                      QPointF(x, rect.top() + rect.height() * 0.68))
     painter.drawPoint(QPointF(x, rect.bottom() - rect.height() * 0.14))
+
+
+class FlowLayout(QLayout):
+    """A row that wraps onto the next line when the width runs out.
+
+    For a bar of tools whose one-row width would otherwise be the minimum
+    width of the whole window: the bed's own tool row asked for 713 px on
+    macOS and more on Windows, which with the rail and the inspector beside
+    it made the window wider than a 1280 px screen - and the inspector's
+    Start and the bar's STOP were what fell off the right edge. ``None``
+    added with :meth:`addStretch` pushes everything after it to the right
+    end of its line, as a stretch in a box layout would."""
+
+    def __init__(self, parent=None, spacing=0):
+        super().__init__(parent)
+        self._items = []
+        self._right_from = None        # index of the first right-aligned item
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def addStretch(self, _factor=1):
+        self._right_from = len(self._items)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations()
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._lay(0, 0, w, False)
+
+    def sizeHint(self):
+        m = self.contentsMargins()
+        w = sum(i.sizeHint().width() for i in self._visible())
+        w += self.spacing() * max(0, len(self._visible()) - 1)
+        h = max((i.sizeHint().height() for i in self._visible()), default=0)
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def minimumSize(self):
+        m = self.contentsMargins()
+        s = QSize()
+        for i in self._visible():
+            s = s.expandedTo(i.minimumSize())
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._lay(rect.x(), rect.y(), rect.width(), True)
+
+    def _visible(self):
+        return [i for i in self._items
+                if i.widget() is None or not i.widget().isHidden()]
+
+    def _lay(self, x0, y0, width, apply):
+        """Place the items in lines; the height they take."""
+        from PySide6.QtCore import QRect
+        m = self.contentsMargins()
+        left, right = x0 + m.left(), x0 + width - m.right()
+        sp = self.spacing()
+        lines, line, used = [], [], 0
+        for k, item in enumerate(self._items):
+            if item.widget() is not None and item.widget().isHidden():
+                continue
+            iw = item.sizeHint().width()
+            if line and used + sp + iw > right - left:
+                lines.append(line)
+                line, used = [], 0
+            used += (sp if line else 0) + iw
+            line.append((k, item))
+        if line:
+            lines.append(line)
+        y = y0 + m.top()
+        for line in lines:
+            lh = max(i.sizeHint().height() for _k, i in line)
+            if apply:
+                rf = self._right_from
+                lead = [i for k, i in line if rf is None or k < rf]
+                tail = [i for k, i in line if rf is not None and k >= rf]
+                x = left
+                for i in lead:
+                    s = i.sizeHint()
+                    i.setGeometry(QRect(x, y + (lh - s.height()) // 2,
+                                        min(s.width(), right - x), s.height()))
+                    x += s.width() + sp
+                tw = (sum(i.sizeHint().width() for i in tail)
+                      + sp * max(0, len(tail) - 1))
+                x = max(x, right - tw)
+                for i in tail:
+                    s = i.sizeHint()
+                    i.setGeometry(QRect(x, y + (lh - s.height()) // 2,
+                                        min(s.width(), right - x), s.height()))
+                    x += s.width() + sp
+            y += lh + sp
+        return y - sp - y0 + m.bottom() if lines else m.top() + m.bottom()

@@ -223,6 +223,20 @@ class SetupPage(Page):
         tools.add(prow)
         self.tool_summary = widgets.hint("")
         tools.add(self.tool_summary)
+        # Novice's one cutting number. The profile sets it like everything
+        # else, but how deep the isolation goes is the thing a beginner is
+        # told to change when tracks stay joined - and the only other place
+        # to change it is the Traces step, which Novice does not have. Flat
+        # endmill only: a V-bit's depth is worked out from the width.
+        self.trace_depth = num(0.10, 0.02, 1.0, 0.01, 2, self._on_trace_depth,
+                               suffix=" mm")
+        self.trace_depth_field = widgets.Field(
+            "Cut depth", self.trace_depth,
+            help="How deep the traces are isolated. Just through the copper "
+                 "foil, which is 35 µm; the rest is margin for an uneven "
+                 "surface. Deeper if tracks stay joined. Applying a profile "
+                 "sets it back.")
+        tools.add(self.trace_depth_field)
         # Only for a V-bit: a flat endmill's width does not move with depth,
         # so the picture would say nothing the line above does not.
         from gerber2rml.gui2.bitviz import BitProfile
@@ -274,12 +288,14 @@ class SetupPage(Page):
                            suffix=" mm")
         self.stock_y = num(0.0, -50.0, 400.0, 1.0, 2, self._on_stock,
                            suffix=" mm")
-        stock.add(widgets.Field(
+        self.sheet_w_field = widgets.Field(
             "Sheet width", self.stock_w,
             help="The piece of copper, not the board. With the bed fixture its "
                  "front-left corner sits on the machine origin; if you clamped "
-                 "it by hand, set the corner below."))
-        stock.add(widgets.Field("Sheet height", self.stock_h))
+                 "it by hand, set the corner below.")
+        self.sheet_h_field = widgets.Field("Sheet height", self.stock_h)
+        stock.add(self.sheet_w_field)
+        stock.add(self.sheet_h_field)
         stock.add(widgets.Field(
             "Corner across (X)", self.stock_x,
             help="The front-left corner of the copper, in machine "
@@ -384,9 +400,12 @@ class SetupPage(Page):
                 "Run it FIRST, drop the screws in, then re-zero Z - the "
                 "board sits differently once it is bolted down.")
         stock.add(self.screw_file_btn)
-        # Novice keeps the thickness: the size and the corner of the stock
-        # are on its Run page, and how it is held is the bracket.
+        # Novice keeps the thickness and the sheet's size: the corner of the
+        # stock is the bracket's, and so is how it is held. The size is also
+        # on its Run page; the two are the same number (see _on_stock).
         self.copper_more = self._gather(stock, 1)
+        for i, f in enumerate((self.sheet_w_field, self.sheet_h_field), 1):
+            stock.body.insertWidget(i, f)
         self.add(stock)
 
         # -- placement ---------------------------------------------------
@@ -708,7 +727,26 @@ class SetupPage(Page):
                                self.clear_large.value(),
                                self.clear_small.value(), self.bed_bite.value())
 
+    def _on_trace_depth(self, v):
+        self.ctl.state.trace.cut_depth = v
+        self.ctl.action_params_changed()
+
     def _on_stock(self, *_a):
+        # In Novice the stock is in the bracket and the Run page's size is
+        # what the outline and Start are made from - typed here, it goes
+        # there, and the page puts the sheet on the bed from the bracket.
+        run = getattr(self.ctl, "autorun_page", None)
+        if not tier.is_full() and run is not None:
+            for spin, v in ((run.w_spin, self.stock_w.value()),
+                            (run.h_spin, self.stock_h.value())):
+                if abs(spin.value() - v) > 1e-6:
+                    spin.setValue(v)
+            if not run._everywhere():
+                # No board yet: the page drew nothing, so the size is kept
+                # here, at the corner it already has.
+                self.ctl.action_stock(self.stock_w.value(),
+                                      self.stock_h.value())
+            return
         self.ctl.action_stock(self.stock_w.value(), self.stock_h.value(),
                               self.stock_x.value(), self.stock_y.value(),
                               self.show_stock.isChecked())
@@ -851,6 +889,12 @@ class SetupPage(Page):
             spec += (chr(10) + "Cut deepened by %.3f mm, set by hand under "
                      "Held down by." % margin)
         self.tool_summary.setText(spec)
+        self.trace_depth.blockSignals(True)
+        self.trace_depth.setValue(st.trace.cut_depth)
+        self.trace_depth.blockSignals(False)
+        self.trace_depth_field.setVisible(
+            not tier.is_full()
+            and getattr(st.trace, "tool_type", "flat") != "vbit")
         # The job as it will be CUT, margin included - a V-bit's width follows
         # depth, so a margin that deepens the cut also widens every trace, and
         # that is the number worth looking at.

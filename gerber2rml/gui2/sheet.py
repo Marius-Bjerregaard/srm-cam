@@ -51,9 +51,13 @@ class RunSheet(QWidget):
         bar = QWidget()
         bar.setObjectName("sheetBar")
         bar.setStyleSheet(f"QWidget#sheetBar {{ background: {theme.BASE}; }}")
-        bh = QHBoxLayout(bar)
+        # Wraps: on one row it set the width of the centre column, and with
+        # it the window's (see widgets.FlowLayout).
+        bh = widgets.FlowLayout(bar, theme.GAP_S)
         bh.setContentsMargins(theme.GAP_L, theme.GAP_M, theme.GAP_L, theme.GAP_M)
-        bh.setSpacing(theme.GAP_S)
+        pol = QSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        pol.setHeightForWidth(True)
+        bar.setSizePolicy(pol)
         self.head = QLabel("Job exported")
         self.head.setFont(theme.font("head"))
         bh.addWidget(self.head)

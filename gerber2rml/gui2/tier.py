@@ -86,7 +86,8 @@ ADDED_BY_FULL = [
     "Running the job by hand: every step of the plan, one at a time, and "
     "exporting the files for VPanel. Novice runs them itself.",
     "Per-operation cutting parameters - feeds, depths, offsets, stepover, "
-    "V-bit geometry. In Novice the tool profile sets these.",
+    "V-bit geometry. In Novice the tool profile sets these, apart from "
+    "the trace cut depth and the sheet size, which are on Your board.",
     "How a double-sided board is registered: dowels, and choosing the "
     "fiducials. Novice flips and finds its own fiducials.",
     "Stock that is not in the bracket, found by its edges or clamped by hand, "

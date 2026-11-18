@@ -122,6 +122,7 @@ def seek_surface(ser, x_um, y_um, should_abort=None, note=None,
     note = note or (lambda _m: None)
     travel(ser, x_um, y_um, should_abort)
     drop_to_hint(ser, hint_um, should_abort, note, fresh=hint_fresh)
+    unsteady = 0
     while True:
         r = _cmd(ser, "D", should_abort, 5.0)
         if not r or not r.startswith("D "):
@@ -131,16 +132,52 @@ def seek_surface(ser, x_um, y_um, should_abort=None, note=None,
         r = _cmd(ser, "P 900 0 0", should_abort)
         if r and r.startswith("R "):
             return int(r.split()[4])
-        if r and r.rstrip().endswith("LOW"):
+        tail = (r or "").rstrip()
+        if tail.endswith("LOW"):
             raise StockNotFound(
                 "the probe already reads contact. Check the clip is on the "
                 "stock's copper and not touching the bit or the bed.")
+        # Only a clean miss may go lower - the rule touch_from_anywhere has
+        # always had. This loop used to step down, at the machine's rapid and
+        # with nothing watching the probe, after ANY reply that was not a
+        # height: also UNSTABLE, which means the copper WAS touched and is
+        # right there, and ABORT or no reply at all, which come back at once
+        # - so the head went down 5.5 mm at a time, fast, into the stock and
+        # on (the lab mill, 2026-11-18, on Start).
+        if tail.endswith("UNSTABLE"):
+            unsteady += 1
+            if unsteady < 3:
+                note("Touched the copper but the reading was not steady; "
+                     "touching again from the same height…")
+                continue
+            raise ProbeError(
+                "the copper was touched, but three times the reading was "
+                "not steady. Check the clip grips bare copper and the bit "
+                "is clean, then start again. Nothing was cut.")
+        if not tail.endswith("NOTOUCH"):
+            raise ProbeError(
+                "the touch for the copper's height did not finish (%r), so "
+                "the head was not taken any lower. Check the lid is shut "
+                "and the machine is not paused, then start again." % (r,))
         if z - DROP_STEP_UM < Z_LIMIT_UM:
             raise StockNotFound(
                 "no copper under the clicked spot, all the way down. Click on "
                 "the stock, and check the clip is on its copper.")
-        spi_probe.timed_move(ser, dz_um=-DROP_STEP_UM,
-                             should_abort=should_abort)
+        # The probe found nothing for 6 mm below the datum and came back up
+        # to it. Down to 5.5 mm below THAT, wherever the head now is - and
+        # not at all if it reads contact or cannot be read.
+        pos = spi_probe.query_position(ser)
+        if pos is None:
+            raise ProbeError("cannot read where the head is, so it was not "
+                             "taken any lower")
+        if len(pos) > 3 and pos[3]:
+            raise StockNotFound(
+                "the probe reads contact where it found none a moment ago. "
+                "Check the clip and the bit, then start again.")
+        if spi_probe.timed_move(
+                ser, dz_um=int(z - DROP_STEP_UM - pos[2] * 1000),
+                should_abort=should_abort) is None:
+            raise ProbeError("the head did not move down to look lower")
 
 
 def drop_to_hint(ser, hint_um, should_abort=None, note=None, fresh=False):

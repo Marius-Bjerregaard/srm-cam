@@ -507,7 +507,9 @@ class MachineLink(QObject):
 
     def zero_z(self):
         hint = self.copper_hint_um()
-        fresh = self.surface_z is not None
+        # Never the close drop, for the reason in touch_off: the bit may have
+        # been changed since the height was taken.
+        fresh = False
 
         def op(ser):
             if fresh:
@@ -544,13 +546,19 @@ class MachineLink(QObject):
 
     def touch_off(self):
         hint = self.copper_hint_um()
-        # This session's own touch, or one saved on another day - when the
-        # bit may have been another, seated differently (drop_to_hint).
-        fresh = self.surface_z is not None
+        # Never the close drop, even with a height touched this session.
+        # Probe Z is what is pressed after a bit change - that is what it is
+        # for - and a height measured with the last bit says nothing about
+        # where this one ends: drop_to_hint's 5 mm "same bit, same stock"
+        # margin drove a longer bit into the stock at full rapid on a
+        # second Probe Z (2026-11-18). The far margin clears the longest bit
+        # there is and costs one more touch (about 5 mm at probing speed).
+        # The automatic run keeps the close drop: inside one run it is one
+        # bit.
 
         def op(ser):
             return stockfind.touch_from_anywhere(ser, hint, self.should_abort,
-                                                 fresh=fresh)
+                                                 fresh=False)
         self.clear_abort()
         self.submit("touch", op)
 
@@ -853,9 +861,9 @@ class MachineBar(QWidget):
                 "surface height so the pre-flight can check the Z stroke "
                 "and the level page knows where the copper is. VPanel's "
                 "origin is untouched. It can start from any height: it drops "
-                "fast to 5 mm above the copper's last known height, then feels "
-                "its way down. After changing to a longer bit, jog down to "
-                "just above the copper first: the last height no longer holds.")
+                "fast to 12 mm above where the copper was last found - clear "
+                "of it with any bit, even one changed since - then feels its "
+                "way down.")
         lh.addWidget(self.probe_btn)
         self.pause_btn = widgets.button(
             "Pause", on=self._toggle_pause,

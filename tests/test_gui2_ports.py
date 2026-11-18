@@ -159,3 +159,20 @@ def test_a_single_sided_job_offers_no_top_pass(loaded):
     page.refresh_sources()
     assert [page.source.itemData(i) for i in range(page.source.count())] \
         == ["traces", "cutout"]
+
+
+def test_a_second_probe_z_drops_no_closer_than_the_first(monkeypatch):
+    """Probe Z is pressed after a bit change. A height touched earlier in the
+    session, with the last bit, used to let the fast drop go to 5 mm above
+    it - and a longer bit went into the stock at full rapid (2026-11-18)."""
+    from gerber2rml.engine import stockfind
+    from gerber2rml.gui2.machine import MachineLink
+    link = MachineLink()
+    link.surface_z = -40.0                      # touched earlier this session
+    seen = []
+    monkeypatch.setattr(stockfind, "touch_from_anywhere",
+                        lambda ser, hint, abort, fresh=False:
+                        seen.append((hint, fresh)))
+    monkeypatch.setattr(link, "submit", lambda name, op: op(None))
+    link.touch_off()
+    assert seen == [(-40000, False)]
