@@ -86,6 +86,9 @@ def _line(pts, z=-0.15):
            [Move(x, y, z) for (x, y) in pts]
 
 
+
+from uiscale import ui_scale as _dpi_scale
+
 @pytest.fixture
 def with_link(monkeypatch):
     """The bar with its live controls, whatever platform the tests run on."""
@@ -251,7 +254,7 @@ def test_the_bar_stays_one_row_with_stop_last_and_whole(bar, qt_app):
     # and sets the bar in its fallbacks (Avenir Next Condensed, Helvetica
     # Neue), which run about 2 % wider: 1308. There the budget is the one the
     # header is held to below - what fits the 1400 px window the app opens at.
-    budget = 1333 if sys.platform == "darwin" else 1280
+    budget = (1333 if sys.platform == "darwin" else 1280) * _dpi_scale()
     assert bar.minimumSizeHint().width() <= budget, \
         bar.minimumSizeHint().width()
     assert bar.live.sizeHint().height() <= theme.BAR_H
@@ -262,41 +265,25 @@ def test_the_bar_stays_one_row_with_stop_last_and_whole(bar, qt_app):
     assert bar.stop_btn.minimumWidth() >= 112
 
 
-def test_probe_z_and_zero_z_are_two_buttons_that_say_what_each_changes(bar):
+def test_probe_z_is_the_only_touch_and_there_is_no_spindle_button(bar):
     assert bar.probe_btn.text() == "Probe Z"
-    assert bar.zero_btn.text() == "Zero Z"
-    probe, zero = bar.probe_btn.toolTip().lower(), bar.zero_btn.toolTip().lower()
-    # the app-side capture says the machine is untouched...
+    probe = bar.probe_btn.toolTip().lower()
     assert "changes nothing on the machine" in probe
-    assert "origin is untouched" in probe
-    # ...and the firmware write says which origin it moves, and only Z
-    assert "firmware" in zero and "origin" in zero and "vpanel" in zero
-    assert "xy origin is never moved" in zero
-
-
-def test_probe_z_touches_off_and_zero_z_writes_the_origin(bar):
+    assert "drops fast" in probe
+    assert not hasattr(bar, "zero_btn")
+    assert not hasattr(bar, "spindle_btn")
     bar.probe_btn.click()
     assert bar.link.calls == ["touch"]
-    bar.zero_btn.click()
-    assert bar.link.calls == ["touch", "zero_z"]
 
 
 def test_both_touches_are_refused_while_the_bit_is_on_the_copper(bar):
     bar._on_position(10.0, 10.0, -1.0, True)
     bar.probe_btn.click()
-    bar.zero_btn.click()
     assert bar.link.calls == []
-    assert all("touching" in t.lower() for _l, t in bar.said[-2:])
+    assert "touching" in bar.said[-1][1].lower()
     assert bar.dro_z._label.text() == "Touch"
     bar._on_position(10.0, 10.0, 0.0, False)
     assert bar.dro_z._label.text() == "Z"
-
-
-def test_zero_z_says_so_on_a_firmware_that_cannot_write_the_origin(bar):
-    bar.link = _Link(features=())
-    bar.zero_btn.click()
-    assert bar.link.calls == []
-    assert "reflash" in bar.said[-1][1].lower()
 
 
 def test_the_touch_results_are_reported_in_the_operators_terms(bar):
@@ -534,29 +521,32 @@ def test_the_chips_answer_for_mesh_fit_photo_and_boxes(loaded):
     assert chips["mesh"].dot._state in ("warn", "ok")
 
 
-def test_the_chips_hide_full_tier_facts_in_essential(win, monkeypatch):
-    monkeypatch.delenv("SRM_CAM_MODE")
-    tier.set_tier(tier.ESSENTIAL)
-    win._sync_tier()
-    assert win.chips["fit"].isHidden() and win.chips["boxes"].isHidden()
-    assert not win.chips["mesh"].isHidden()
-    tier.set_tier(tier.FULL)
-    win._sync_tier()
-    assert not win.chips["fit"].isHidden()
+def test_the_chips_show_only_when_lit(win):
+    win.refresh_chips()
+    assert all(c.isHidden() for c in win.chips.values())
 
 
 def test_the_chips_do_not_widen_the_window(win, qt_app):
     """The header was the widest row before the chips; it must not become
-    the reason the window cannot be narrowed to the A/B's 1400 px."""
+    the reason the window cannot be narrowed to the A/B's 1400 px - lit or
+    not. (The status chips show only when lit.)"""
+    for chip in win.chips.values():
+        chip.set(chip.label.text() + " 999", "ok")
+        chip.show()
     qt_app.processEvents()
-    head = win.frame_switch.parentWidget()
-    assert head.minimumSizeHint().width() <= 1333
+    assert win.header.minimumSizeHint().width() <= 1333 * _dpi_scale()
+
+
+def test_the_bed_toolbar_fits_beside_the_rail_and_the_inspector(win, qt_app):
+    qt_app.processEvents()
+    bar = win.frame_switch.parentWidget()
+    assert bar.minimumSizeHint().width() <= 700 * _dpi_scale()
 
 
 def test_nothing_new_offers_to_zero_the_xy_origin(bar):
     texts = [b.text().lower() for b in bar.findChildren(QPushButton)]
     assert not [t for t in texts if "zero" in t and "xy" in t]
-    assert "zero z" in texts
+    assert "probe z" in texts
 
 
 def test_a_position_poll_in_flight_does_not_read_as_a_busy_machine():

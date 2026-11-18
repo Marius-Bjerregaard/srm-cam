@@ -95,7 +95,7 @@ def test_the_run_sheet_replaces_the_board_after_an_export(loaded, tmp_path):
     text = loaded.sheet.text()
     assert "buck_traces.nc" in text
     assert "NEVER re-zero XY" in text
-    assert "Dry run" in text
+    assert "Dry run" not in text
 
 
 def test_the_run_sheet_asks_for_feedback_once_the_board_is_out(loaded, tmp_path):
@@ -226,10 +226,8 @@ def test_nothing_offers_to_zero_the_xy_origin(loaded):
     offenders = [t for t in _control_texts(loaded)
                  if "zero" in t.lower() and "xy" in t.lower()]
     assert not offenders, offenders
-    zeroing = [t for t in _control_texts(loaded) if "zero" in t.lower()]
-    assert zeroing, "there should still be a way to zero Z"
-    for t in zeroing:
-        assert "z" in t.lower()
+    # The one touch left is Probe Z (Zero Z went on 2026-11-17).
+    assert any(t == "Probe Z" for t in _control_texts(loaded))
 
 
 def test_nothing_implies_the_spindle_speed_is_settable(win):
@@ -242,7 +240,7 @@ def test_nothing_implies_the_spindle_speed_is_settable(win):
             assert "rpm" not in label.lower()
             assert "speed" not in (w.toolTip() or "").lower() or \
                 "vpanel" in (w.toolTip() or "").lower()
-    assert "vpanel" in win.bar.spindle_btn.toolTip().lower()
+    assert not hasattr(win.bar, "spindle_btn")
 
 
 def test_the_screw_checkbox_raises_the_lift_height(loaded):

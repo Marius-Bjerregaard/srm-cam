@@ -725,3 +725,40 @@ def test_a_job_reports_how_far_the_head_is_along_its_path():
         assert got, key                           # it was followed at all
         assert got == sorted(got)                 # and never went back
         assert 0.0 <= got[0] and got[-1] <= 1.0
+# -- one step on its own (Pro's Run this step) ---------------------------------
+def test_one_step_finds_the_stock_probes_and_cuts_only_that_step():
+    m, ser, board, log, run = _run(False, only=["traces"])
+    sent = []
+    log.job = lambda key, label, prog: sent.append(key)
+    log.check = lambda *a: pytest.fail("one step never stops to check")
+    assert run.run() is True
+    assert sent == ["traces"]
+    done = [k for k, s in log.steps if s == "done"]
+    assert done == ["stock", "level", "traces"]
+    assert ("drill", "skipped") in log.steps
+    assert ("cutout", "skipped") in log.steps
+
+
+def test_one_cutout_does_not_ask_for_the_check():
+    m, ser, board, log, run = _run(False, level=False, only=["cutout"])
+    sent = []
+    log.job = lambda key, label, prog: sent.append(key)
+    log.check = lambda *a: pytest.fail("one step never stops to check")
+    assert run.run() is True
+    assert sent == ["cutout"]
+
+
+def test_one_bottom_step_of_a_double_sided_job_never_asks_for_the_flip():
+    m, ser, board, log, run = _run(True, level=False, only=["drill"])
+    sent = []
+    log.job = lambda key, label, prog: sent.append(key)
+    log.flip = lambda: pytest.fail("one bottom step never flips")
+    assert run.run() is True
+    assert sent == ["drill"]
+    assert ("top_traces", "skipped") in log.steps
+
+
+def test_one_step_that_is_not_in_the_job_is_refused():
+    m, ser, board, log, run = _run(False, level=False, only=["nope"])
+    with pytest.raises(RunFailed):
+        run.run()

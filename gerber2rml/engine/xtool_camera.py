@@ -214,18 +214,64 @@ class Alignment:
     found: int          # holes that sit on a dark spot after the move
     total: int
     score: float        # 0..1, how much of the pattern's area lands on darkness
+    need: float = 0.85  # of the holes found before the fit is believed
 
     @property
     def ok(self):
-        return bool(self.total) and self.found >= max(3, 0.85 * self.total) and self.score > 0.2
+        return (self.total >= 2 and self.found >= max(2, self.need * self.total)
+                and self.score > 0.2)
 
 
-def align(bed_rgb, px_per_mm, holes, *, search_mm=25.0, max_turn=6.0):
+# Holes cut in steel show bright plate through every one: 85 %. Holes drilled
+# in a board sit over the bed's slats, and over a bright slat a hole hardly
+# reads dark: at the machine 42-44 of 52 on a drilled board, the fit the same
+# every time. A wrong place or a wrong way round finds far fewer.
+DRILLED_NEED = 0.75
+
+
+@dataclass
+class PointAlignment:
+    transform: object
+    errors: list
+    rms: float
+
+
+def fit_reference_points(drawing, photo, *, max_error_mm=0.3):
+    """Rigid registration of matching points in corrected bed millimetres.
+
+    Never scale or reflect the job to conceal mismatched picks. All points
+    participate; an inconsistent reference must be corrected explicitly.
+    """
+    from gerber2rml.engine.fiducial import fit_transform, residuals, rms
+    p, q = np.asarray(drawing, dtype=float), np.asarray(photo, dtype=float)
+    if p.ndim != 2 or p.shape[1:] != (2,) or p.shape != q.shape or len(p) < 2:
+        raise CameraError("Pick at least two matching drawing/photo points.")
+    if not np.isfinite(p).all() or not np.isfinite(q).all():
+        raise CameraError("Reference coordinates must be finite.")
+    for points in (p, q):
+        distances = np.linalg.norm(points[:, None] - points[None, :], axis=2)
+        if distances.max() < 5:
+            raise CameraError("Pick references at least 5 mm apart for a reliable angle.")
+        if np.min(distances[np.triu_indices(len(points), 1)]) < 0.5:
+            raise CameraError("Two references overlap. Remove the duplicate and pick a distinct point.")
+    transform = fit_transform(p, q)
+    errors = residuals(transform, p, q)
+    if max(errors) > max_error_mm:
+        worst = int(np.argmax(errors)) + 1
+        raise CameraError(f"Reference {worst} disagrees by {max(errors):.2f} mm. "
+                          "Check the matching points; alignment was not applied.")
+    return PointAlignment(transform, errors, rms(transform, p, q))
+
+
+def align(bed_rgb, px_per_mm, holes, *, search_mm=25.0, max_turn=6.0, polarity="dark",
+          need=0.85):
     """Where the cut ``holes`` (bed mm, as the overlay has them now) really are
     in a straightened photo ``bed_rgb`` of ``px_per_mm``.
 
     A correlation over shift for each of a fan of small turns, then a finer fan
     round the best, then a check hole by hole."""
+    if len(holes) < 2:
+        raise CameraError("Choose at least two automatic references, or pick matching points.")
     pts = np.array([q for p in holes for q in p], float)
     cx, cy = pts.mean(axis=0)
     x0, y0 = pts.min(axis=0) - search_mm - 3
@@ -235,7 +281,10 @@ def align(bed_rgb, px_per_mm, holes, *, search_mm=25.0, max_turn=6.0):
     c1, r1 = min(int(x1 * px_per_mm), W), min(int(y1 * px_per_mm), H)
     if c1 - c0 < 8 or r1 - r0 < 8:
         raise CameraError("The stencil is off the photo.")
-    D = darkness(bed_rgb[r0:r1, c0:c1], px_per_mm)
+    if polarity not in ("dark", "bright"):
+        raise CameraError("Choose dark or bright automatic references.")
+    crop = bed_rgb[r0:r1, c0:c1]
+    D = darkness(255 - crop if polarity == "bright" else crop, px_per_mm)
     origin = (c0 / px_per_mm, r0 / px_per_mm)
     FD = np.fft.rfft2(D)
     lim = int(search_mm * px_per_mm)
@@ -283,4 +332,162 @@ def align(bed_rgb, px_per_mm, holes, *, search_mm=25.0, max_turn=6.0):
         if a > 0 and (D * T).sum() / a > 0.2:
             found += 1
     return Alignment(dx=dx_mm, dy=dy_mm, turn=float(deg), found=found,
-                     total=len(holes), score=float(s))
+                     total=len(holes), score=float(s), need=need)
+
+
+# ---------------------------------------------------------------------------
+# Proof: where the laser's own marks show up, from a photo before and after
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ChangeFit:
+    dx: float           # mm from where the marks were drawn to where they show
+    dy: float
+    found: int          # marks that show where the fit puts them
+    total: int
+    score: float        # 0..1, how much of the marks' area changed
+    level: float        # grey levels the marks changed the photo by
+
+    @property
+    def ok(self):
+        need = 1 if self.total == 1 else max(2, int(np.ceil(0.6 * self.total)))
+        return self.total >= 1 and self.found >= need and self.score > 0.25
+
+
+def _geoms(shape):
+    return list(getattr(shape, "geoms", [shape]))
+
+
+def _raster_polys(polys, origin, shape, px_per_mm):
+    """Shapely polygons (bed mm), holes kept open, as a float image."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPolygonF
+    h, w = shape
+    img = QImage(w, h, QImage.Format_Grayscale8)
+    img.fill(0)
+    p = QPainter(img)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QBrush(QColor(255, 255, 255)))
+    ox, oy = origin
+    for shape_ in polys:
+        for poly in _geoms(shape_):
+            if poly.is_empty or not hasattr(poly, "exterior"):
+                continue
+            path = QPainterPath()
+            path.setFillRule(Qt.OddEvenFill)
+            for ring in (poly.exterior, *poly.interiors):
+                path.addPolygon(QPolygonF([QPointF((x - ox) * px_per_mm,
+                                                   (y - oy) * px_per_mm)
+                                           for x, y in ring.coords]))
+                path.closeSubpath()
+            p.drawPath(path)
+    p.end()
+    a = np.frombuffer(img.constBits(), np.uint8).reshape(h, img.bytesPerLine())[:, :w]
+    return a.astype(np.float32) / 255.0
+
+
+def _best_shift(D, T, lim):
+    """The shift of template ``T`` over map ``D`` (same shape) with the most
+    overlap, within ``lim`` pixels each way: (overlap per template area, dx,
+    dy), to a fraction of a pixel."""
+    area = T.sum()
+    if area <= 0:
+        return -1.0, 0.0, 0.0
+    corr = np.fft.irfft2(np.fft.rfft2(D) * np.conj(np.fft.rfft2(T)), s=D.shape)
+    win = np.zeros_like(corr, bool)
+    win[:lim + 1, :lim + 1] = win[:lim + 1, -lim:] = True
+    win[-lim:, :lim + 1] = win[-lim:, -lim:] = True
+    corr = np.where(win, corr, -np.inf)
+    k = np.unravel_index(np.argmax(corr), corr.shape)
+    n0, n1 = D.shape
+    dy = k[0] if k[0] <= lim else k[0] - n0
+    dx = k[1] if k[1] <= lim else k[1] - n1
+
+    def vertex(m, c, q):
+        d = m - 2 * c + q
+        return 0.0 if not np.isfinite(d) or d >= 0 else 0.5 * (m - q) / d
+    c = corr[k]
+    fy = vertex(corr[(k[0] - 1) % n0, k[1]], c, corr[(k[0] + 1) % n0, k[1]])
+    fx = vertex(corr[k[0], (k[1] - 1) % n1], c, corr[k[0], (k[1] + 1) % n1])
+    return float(c / area), dx + fx, dy + fy
+
+
+def locate_change(before, after, px_per_mm, marks, *, search_mm=3.0, min_level=8.0):
+    """Where marks the laser has just made show up, from two straightened
+    photos of the same bed: one before, one after. ``marks`` are shapely
+    shapes in bed mm, where they were drawn.
+
+    Only what changed between the photos counts, so it does not matter whether
+    a mark reads dark or bright, nor what the board looks like around it."""
+    marks = [m for m in marks if m is not None and not m.is_empty]
+    if not marks:
+        raise CameraError("There are no proof marks to look for.")
+    if before.shape != after.shape:
+        raise CameraError("The two photos are not the same size.")
+    b = np.array([m.bounds for m in marks], float)
+    x0, y0 = b[:, 0].min() - search_mm - 3, b[:, 1].min() - search_mm - 3
+    x1, y1 = b[:, 2].max() + search_mm + 3, b[:, 3].max() + search_mm + 3
+    H, W = before.shape[:2]
+    c0, r0 = max(int(x0 * px_per_mm), 0), max(int(y0 * px_per_mm), 0)
+    c1, r1 = min(int(x1 * px_per_mm), W), min(int(y1 * px_per_mm), H)
+    if c1 - c0 < 8 or r1 - r0 < 8:
+        raise CameraError("The proof marks are off the photo.")
+    g = np.abs(after[r0:r1, c0:c1].astype(np.float32)
+               - before[r0:r1, c0:c1].astype(np.float32)).mean(axis=2)
+    g = _box_blur(g, 1)
+    g = np.clip(g - np.median(g), 0, None)      # a change in the light is not a mark
+    origin = (c0 / px_per_mm, r0 / px_per_mm)
+    T = _raster_polys(marks, origin, g.shape, px_per_mm)
+    n = int(max(4, round(T.sum())))
+    level = float(np.sort(g, axis=None)[-n:].mean())
+    if level < min_level:
+        return ChangeFit(0.0, 0.0, 0, len(marks), 0.0, level)
+    D = np.clip(g / level, 0, 1)
+    s, dx, dy = _best_shift(D, T, int(search_mm * px_per_mm))
+    dx_mm, dy_mm = dx / px_per_mm, dy / px_per_mm
+    from shapely.affinity import translate
+    found = 0
+    for m in marks:
+        t = _raster_polys([translate(m, dx_mm, dy_mm)], origin, g.shape, px_per_mm)
+        a = t.sum()
+        if a > 0 and (D * t).sum() / a > 0.25:
+            found += 1
+    return ChangeFit(dx_mm, dy_mm, found, len(marks), s, level)
+
+
+MATERIAL_MIN = 100.0     # brightness: below this a spot is the dark bed
+MATERIAL_SHARE = 0.5     # of the board's own brightness
+
+
+def sheet_continues(rgb, px_per_mm, spots, inside):
+    """Whether there is material under each of ``spots`` (bed mm points
+    outside the board): the board is still in a bigger sheet, so there is
+    waste to mark.
+
+    Material is bright and the bed is dark. A spot counts when it is bright in
+    itself and at least half as bright as the board, judged by the brightest
+    of the ``inside`` points (plain copper; another may land on a hole). It
+    used to have to match its own inside point in colour, and next to the
+    corners' mounting holes that point was the hole: the output board read as
+    having no waste and was marked on the isolation instead."""
+    if not spots or len(spots) != len(inside):
+        return False
+    H, W = rgb.shape[:2]
+    r = max(2, int(0.6 * px_per_mm))
+
+    def lum(p):
+        c, row = int(round(p[0] * px_per_mm)), int(round(p[1] * px_per_mm))
+        if not (r <= c < W - r and r <= row < H - r):
+            return None
+        q = rgb[row - r:row + r + 1, c - r:c + r + 1].reshape(-1, 3).astype(np.float32)
+        return float(q.mean(axis=0) @ np.array([0.299, 0.587, 0.114], np.float32))
+    board = [v for v in (lum(q) for q in inside) if v is not None]
+    if not board:
+        return False
+    need = max(MATERIAL_MIN, MATERIAL_SHARE * max(board))
+    for a in spots:
+        v = lum(a)
+        if v is None or v < need:
+            return False
+    return True

@@ -198,9 +198,11 @@ class JobSource:
         """``[(key, label)]`` after the flip; [] single-sided."""
         return []
 
-    def place(self, pose, margin_mm):
+    def place(self, pose, margin_mm, flush=None):
         """Put the board on the stock: its corner at the stock corner plus
-        ``margin_mm``, unrotated."""
+        ``margin_mm``, unrotated. ``flush`` ``(fx, fy)``: per axis None, or
+        ``"min"``/``"max"`` to put that edge of the board on the stock's
+        edge instead (a board that spans the stock that way)."""
         raise NotImplementedError
 
     def extent(self, side):
@@ -295,6 +297,34 @@ def fills_stock(bw, bh, sw, sh, tol=SHEET_EDGE_MM):
     return abs(bw - sw) <= tol and abs(bh - sh) <= tol
 
 
+def spans_stock(bw, bh, sw, sh, tol=SHEET_EDGE_MM):
+    """``(across, along)``: does a ``bw`` x ``bh`` board reach the
+    ``sw`` x ``sh`` stock's two edges in X, and in Y - as big as the stock
+    there, or bigger. Bigger is a board drawn past its sheet (the synth's
+    brain, 101.6 mm on 100 mm stock): the sheet's edge is its edge, and the
+    strip past it is simply not there."""
+    return bw >= sw - tol, bh >= sh - tol
+
+
+def strip_damage(geoms, strip):
+    """How many pieces of copper in ``geoms`` the ``strip`` (a polygon of
+    what is not there) takes away whole or cuts in two. Nothing for a strip
+    of pour edge; something for a trace or a pad that runs through it."""
+    def parts(g):
+        if g is None or g.is_empty:
+            return []
+        return list(getattr(g, "geoms", [g]))
+    hurt = 0
+    for g in geoms:
+        for piece in parts(g):
+            if not piece.intersects(strip):
+                continue
+            left = piece.difference(strip)
+            if left.is_empty or len(parts(left)) > 1:
+                hurt += 1
+    return hurt
+
+
 def about(cx, cy, deg):
     """The rotation by ``deg`` about (cx, cy), as a :class:`Transform`."""
     a = math.radians(deg)
@@ -332,7 +362,7 @@ class AutoRun:
                  runner_opts=None, level=True, surface_hint=None,
                  datum=None, check_cut=True, start_at=None, keepout=None,
                  arms=None, leave_under=False, nogo=None, level_margin=2.0,
-                 by_holes=False):
+                 by_holes=False, only=None):
         self.ser, self.printer = ser, printer
         self.src, self.ev = source, events
         self.click, self.size = click_mm, stock_mm
@@ -360,6 +390,7 @@ class AutoRun:
         # passes, milled out of the sheet on paper, are seen to join no nets
         # (engine/bracket.py). Off, a job that reaches there is refused.
         self.leave_under = bool(leave_under)
+        self._tabbed = set()                  # cut-outs that got tabs
         # [(x0, y0, x1, y1)] machine mm: what holds the stock down - clamps,
         # screws, anything standing above the copper that the operator drew a
         # box round. The bracket is known by its drawing; these are known only
@@ -381,6 +412,11 @@ class AutoRun:
         # 0.2 mm wide (a board was lost to this the day after it was cut,
         # 2026-11-16).
         self.by_holes = bool(by_holes)
+        # Run these jobs and no others (one step, sent from its own page).
+        # The stock is still found and the surface probed first: no origin
+        # is set anywhere, so that is what puts the step where the rest of
+        # the board is. No check before a cut-out, and no flip.
+        self.only = set(only) if only else None
         self.pose = self.pose_top = None
         self.rotation = None
         self.fit = None
@@ -407,15 +443,26 @@ class AutoRun:
         p = self.pose
         x0, y0, x1, y1 = self.src.extent("bottom")
         self.whole = not self.double and fills_stock(x1 - x0, y1 - y0, p.w, p.h)
-        self.src.place(self.pose, 0.0 if self.whole else self.margin)
+        span = ((False, False) if self.double or self.whole else
+                spans_stock(x1 - x0, y1 - y0, p.w, p.h))
+        if any(span):
+            # As big as the stock one way, or bigger: the sheet's edges are
+            # the board's edges that way, and only the other two are cut.
+            flush = self._flush((x0, y0, x1, y1), span)
+            self.src.place(self.pose, self.margin, flush=flush)
+            self.whole = True
+        else:
+            self.src.place(self.pose, 0.0 if self.whole else self.margin)
         self.rotation = about(self.pose.x, self.pose.y, self.pose.angle)
         if self.whole:
             # The board IS the piece of stock: its edge is the stock's edge
             # and is not cut (the cut-out leaves out what lies on the sheet's
             # edge). What has to land on the copper, clear of the bracket, is
             # what the bit cuts, so that is what the gates below look at.
-            self.ev.note("The board is the whole piece of stock: its edge is "
-                         "left as it is, and only what lies inside it is cut.")
+            if not any(span):
+                self.ev.note("The board is the whole piece of stock: its edge "
+                             "is left as it is, and only what lies inside it "
+                             "is cut.")
             reach = self._cut_reach(self.src.bottom_steps())
             if reach is None:
                 raise RunFailed("the board fills the stock, and there is "
@@ -463,6 +510,8 @@ class AutoRun:
             self._clear_of_keepout(mid - x1, y0, mid - x0, y1,
                                    " once the board is flipped")
         bottom, top = self.src.bottom_steps(), self.src.top_steps()
+        if self.only is not None:
+            return self._only(bottom, top)
         from_fiducials = self.start_at == START_AT_FIDUCIALS and top
         at_check = self.start_at == START_AT_CHECK
         if from_fiducials:
@@ -507,6 +556,38 @@ class AutoRun:
         hmap = self._level("level_top", "top", None)
         self._jobs(top, None, hmap)
         return True
+
+    def _only(self, bottom, top):
+        """The rest of the sequence when only some jobs are to run: the
+        face they are on, found and probed, and those jobs. A top-side job
+        means the board is already turned over."""
+        keys_b = {k for k, _l in bottom}
+        keys_t = {k for k, _l in top}
+        if not self.only & (keys_b | keys_t):
+            raise RunFailed("there is no step %s to run"
+                            % ", ".join(sorted(self.only)))
+        if self.only & keys_b:
+            hmap = self._level("level", "bottom", self.rotation)
+            self._run_only(bottom, self.rotation, hmap)
+        else:
+            for key, _l in bottom:
+                self._step(key, "skipped")
+        if self.only & keys_t:
+            self._find_stock("stock_top", again=True)
+            self._fiducials()
+            hmap = self._level("level_top", "top", None)
+            self._run_only(top, None, hmap)
+        else:
+            for key, _l in top:
+                self._step(key, "skipped")
+        return True
+
+    def _run_only(self, steps, t, hmap):
+        for key, label in steps:
+            if key in self.only:
+                self._job(key, label, t, hmap)
+            else:
+                self._step(key, "skipped")
 
     def _jobs(self, steps, t, hmap):
         """Run ``steps`` in order; before a cut-out, let the traces be
@@ -905,6 +986,71 @@ class AutoRun:
                          "under the bracket and is left uncut. Milled out on "
                          "paper, it joins no nets." % left)
 
+    def _flush(self, ext, span):
+        """``(fx, fy)``: for each way the board spans the stock, which of its
+        edges is put on the stock's edge - ``"min"`` (front or left) or
+        ``"max"`` (back or right); None the other way, which keeps its
+        margin. The other edge hangs off, and whatever lies in that strip is
+        lost: it goes where that loses no copper - a strip of pour edge, not
+        a trace - on either face. Refused when both sides would."""
+        p = self.pose
+        x0, y0, x1, y1 = ext
+        geoms = []
+        for face in ("bottom", "top"):
+            try:
+                g = self.src.copper_nets(face, fitted=False)[0]
+            except Exception:   # a single-sided job has no top to give
+                g = None
+            if g is not None:
+                geoms.append(g)
+        if not geoms and any(
+                (hi - lo) - s > SHEET_EDGE_MM
+                for on, lo, hi, s in ((span[0], x0, x1, p.w),
+                                      (span[1], y0, y1, p.h)) if on):
+            # With no copper to look at, nothing says the strip that would
+            # hang off is empty.
+            raise RunFailed(
+                "the job is %.1f × %.1f mm and this stock is %.1f × %.1f mm. "
+                "Use a bigger piece." % (x1 - x0, y1 - y0, p.w, p.h))
+        from shapely.geometry import box
+        out = []
+        for axis, spans in enumerate(span):
+            if not spans:
+                out.append(None)
+                continue
+            lo, hi = (x0, x1) if axis == 0 else (y0, y1)
+            over = (hi - lo) - (p.w if axis == 0 else p.h)
+            if over <= SHEET_EDGE_MM:
+                out.append("min")           # the stock's size: both edges on
+                continue
+            far = 1e4
+
+            def strip(a, b):
+                return (box(a, -far, b, far) if axis == 0
+                        else box(-far, a, far, b))
+            lose_lo = strip_damage(geoms, strip(lo - 1.0, lo + over))
+            lose_hi = strip_damage(geoms, strip(hi - over, hi + 1.0))
+            names = (("left", "right") if axis == 0 else ("front", "back"))
+            if lose_lo and lose_hi:
+                raise RunFailed(
+                    "the board is %.1f mm bigger than the stock %s, and either "
+                    "way %.1f mm of it hanging off the %s or the %s edge would "
+                    "cut copper in two. Use a bigger piece."
+                    % (over, "across" if axis == 0 else "from front to back",
+                       over, names[0], names[1]))
+            # Kept edge on the stock's edge; the strip with nothing in it
+            # hangs off. Front or left when both are free.
+            side = "max" if not lose_lo else "min"
+            out.append(side)
+            self.ev.note(
+                "The board is %.1f mm %s than the stock: its %s edge is put on "
+                "the stock's edge and the %s %.1f mm hang off, so those edges "
+                "are the sheet's own and only the other two are cut."
+                % (over, "wider" if axis == 0 else "longer",
+                   names[1] if side == "max" else names[0],
+                   names[0] if side == "max" else names[1], over))
+        return tuple(out)
+
     def _reach(self, side):
         """What has to be on the stock: the job's extent, outline and all -
         or, for a board left in the sheet, only what is cut.
@@ -1099,7 +1245,25 @@ class AutoRun:
     def _leave_out(self, key, paths):
         """An isolation pass with what is under the bracket taken out and
         the bit led round. ``(paths, uncut_mm)``; any other job, or with
-        ``leave_under`` off, is returned as it is."""
+        ``leave_under`` off, is returned as it is.
+
+        A cut-out that would run into the bracket's bars - the side cuts of
+        a board that spans its stock run edge to edge, and one edge is
+        against a bar - stops short of them instead, leaving tabs that are
+        broken free by hand. ``uncut_mm`` is 0 for it: nothing is proved."""
+        if "cutout" in key and self.arms:
+            from gerber2rml.engine.bracket import tabs
+            paths, n = tabs(paths, [(arm, self.bit / 2.0 + 0.1)
+                                    for arm in self.arms],
+                            self._stock_rect())
+            if n and key not in self._tabbed:
+                self._tabbed.add(key)
+                self.ev.note("The cut-out stops just short of the "
+                             "bracket's bar in %d place%s, so it does not cut "
+                             "the bar: the board stays held there by a thin "
+                             "tab (about 0.15 mm). Break or cut it free "
+                             "afterwards." % (n, "" if n == 1 else "s"))
+            return paths, 0.0
         if not self.leave_under or "traces" not in key:
             return paths, 0.0
         from gerber2rml.engine.bracket import avoid

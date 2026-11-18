@@ -21,6 +21,15 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
 
 @pytest.fixture(autouse=True)
+def _background_inline(monkeypatch):
+    """The laser page's sums run where they are asked for, so a test sees the
+    result the moment it makes the edit. test_gui2_background.py turns this
+    off to test the thread pool itself."""
+    from gerber2rml.gui2 import background
+    monkeypatch.setattr(background, "INLINE", True)
+
+
+@pytest.fixture(autouse=True)
 def _no_desktop_urls(monkeypatch):
     """No test opens a browser tab or a file manager.
 
@@ -77,6 +86,9 @@ def _isolated_qsettings(tmp_path_factory):
     d.mkdir(parents=True, exist_ok=True)
     QSettings.setDefaultFormat(QSettings.IniFormat)
     QSettings.setPath(QSettings.IniFormat, QSettings.UserScope, str(d))
+    # The explicit (organization, application) constructor still uses Native
+    # format, even after setDefaultFormat. Isolate that overload as well.
+    QSettings.setPath(QSettings.NativeFormat, QSettings.UserScope, str(d))
     yield
 
 
