@@ -24,11 +24,9 @@ def win(qt_app, monkeypatch, tmp_path):
     w = MainWindow()
     w.resize(1400, 900)
     w.show()
-    w.action_autorun(True)
     w.autorun_page.set_bracket(br.DEFAULT)
     yield w
     w.autorun_page._clear_nogo()
-    w.action_autorun(False)
     w.close()
 
 
