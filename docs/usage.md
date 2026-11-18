@@ -32,6 +32,33 @@ A height map is a file, so you do not lose levelling — only measuring.
 A bed does not move between sessions, so one probe run serves every job on that
 sheet.
 
+## How the board is made
+
+Every board has one **method**: the **flat mill** (0.8 mm endmill), the **ball
+mill** (0.44 mm channel, for fine pitch) or **laser copper**. It is shown as the
+chip at the top left and on *Your board*, and it decides:
+
+- **the checks**: a mill board is checked against the cutter; a laser board
+  against the laser's 0.20 mm floor. A laser board with 0.25 mm gaps is no
+  longer "shorted";
+- **the tool profile** on the mill: flat or ball;
+- **the rail**: a laser board is *Drill and cut out* on the mill, then *Etch
+  the traces* (and the mask, silkscreen and stencil the folder has layers for)
+  on the laser.
+
+Where it comes from, best first: what you chose for this board before; what
+KiCad's *Set design rules for SRM-CAM* stored (`srm-cam/method.json`, in the
+folder *Send to SRM-CAM* plots into); a guess from the narrowest gap between
+two nets (at least 0.8 mm: flat; at least 0.44 mm: ball; narrower: laser).
+Click the chip to choose another method at any time. Every mill feature stays
+available for a board you mill.
+
+**The laser order.** On the mill the run drills the holes and cuts the outline
+on its tabs, so the board stays in the sheet. The whole sheet then goes to the
+laser, which lines the copper, the mask and the silkscreen up on those holes.
+Break the tabs at the end. Several boards on one sheet go to the laser as one
+job.
+
 ## Operations
 
 Three operations, each exported as its own job:
@@ -71,7 +98,10 @@ Two or more Gerber folders, cut from one piece of copper in one run.
   them up 4 mm apart.
 - **Files:** one set, named after every board (`buck+buck_2_traces.nc`) unless
   you type a job name. One trace pass, one drill file, one cut-out that frees
-  each board in turn. The dry run traces every outline.
+  each board in turn. On the laser the whole sheet is one job.
+- **Arrange:** *Lay them side by side* starts a new row when the next board
+  would run past the copper sheet's edge, and says so if they still do not
+  fit.
 - **Butted boards:** boards closer than the cut-out bit share one cut, centred
   in the gap, so the panel needs no waste between them; each loses half of
   what the cutter takes beyond the gap (0.4 mm a side for touching boards and
@@ -249,21 +279,13 @@ in a shared bed.
 Re-zero **Z** after every bit change. Never XY. The fixture makes this practical:
 there is no reason to touch XY once the pins are in.
 
-### 3 · Prove it before you cut — the dry run
-
-Every export writes **`<name>_airpass.nc`**, and it is step 0 in the run plan.
-Spindle **off**, bit held 5 mm up, tracing the board outline at a feed slow
-enough to watch. If the stock is misplaced you see the bit leave the copper and
-you stop — having spent seconds instead of a board.
-
-This is the part that actually answers *"is it aligned?"*, it needs no hardware
-at all, and it is worth running before **every** job, fixture or not.
+### 3 · Keep the origin
 
 > **One thing to check on your machine:** whether the SRM-20 keeps its user
 > origin across a power cycle. If it does, set XY zero once per term against the
 > fixture and never again. If it does not, the daily ritual is "seat the bit in
-> pin hole 1, set origin" — still far better than finding a sheared stock corner
-> by eye, because a drilled hole is a crisp feature you can drop a bit into.
+> pin hole 1, set origin", because a drilled hole is a crisp feature you can
+> drop a bit into.
 
 ### 4 · Bolt it down — the spoilboard screw grid
 
@@ -378,12 +400,20 @@ Safety, all enforced in firmware so they survive the app crashing:
 The **Spindle** button follows the machine, so it shows a spindle you started
 from VPanel too — and disconnecting never stops a spindle SRM-CAM did not start.
 
-### Streaming a job without VPanel
+### Running a job from SRM-CAM
 
-**Stream (exp.)** sends a job move-by-move over the link. A **wet run** now
-starts and stops the spindle itself, holds on **Pause**, and aborts if the lid
-opens mid-job. It still needs the speed set in VPanel first, and it is still
-experimental: always do the dry run on a new job.
+Both Novice and Pro send the job to the mill themselves: the run on the rail
+(*Mill it*, or *Drill and cut out* for a laser board) finds the stock, levels,
+cuts, asks for the flip and stops before the cut-out. Pro also has every step
+on the rail, *Start at* to finish a run that stopped, and *Export the files for
+VPanel* to run them from another PC.
+
+**Where the stock is.** In the corner bracket (drawn on the bed; the board goes
+into its corner), or, in Pro, **anywhere**: put the board on the bed where the
+copper is and the probe starts in the middle of the board and walks out to the
+copper's edges to find its corner and how it is turned. A board that lies on
+the copper it finds is cut where you put it. Start says before it changes any
+Pro setting (registration, flip, reference-hole size) a double-sided run needs.
 
 ## Machine test — what this machine can actually do
 
@@ -482,7 +512,8 @@ laser preview. Proven on a 90 × 72 mm board, 120 holes, worst pad 0.034 mm.
    is, and **Worst pad** says how far the pads disagree (good < 0.10 mm, too far
    out ≥ 0.25 mm).
 5. **Write the drill file** writes `<name>_drill_fitted.nc`: every hole moved onto
-   the measured board. Zero Z with the drill bit and run it. Do not move the
+   the measured board. Set the Z origin on the copper with the drill bit and run
+   it. Do not move the
    board or reset XY after measuring.
 
 Three pads are required because two fit a mirrored board just as well as the
@@ -573,23 +604,143 @@ inside of a letter like O stays a loop of its own, which the laser's fill leaves
 unmarked. Nothing is shrunk. Artwork past the board edge is cut off at the outline
 and the clipped area is reported. Engine: `engine/silkscreen.py`.
 
-## Solder mask and silkscreen on the xTool
+## Copper traces, solder mask, and silkscreen on the xTool
 
-The solder mask and silkscreen sections each have a button that opens the same
-laser page as the stencil, with the same photo, autofocus, placement, Align,
-selection, presets and STOP:
+The Setup page lets you send any laser job directly to the xTool F1 Ultra (no
+XCS required). The laser is a page of the main window, not a window of its own:
+**CNC | Laser** in the header (Ctrl+1 / Ctrl+2) swaps between the
+mill and the laser, and each page stays as you left it. The laser page has a
+**Traces | Mask | Silk | Stencil** switcher at the top of the right panel so you
+can step through all four jobs without losing board placement, focus, or camera
+alignment. It follows the board loaded on the mill's page.
+
+**Undo** (Ctrl+Z, or the Undo button above the bed) puts the job back where it
+was before the last drag, typed position, arrow nudge, right-click centring or
+turn; **Redo** is Ctrl+Shift+Z or Ctrl+Y. A drag is one step, and arrow nudges
+in a row are one step.
+
+The page works out the trenches and the run time in the background, once an
+edit has rested for a moment, so typing a ring count or turning the board never
+freezes the window. The old trenches stay up until the new ones are in, and the
+Estimate shows **…** while it is being worked out. A run started meanwhile waits
+for them, so what is cut is always what is shown.
+
+- **Etch the traces on the xTool…** isolates every net on `B.Cu` (or `F.Cu`
+  when `B.Cu` is absent/empty) directly from the Gerber folder. Use **Copper face**
+  in the laser window to select **F.Cu — top copper** for a circuit routed on
+  the front, such as curtain-drive. The preview labels the chosen layer and
+  mirror state; top copper is not mirrored.
 - **Open the mask on the xTool…** fills every mask opening, ablating the cured
   ink off the pads.
 - **Mark it on the xTool…** fills the silkscreen artwork.
 
-What changes:
+**The board's edge is never lasered as a trace.** Two things used to put it in
+the job, and both are taken out when the traces are read:
+- **The outline plotted into the copper file.** KiCad's plot option *Plot
+  Edge.Cuts on all layers* draws the outline into every copper Gerber as a thin
+  line, and read as copper it was isolated all the way round. Lines and arcs that
+  lie on the outline are left out when together they cover at least half of it,
+  and the page says so. A single stroke that only touches the edge is kept. Best
+  fixed in KiCad too: untick that option when plotting.
+- **Copper that reaches the edge.** A pour or track running to the outline was
+  isolated along the edge as well, where there is nothing to isolate it from.
+  That part of every pass is no longer drawn.
 
-| | Stencil | Solder mask | Silkscreen |
-|---|---|---|---|
-| Laser work | outline cut, 30 passes in zones | filled, hatch lines | filled, hatch lines |
-| Default preset | 0.1 mm 304 stainless | RemoveSolderMask (sphawes) | RemoveSolderMask (sphawes) |
-| Align locks onto | the holes it cut | the drilled holes | the drilled holes |
-| Learn the camera offset | yes | no (uses the stencil's) | no (uses the stencil's) |
+The traces DXF still has the outline on its own layer, for placing the job in
+XCS. Set that layer to not output there. *Score the board outline afterwards* is
+off in every traces preset.
+
+### Native vector isolation and material calibration
+
+XCS turns a Vector Engrave fill into full-board scanlines that cut across narrow
+trace gaps and rapid-jump back and forth across copper tracks tens of thousands
+of times. SRM-CAM defaults to **Concentric passes (FlatCAM style)**:
+
+| Method | What it does | When to use |
+|---|---|---|
+| **Concentric passes (FlatCAM)** | Follows copper boundaries outward in concentric vector rings (default geometry: 6 rings ≈ 0.22 mm band), alternating sweep order each round | Native vector isolation, after calibrating on the same copper stock |
+| **Moat hatch (cross-hatched band)** | Hatches only the isolation band around copper traces and pads | When you want a cross-hatched moat without full rubout |
+| **Full rubout (sphawes / XCS)** | Hatches every empty millimetre inside the board outline | When all unused copper must be removed |
+
+**The proven recipe.** **FR4 1.6 mm · proven** is the default traces preset:
+- **Settings:** fiber, **100 %, 1000 mm/s, 30 kHz, 20 passes**, with concentric
+  rings (6 rings, 0.04 mm kerf, 285 lines/cm).
+- **Result on the lab's F1 Ultra (16 Nov 2026):** the whole curtain-drive board
+  came out with every net isolated and no fine trace burnt, in about five minutes
+  of laser time, against about two hours on the mill.
+- **Other presets:** the rest are still uncalibrated starting points. XCS fill
+  settings do not carry over to these vector rings.
+
+**Copper calibration**, for new stock. Open it from **Traces → Recipe →
+Calibrate copper vectors…**, or straight away with `srm-cam-laser --calibrate`.
+Use a fresh, flat scrap of the same stock and autofocus on its copper. The
+coupon is a 40 × 40 mm square; its labels and frame are guides and are never
+lasered.
+
+1. **Find the exposure.**
+   - **The grid:** 16 small real traces, each two 0.4 mm tracks with a 0.3 mm
+     gap and a pad at alternate ends, isolated with the production rings.
+   - **Columns and rows:** the columns are speeds (300, 600, 1000, 2000 mm/s)
+     and the rows are pass counts (5, 10, 20, 40), all at one power (100 %,
+     30 kHz). Both lists can be edited.
+   - **One job:** the whole grid runs in about 80 s. Passes go round-robin with
+     a 0.5 s laser-off rest each round, so no track gets its passes back to back.
+   - **Reading it:** too little dose leaves faint outlines; too much chars the
+     board.
+   - **Choosing:** pick the cell that cleared the copper with the fewest passes.
+     Prove it with a continuity check across the two pads, which should read
+     open.
+
+   On the lab's FR4, 600 × 20, 1000 × 20 and 2000 × 40 were best: the same dose
+   (passes ÷ speed) window. A single line is not a fair test: it only cuts a
+   hairline, too thin to judge whether the copper is cleared.
+2. **Single lines, Spacing, Corners and pads:** use the exposure the grid found.
+   These stages take a pass count, so a cell runs at, say, 20 passes in one
+   press.
+   - **Single lines:** measure the cleared width.
+   - **Spacing:** find a pitch that clears continuously.
+   - **Corners and pads:** check five real shapes.
+
+   Each stage needs the measurement from the one before. Use fresh copper for
+   every stage.
+
+**Run records.** Every run saves its `.gcode` and `.json` in
+`Documents/SRM-CAM/exports/copper-calibration/`, or the configured workspace:
+- **What is recorded:** the material, the stage and cell (or the whole grid
+  with each cell's speed and passes), power, frequency, passes, position, head
+  Z, camera correction, the exact job's hash, and whether it completed.
+- **Uncertain runs:** interrupted or failed runs are recorded as uncertain, not
+  counted.
+- **Observations:** **Record observation** saves what you inspected. It does not
+  judge isolation from a camera picture.
+
+**Saving a recipe.** After **Clean isolation** on all five corners/pads cells, at
+one exposure and one total pass count, **Save measured recipe…** stores the
+exposure, cleared width, pitch, rings and that pass count as a traces preset.
+Mixed exposures, uneven pass counts and interrupted runs cannot become a
+preset.
+
+**The laser page on its own.** `srm-cam-laser [gerber-folder]` opens the laser
+page straight on a board, without SRM-CAM's milling steps:
+- **Which job:** it starts on traces from the face with the most copper, so a
+  fab-made board like curtain-drive opens on F.Cu. It falls back to mask,
+  silkscreen or stencil if the folder has no copper.
+- **With no folder:** it reopens the last one, or asks for one.
+- **Options:** `--job mask|silk|stencil` opens on that job, and `--calibrate`
+  opens the copper calibration window.
+
+When a drill file is present, **Etch drill hole centres inside pads** (on by
+default) clears the copper at each hole centre so drill bits self-centre and
+`Drill a board made elsewhere` can probe isolated pads.
+
+What changes across the four jobs:
+
+| | Traces | Stencil | Solder mask | Silkscreen |
+|---|---|---|---|---|
+| Laser work | concentric vector rings (or moat/rubout) | outline cut, 30 passes in zones | filled, hatch lines | filled, hatch lines |
+| Default preset | FR4 1.6 mm · proven (100 %, 1000 mm/s × 20) | 0.1 mm 304 stainless | RemoveSolderMask (sphawes) | RemoveSolderMask (sphawes) |
+| Align locks onto | the drilled holes (if present) | the holes it cut | the drilled holes | the drilled holes |
+| Learn the camera offset | no (uses the stencil's) | yes | no (uses the stencil's) | no (uses the stencil's) |
 
 **The fill presets** are the ones in sphawes/fiber-laser-pcb-fab's
 `settings.json`, which the lab imports into XCS:
@@ -661,7 +812,7 @@ focus.
    - The cross sits at the stencil's middle, on the factory's 10 mm grid.
      Right-click → **Autofocus here** measures somewhere else.
    - You can also type XCS's thickness and press **Set**.
-3. **Photo** again, then place the stencil. Any of these work:
+3. The photo refreshes after focus or a thickness change. Place the stencil:
    - Drag it.
    - Nudge it with the arrow keys: 0.1 mm, or 1 mm with Shift, or 10 mm with Ctrl.
    - Type X/Y, which is the top-left corner of the outline.
@@ -702,16 +853,77 @@ The **Camera** section stores a correction, and every photo is moved by it:
 2. It finds the holes in a photo and stores the difference.
 
 The photo taken after a cut is checked automatically, and the status says when
-the photo is more than 0.3 mm off. **Reset** clears the correction.
+the photo is more than 0.3 mm off. Learning uses the recorded laser cut position,
+even if the overlay has since moved. The material must still be where it was
+cut. Learning is available after a successful stencil cut in this window.
+**Correction X/Y** adjusts the stored correction by hand; **Reset** clears it.
+Both immediately reproject the current photo without moving the drawing or
+the laser job. Picked photo references follow the corrected coordinates.
 
 On the lab's machine, learning from the curtain-drive stencil (114 holes) took
 the photo from −0.51, −0.88 mm off down to 0.07 mm.
 
+**Proof on the drilled holes (traces).** For a board that was drilled first,
+**Alignment › Proof on the drilled holes** ties the laser to the holes without
+relying on a stored camera correction:
+
+1. Drag the drawing roughly onto the board (within about 3 mm) and press it.
+2. It takes a photo, makes a few faint marks, and takes a second photo. Only
+   what changed between the two counts, so the marks are found whatever the
+   board looks like.
+3. The marks set the camera correction; the holes, seen through the corrected
+   camera, give how far the job is off the board. The job is moved (and turned
+   up to 1.5°) onto them. Nothing moves if the marks do not show.
+
+**Where the marks go** (*Proof options › Marks*): in the waste beside the board
+when the sheet carries on past the outline, as small 1.5 mm squares 3 mm outside
+it; otherwise on the isolation within 2.5 mm of three drilled holes that lie far
+apart, which the job removes anyway. *Automatic* judges the waste from the
+photo. **Mark passes** (default 3) is how many passes the marks get.
+
+On a double-sided board, run the proof on each face after the flip. Written
+2026-11-17 and tested on synthetic photos only: the mark passes needed for the
+camera to see a mark on copper, and the waste check, are not yet tried at the
+machine.
+
+**The side panel** shows the job, the proof, focus and camera readouts and the
+recipe. Position in numbers, proof options, matching points by hand, the
+automatic references, the height by hand, the camera correction by hand and the
+recipe's numbers are each under a fold that remembers whether it was open.
+
+**Pick matching points (any board).** The **Alignment** section works without
+mounting holes or a drill file:
+
+1. Take a photo and press **Pick matching points**.
+2. Choose snapping to hole centres or artwork centres, or **Free points /
+   corners / marks**. Click a reference in the drawing. The drawing temporarily
+   hides so the photo is unobstructed.
+3. Click the same physical feature in the photo. Repeat for two distant points,
+   preferably three or more distributed over the board. Zoom in with the wheel;
+   the photo is displayed at 8 pixels/mm. Numbered drawing/photo markers show
+   each pair. **Remove** deletes the selected pair; **Clear** starts over;
+   Escape exits picking.
+4. Press **Apply point alignment**. The drawing rotates and translates to fit,
+   without scaling or mirroring. RMS and worst error are shown. Inconsistent
+   pairs (over 0.3 mm residual), duplicates, and references less than 5 mm apart
+   are rejected without moving the job. Two points cannot independently verify
+   the fit, so add a third to check it.
+
+These references never change the shapes selected for etching. A new photo
+clears manual pairs because the board may have moved. Board alignment changes
+the job position; it does not teach the camera offset.
+
+**Automatic alignment.** Expand **Automatic alignment references** to choose
+drilled holes or artwork shapes, then tick only features that already exist on
+the material. Selecting a row highlights that feature in the viewer. Choose
+dark holes/marks or bright pads/marks to match the photo. At least two enabled
+references are required. Artwork references must physically exist already;
+use corners or other visible marks on a blank copper board.
+
 **Align after moving the foil.** If the foil or board has been lifted and put
 back, for example to push out slugs before a re-cut:
 1. Drag the stencil roughly onto it.
-2. Press **Align**. It takes a photo and finds the holes already cut, which
-   show up as dark spots in bright foil or burned marks on FR4.
+2. Press **Align**. It takes a photo and finds the enabled references.
 3. The stencil is moved and turned onto them, including small angles. If the
    board went back a quarter turn round, the other three orientations are
    tried as well.
