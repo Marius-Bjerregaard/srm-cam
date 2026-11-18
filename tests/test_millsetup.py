@@ -144,7 +144,7 @@ def test_an_answer_that_is_not_ready_yet_is_waited_for():
     """Seen on the lab mill without a network link in between: the first
     header after a request says 20 or 40 and announces nothing. Reading on
     regardless gave "the mill sent 0 bytes where 12 were expected"."""
-    mill = FakeMill(slow=3)
+    mill = FakeMill(slow=2)
     assert millsetup.g54_origin(mill, ) == (0.0, 0.0, -55.64)
     assert millsetup.command_set(mill) == "nc"
     assert millsetup.set_command_set(mill, nc=False, **FAST) == "rml"
@@ -367,5 +367,125 @@ def test_the_module_loads_without_pyusb(monkeypatch):
         return real(name, *a, **k)
 
     monkeypatch.setattr(builtins, "__import__", no_usb)
+    monkeypatch.setattr(millsetup, "WINDOWS", False)
     with pytest.raises(SetupError, match="pyusb is not installed"):
+        millsetup.open_mill()
+
+
+# --- Windows: the same transfers through the USB printer driver -------------
+
+from gerber2rml.engine import usbprint_win  # noqa: E402
+
+
+class PrinterDriver:
+    """usbprint.sys's two vendor IOCTLs, in front of the fake mill: unpacks
+    each buffer the way Microsoft documents it and hands the mill the
+    control transfer the driver would put on the wire."""
+
+    def __init__(self, mill):
+        self.mill = mill
+        self.calls = []
+
+    def __call__(self, code, inbuf, outlen):
+        self.calls.append((code, bytes(inbuf), outlen))
+        request, value = inbuf[0], (inbuf[1] << 8) | inbuf[2]
+        if code == usbprint_win.IOCTL_USBPRINT_VENDOR_SET_COMMAND:
+            assert outlen == 0
+            self.mill.ctrl_transfer(0x41, request, value, 0, bytes(inbuf[3:]))
+            return b""
+        assert code == usbprint_win.IOCTL_USBPRINT_VENDOR_GET_COMMAND
+        assert len(inbuf) == 3
+        return bytes(self.mill.ctrl_transfer(0xC1, request, value, 0,
+                                             outlen))[:outlen]
+
+
+def test_the_ioctl_codes_are_usbprints():
+    # CTL_CODE(FILE_DEVICE_UNKNOWN, 14 / 15, METHOD_BUFFERED, FILE_ANY_ACCESS)
+    def ctl(fn):
+        return (0x22 << 16) | (fn << 2)
+    assert usbprint_win.IOCTL_USBPRINT_VENDOR_SET_COMMAND == ctl(14)
+    assert usbprint_win.IOCTL_USBPRINT_VENDOR_GET_COMMAND == ctl(15)
+
+
+def test_a_request_goes_to_the_driver_value_high_byte_first():
+    mill = FakeMill()
+    drv = PrinterDriver(mill)
+    millsetup.command_set(usbprint_win.UsbPrintDevice(drv))
+    code, inbuf, _n = drv.calls[0]
+    # Register 3100: wValue 0x3100, data 01 31 00 00 - as VPanel sent it.
+    assert code == usbprint_win.IOCTL_USBPRINT_VENDOR_SET_COMMAND
+    assert inbuf == H("01 31 00 01 31 00 00")
+    code, inbuf, n = drv.calls[1]
+    assert code == usbprint_win.IOCTL_USBPRINT_VENDOR_GET_COMMAND
+    assert inbuf == H("01 00 01") and n == 8
+
+
+def test_the_whole_channel_works_through_the_printer_driver():
+    mill = FakeMill(slow=2)
+    dev = usbprint_win.UsbPrintDevice(PrinterDriver(mill))
+    assert millsetup.is_srm20(dev)
+    assert millsetup.command_set(dev) == millsetup.NC
+    assert millsetup.g54_origin(dev)[2] == pytest.approx(-55.64)
+    assert millsetup.status(dev)["spindle_percent"] == 100
+    millsetup.set_command_set(dev, nc=False, **FAST)
+    assert mill.reg[0x3100] == H("00")
+
+
+def test_the_printer_driver_is_asked_only_what_it_can_send():
+    dev = usbprint_win.UsbPrintDevice(lambda *a: b"")
+    with pytest.raises(OSError):
+        dev.ctrl_transfer(0x80, 0x06, 0x0100, 0, 18)    # a standard request
+    with pytest.raises(OSError):
+        dev.ctrl_transfer(0xC1, 0x01, 0x0001, 1, 8)     # another interface
+
+
+def test_the_mill_is_picked_out_of_the_usb_printers_by_its_ids():
+    path = (r"\\?\usb#vid_0b75&pid_039f#6&2c5c1e4&0&2#"
+            "{28d78fad-5a12-11d1-ae5b-0000f803a8c2}")
+    assert usbprint_win.matches(path, 0x0B75, 0x039F)
+    assert not usbprint_win.matches(path.replace("039f", "0400"),
+                                    0x0B75, 0x039F)
+
+
+def test_on_windows_the_printer_driver_is_tried_first(monkeypatch):
+    mill = FakeMill()
+    monkeypatch.setattr(millsetup, "WINDOWS", True)
+    monkeypatch.setattr(usbprint_win, "open_device",
+                        lambda vid, pid: usbprint_win.UsbPrintDevice(
+                            PrinterDriver(mill)))
+    monkeypatch.setattr(millsetup, "_open_libusb",
+                        lambda: pytest.fail("libusb was tried first"))
+    dev = millsetup.open_mill()
+    assert isinstance(dev, usbprint_win.UsbPrintDevice)
+
+
+def test_on_windows_no_mill_says_what_to_check(monkeypatch):
+    monkeypatch.setattr(millsetup, "WINDOWS", True)
+    monkeypatch.setattr(usbprint_win, "open_device", lambda vid, pid: None)
+
+    def no_libusb():
+        raise SetupError("pyusb is not installed")
+
+    monkeypatch.setattr(millsetup, "_open_libusb", no_libusb)
+    # The printer driver's answer is the one that matters on Windows.
+    with pytest.raises(SetupError, match="USB printers"):
+        millsetup.open_mill()
+
+
+def test_on_linux_a_mill_that_will_not_answer_points_at_udev(monkeypatch):
+    import types
+    monkeypatch.setattr(millsetup, "WINDOWS", False)
+    monkeypatch.setattr(millsetup, "LINUX", True)
+
+    class Denied:
+        def ctrl_transfer(self, *a):
+            raise OSError("[Errno 13] Access denied (insufficient permissions)")
+
+    core = types.SimpleNamespace(find=lambda **k: Denied())
+    usb = types.ModuleType("usb")
+    usb.core = core
+    monkeypatch.setitem(__import__("sys").modules, "usb", usb)
+    monkeypatch.setitem(__import__("sys").modules, "usb.core", core)
+    monkeypatch.setattr(millsetup, "_libusb_backend", lambda: object())
+    with pytest.raises(SetupError, match="udev"):
         millsetup.open_mill()

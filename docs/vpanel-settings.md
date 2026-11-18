@@ -151,9 +151,24 @@ before the run has probed anything.
 - **Before an automatic run** the same reading is taken. A mill in RML-1 is
   set to NC Code and the run's log says so. A G54 that is not at 0, 0, or a
   mill that cannot be read over USB, asks before the run goes on.
-- macOS (and Linux, where there is no machine link yet). **Not Windows**: the
-  Roland driver owns the device there and libusb cannot open it; VPanel is at
-  hand on that PC anyway.
+- **macOS and Linux**: pyusb and libusb, straight to the device, the system's
+  printer driver left in place. Linux's usbfs lets a vendor request past the
+  `usblp` driver without claiming the interface; it needs read/write access
+  to the device, which a udev rule gives
+  (`SUBSYSTEM=="usb", ATTR{idVendor}=="0b75", ATTR{idProduct}=="039f",
+  MODE="0666"` in `/etc/udev/rules.d/60-srm20.rules`). Linux has no machine
+  link yet, so there it is the settings sheet only.
+- **Windows**: the Roland driver owns the device and libusb cannot open it
+  without replacing that driver, which would take the printer queue with it.
+  So the transfers go through the USB printer driver instead
+  (`engine/usbprint_win.py`): `usbprint.sys` has two documented device
+  controls, `IOCTL_USBPRINT_VENDOR_SET_COMMAND` and `…_GET_COMMAND`, that put
+  a vendor request to the printer interface on endpoint 0 - `41`/`C1`,
+  `wIndex` 0, exactly what the captures show VPanel sending. The device is
+  found among the USB printers (`GUID_DEVINTERFACE_USBPRINT`) by
+  `vid_0b75&pid_039f` in its path. **Not yet tried at the mill.** Until it
+  has been, a mill that cannot be read on Windows is a line in the run's log,
+  not a question before the run.
 
 ## Tried at the mill, and not
 
@@ -206,3 +221,20 @@ what VPanel showed last: Command Set, the Spindle slider.
    was RML-1 and is now NC Code, and the run should go on. Check in VPanel
    afterwards that Setup shows NC Code.
 5. **Power cycle.** Switch the mill off and on; read the settings again.
+
+### Windows checklist
+
+The printer-driver channel is written from Microsoft's documentation and
+tested against the replayed captures, not yet against the mill. At the mill,
+on the lab PC, VPanel closed:
+
+1. **Read only.** Machine ▸ The mill's settings… shows NC Code, G54 X/Y and
+   the spindle percentage - the same numbers VPanel shows. If it says the
+   mill was not found among the USB printers, check Devices and Printers for
+   the SRM-20 and that the monoFab driver is installed.
+2. **Spindle percentage, spindle off.** Set 60 %, close, reopen: it reads 60.
+   Set it back.
+3. **A job still prints.** Start a dry run: the jobs go through the spooler
+   as before.
+4. **With VPanel open** at the same time: does the read still work? (VPanel
+   polls five times a second; the driver may or may not let both in.)

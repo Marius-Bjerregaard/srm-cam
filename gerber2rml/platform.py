@@ -35,6 +35,10 @@ def _is_macos(platform=None):
     return _plat(platform) == MACOS
 
 
+def _is_linux(platform=None):
+    return _plat(platform).startswith(LINUX)
+
+
 @dataclass(frozen=True)
 class Capabilities:
     """What the host OS supports.

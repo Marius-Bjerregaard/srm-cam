@@ -3,7 +3,8 @@
 Two settings on the SRM-20 itself decide whether a job runs and how fast the
 spindle turns, and until now both lived only in Roland's VPanel, which is
 Windows-only: Setup ▸ Command Set, and the Spindle slider. A lab that runs
-its mill from a Mac had to borrow a Windows PC to look at either.
+its mill from a Mac had to borrow a Windows PC to look at either, and on
+Windows it meant a second program next to this one.
 :mod:`gerber2rml.engine.millsetup` reads and sets them over USB the way
 VPanel does; this is the sheet in front of it.
 
@@ -74,7 +75,8 @@ def _ask(parent, headline, text, go, level="warn"):
     return bool(d.exec())
 
 
-def preflight(parent, open_mill=None, say=None):
+def preflight(parent, open_mill=None, say=None,
+              ask_unreadable=True):
     """Check the mill's own settings before a run sends anything, and put
     right what can be. True to go ahead.
 
@@ -85,6 +87,9 @@ def preflight(parent, open_mill=None, say=None):
     next person finds out why VPanel shows something else than they left.
     Cancel is the default button on the questions that remain, so Return
     never starts a run that had something to say.
+
+    ``ask_unreadable=False``: a mill that cannot be read is a line in the
+    log, not a question (Windows, where the channel is new).
     """
     say = (lambda _level, _text: None) if say is None else say
     open_mill = millsetup.open_mill if open_mill is None else open_mill
@@ -92,6 +97,12 @@ def preflight(parent, open_mill=None, say=None):
         dev = _busy(open_mill)
         now = _busy(lambda: read_all(dev))
     except millsetup.SetupError as e:
+        if not ask_unreadable:
+            say("warn", f"The mill's settings could not be read ({e}), so "
+                        "the command set and G54 were not checked. The run "
+                        "goes on; it stops by itself if the mill refuses "
+                        "the job or G54 is not where it should be.")
+            return True
         return _ask(parent, "The mill's settings could not be checked",
                     f"SRM-CAM could not read the mill over USB ({e}). The "
                     "run can still start: it stops by itself if the mill "

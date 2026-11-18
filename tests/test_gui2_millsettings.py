@@ -184,3 +184,17 @@ def test_a_mill_that_cannot_be_read_leaves_the_choice_to_the_operator(
                                "Start anyway")]
     asked["yes"] = False
     assert millsettings.preflight(None, open_mill=gone) is False
+
+
+def test_on_windows_a_mill_that_cannot_be_read_is_only_noted(mill, asked):
+    """The printer-driver channel is new on Windows: an unreadable mill is a
+    line in the log, not a question before every run."""
+    def gone():
+        raise millsetup.SetupError("no SRM-20 among this PC's USB printers")
+
+    log = []
+    assert millsettings.preflight(None, open_mill=gone, ask_unreadable=False,
+                                  say=lambda lv, t: log.append((lv, t)))
+    assert asked["heads"] == []
+    assert len(log) == 1 and log[0][0] == "warn"
+    assert "USB printers" in log[0][1]

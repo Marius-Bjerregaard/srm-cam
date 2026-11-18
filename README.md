@@ -33,7 +33,8 @@ All from the [latest release](https://github.com/MadsRudolph/srm-cam/releases/la
 (Software tab). It is the one thing SRM-CAM needs: the driver makes the mill a
 printer SRM-CAM can send to. Install it with the mill's USB unplugged, and plug
 it in when the installer asks. Roland's VPanel is optional: only for playing
-exported files by hand in Pro, or for changing the mill's command set.
+exported files by hand in Pro. The mill's command set and spindle speed are
+under *Machine ▸ The mill's settings…* on Windows, macOS and Linux.
 Step by step: [Getting started](https://madsrudolph.github.io/srm-cam/getting-started.html#roland).
 
 ## What it does

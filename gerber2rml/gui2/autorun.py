@@ -1713,13 +1713,16 @@ class AutoRunPage(inspector.Page):
             if rmlspool.MACOS and not macmill.preflight(self.window(),
                                                         printer):
                 return
-            if rmlspool.MACOS:
-                # The mill's own settings, which used to need VPanel on a
-                # Windows PC: the command set is put right and said in the
-                # log; a run that would stop at the frame check asks first.
-                from gerber2rml.gui2 import millsettings
-                if not millsettings.preflight(self.window(), say=ctl.say):
-                    return
+            # The mill's own settings, which used to need VPanel: the
+            # command set is put right and said in the log; a run that would
+            # stop at the frame check asks first. On Windows a mill that
+            # cannot be read is only noted - the channel through the printer
+            # driver is new there, and the run has its own checks.
+            from gerber2rml.gui2 import millsettings
+            if not millsettings.preflight(
+                    self.window(), say=ctl.say,
+                    ask_unreadable=not rmlspool.WINDOWS):
+                return
         if ctl._double:
             self._apply_double_settings()
         ctl.show_auto_face(False)
