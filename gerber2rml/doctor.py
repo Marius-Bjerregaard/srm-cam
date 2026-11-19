@@ -116,7 +116,7 @@ def main(argv=None):
     ap.add_argument("--dev", action="store_true",
                     help="also include the dev (pytest) extras")
     ap.add_argument("--setup-mill", action="store_true",
-                    help="macOS: make the raw CUPS queue SRM-20 that jobs "
+                    help="macOS and Linux: make the raw CUPS queue SRM-20 that jobs "
                          "are sent to (mill on, USB in; asks for sudo)")
     args = ap.parse_args(argv)
 

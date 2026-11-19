@@ -740,8 +740,8 @@ class RunReadout(QWidget):
 OFFLINE_PRO = ("Everything except probing works without the link — export the "
                "files and send them from VPanel.")
 OFFLINE_NOVICE = "Connect the machine to run the board."
-# Where only the simulator can be connected (not Windows or macOS).
-OFFLINE_SIM_ONLY = ("The machine link runs on Windows and macOS only. Here "
+# Where only the simulator can be connected (not Windows, macOS or Linux).
+OFFLINE_SIM_ONLY = ("The machine link runs on Windows, macOS and Linux only. Here "
                     "the port list has the simulated mill, to practise a run on.")
 
 
@@ -770,7 +770,7 @@ class MachineBar(QWidget):
                              theme.GAP_S)
         h.setSpacing(theme.GAP_M)
 
-        # Where the real link does not run (Linux, macOS), the bar is built
+        # Where the real link does not run (any other OS), the bar is built
         # all the same, but the only port it will list or open is the
         # simulator: practising a run needs no hardware, and so none of the
         # reasons the link is Windows-only. Real serial ports stay out of the

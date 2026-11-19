@@ -10,10 +10,11 @@ from pathlib import Path
 from gerber2rml import platform as plat
 
 
-def test_machine_link_is_windows_and_macos_only():
-    assert plat.capabilities("win32").machine_link is True
-    assert plat.capabilities("linux").machine_link is False
-    assert plat.capabilities("darwin").machine_link is True
+def test_machine_link_is_on_all_three_desktops_and_nowhere_else():
+    """One program, the same on Windows, macOS and Linux."""
+    for p in ("win32", "darwin", "linux"):
+        assert plat.capabilities(p).machine_link is True, p
+    assert plat.capabilities("freebsd14").machine_link is False
 
 
 def test_qt_style_is_fusion_on_macos_only():
@@ -51,7 +52,7 @@ def test_reveal_has_no_command_off_windows():
 def test_capabilities_defaults_to_the_running_host():
     import sys
     assert plat.capabilities().machine_link == (
-        sys.platform.startswith("win") or sys.platform == "darwin")
+        sys.platform.startswith(("win", "linux")) or sys.platform == "darwin")
 
 
 def test_permission_hint_names_the_group_the_device_actually_has():

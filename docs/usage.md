@@ -13,14 +13,14 @@ Everything that turns Gerbers into toolpaths works exactly as it does on
 Windows: load, check, place, level, export. The run plan, the shorts check and
 the double-sided flow are all the same code and produce the same files.
 
-**The machine link is Windows-only.** No Connect, no DRO, no jogging, no
-probing the bed over the Arduino. This is deliberate: the CNC PC is Windows,
-that link has only ever been run there, and an unverified motion path is not
-something to hand someone standing next to a spinning tool.
+**The machine link runs on Linux too** - Connect, the position readout,
+jogging, probing and the automatic run, with the mill as a CUPS print queue.
+It has not been run at a mill from Linux yet; [linux.md](linux.md) has the
+setup and says what is unproven.
 
 ### Levelling a board you prepared on Linux
 
-A height map is a file, so you do not lose levelling — only measuring.
+A height map is a file, so a board can also be levelled without the link:
 
 1. On the CNC PC, probe the bed as usual and use **Save CSV** to write the
    grid to a file.
