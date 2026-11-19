@@ -147,7 +147,13 @@ def main(argv=None, *, start_on=None, start_dxf=None):
         w._handoff.listen()
     except Exception:                           # noqa: BLE001 - a nicety
         traceback.print_exc()
-    QTimer.singleShot(800, w.maybe_offer_kicad_plugin)
+    # In Bot the app opens asking - after the KiCad offer, so that the two
+    # never stand on top of each other.
+    def greet():
+        if getattr(w, "_bot", None) is None:    # not already asking
+            w.maybe_offer_kicad_plugin()
+        w.maybe_start_bot()
+    QTimer.singleShot(800, greet)
     if not os.environ.get("SRM_CAM_NO_UPDATE_CHECK"):
         QTimer.singleShot(1500, w.start_update_check)
     return app.exec()

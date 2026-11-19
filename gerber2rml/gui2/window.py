@@ -431,6 +431,36 @@ class Toast(QLabel):
         self.resize(w, max(self.heightForWidth(w), self.minimumSizeHint().height()))
 
 
+# What to do about a folder that will not read, wherever it was picked.
+NOT_A_BOARD = ("SRM-CAM needs a copper layer, an Edge.Cuts outline and a "
+               "drill file in one folder — the set KiCad's Plot and Generate "
+               "Drill Files produce. If the folder holds a zip, unpack it "
+               "first.")
+
+# What a job is beyond its boards and its tool numbers, as far as Bot's
+# answers can reach: the attributes ``load_folder`` and the Setup and Run
+# pages' handlers write. See ``MainWindow.job_snapshot``.
+_JOB_ATTRS = ("_double", "_registration", "_auto_top", "_top_fit",
+              "_fid_measured", "_stock_turn", "_fid_mounting",
+              "_fid_placement", "_fid_points", "_fid_count", "_fid_diameter",
+              "_fid_offset", "_fid_flip", "_no_cutout", "_custom_name",
+              "stock", "_stock_set", "show_stock", "_exported", "_export_dir",
+              "_mask_result", "_silk_result", "_stencil_result",
+              "_laser_traces_result", "_method", "_method_source",
+              "_method_gap", "_double_before_laser")
+# ...and what those handlers remember between sessions.
+_JOB_SETTINGS = ("dirs/gerber", "autorun/centre", "sides/", "nocut/", "refs/",
+                 "method/")
+
+
+def copper_on_both_sides(board):
+    """Only a double-sided board has copper on both layers. Copper, not
+    files: KiCad can plot an empty F.Cu for a single-sided board."""
+    top = board.copper_top
+    return (top is not None and not top.is_empty
+            and board.copper is not None and not board.copper.is_empty)
+
+
 # Novice's whole rail, in order: keys of the one plan, in its own words.
 NOVICE_RAIL = {"setup": ("Your board", "How it is made, one side or two"),
                "checks": ("Check it", "Can it be made as drawn?"),
@@ -534,6 +564,7 @@ class MainWindow(QMainWindow):
         self._stock_turn = None       # the job turned to the found stock
         from gerber2rml.gui2 import machine as _machine
         _machine.SHOW_SIM = tier.is_full()
+        self._bot = None               # Bot's questions, while they are up
         self._layout_base = None       # the layout at offset (0, 0)
         self._layout_key = None        # what that base was built from
         self._layout_placed = None     # ...translated to the placement
@@ -899,8 +930,9 @@ class MainWindow(QMainWindow):
         self.tier_chip = widgets.ClickChip("Novice", "idle")
         self.tier_chip.setToolTip(
             "Which set of controls is on screen. Click to switch between "
-            "Novice and Pro; Help ▸ What Novice and Pro differ by says "
-            "exactly what Pro adds.")
+            "Novice and Pro; Help ▸ What Bot, Novice and Pro differ by says "
+            "exactly what Pro adds. Bot - Novice, with the app asking - is "
+            "in the View menu.")
         self.tier_chip.clicked.connect(self._toggle_tier)
         h.addWidget(self.tier_chip)
         return head
@@ -1030,14 +1062,24 @@ class MainWindow(QMainWindow):
         # the keyboard and for the menu-minded.
         self.tier_group = QActionGroup(self)
         self.tier_group.setExclusive(True)
+        # Most help first. Choosing Bot starts its questions at once: that
+        # is what was asked for by choosing it.
+        self.bot_act = self._act(v, "Bot: it asks, you answer",
+                                 self._choose_bot, checkable=True)
+        self.bot_act.setToolTip(
+            "Novice's controls, with the app asking for every setting in "
+            "turn - the board, how it is made, the copper - and then "
+            "running it.")
         self.essential_act = self._act(v, "Novice controls",
                                        lambda: self.set_tier(tier.ESSENTIAL),
                                        checkable=True)
         self.full_act = self._act(v, "Pro controls",
                                   lambda: self.set_tier(tier.FULL),
                                   checkable=True)
-        for a in (self.essential_act, self.full_act):
+        for a in (self.bot_act, self.essential_act, self.full_act):
             self.tier_group.addAction(a)
+        self.bot_again_act = self._act(v, "Ask me the questions…",
+                                       self.action_bot)
         v.addSeparator()
         self.xray_act = self._act(v, "Design X-ray", self._toggle_xray, "Ctrl+D",
                                   checkable=True)
@@ -1159,7 +1201,7 @@ class MainWindow(QMainWindow):
         self._act(h, "How this works", self.action_help)
         self.basics_act = self._act(h, "The machine, in five minutes",
                                     self.action_basics)
-        self._act(h, "What Novice and Pro differ by…",
+        self._act(h, "What Bot, Novice and Pro differ by…",
                   lambda: dialogs.about_tier(self))
         self.kicad_act = self._act(h, "Add the SRM-CAM buttons to KiCad…",
                                    self.action_setup_kicad_plugin)
@@ -1202,6 +1244,28 @@ class MainWindow(QMainWindow):
         if self._current_step is not None and not tier.is_full() \
                 and self._current_step.key not in self._novice_keys():
             self.select_step("setup")
+
+    def _choose_bot(self):
+        """View ▸ Bot: the profile, and its questions straight away."""
+        self.set_tier(tier.BOT)
+        if tier.is_bot():                  # not while SRM_CAM_MODE pins another
+            self.action_bot()
+
+    def action_bot(self):
+        """Ask for every setting in turn, then run (gui2/bot.py)."""
+        from gerber2rml.gui2 import bot
+        if getattr(self, "_bot", None) is not None:
+            return False                   # one set of questions at a time
+        self._bot = bot.Bot(self)
+        try:
+            return self._bot.run()
+        finally:
+            self._bot = None
+
+    def maybe_start_bot(self):
+        """Launch-time: in Bot the app opens asking. Called by app.py."""
+        if tier.is_bot():
+            self.action_bot()
 
     def automatic(self):
         """Is the run on the rail? Always, in both tiers: Pro runs the same
@@ -1253,8 +1317,8 @@ class MainWindow(QMainWindow):
             return fab.FLOOR[fab.LASER]
         return self.state.trace.effective_diameter()
 
-    def _method_key(self):
-        return "method/" + self._sides_key().split("/", 1)[1]
+    def _method_key(self, folder=None):
+        return "method/" + self._sides_key(folder).split("/", 1)[1]
 
     def action_method(self, mid, source="chosen", *, quiet=False):
         """Make the board ``mid``. Chosen here, it is remembered for the
@@ -1311,28 +1375,34 @@ class MainWindow(QMainWindow):
         if page is not None:
             page.sync_method()
 
+    def method_of(self, board, folder, *, key=None):
+        """``(method id, where it comes from, narrowest gap or None)`` for
+        ``board``, read from ``folder``: what was chosen for it here before,
+        else what KiCad stored, else the guess from its gaps. For a board
+        being opened, and for one Bot is only asking about."""
+        said = (workspace.setting(key or self._method_key(folder), "")
+                if self.remember_board_choices else "")
+        from gerber2rml.loader import gerber_stem
+        try:
+            stem = gerber_stem(Path(folder))
+        except Exception:                               # noqa: BLE001
+            stem = None
+        kicad = fab.read_kicad(folder, stem) if folder else None
+        if said in fab.IDS:
+            return said, "chosen", None
+        if kicad:
+            return kicad, "kicad", None
+        mid, gap = fab.guess(board)
+        return mid, "guessed", gap
+
     def _detect_method(self):
         """What a board just opened is made with: what was chosen for it here
         before, else what KiCad stored, else the guess from its gaps."""
         st = self.state
         if st.board is None:
             return
-        said = (workspace.setting(self._method_key(), "")
-                if self.remember_board_choices else "")
-        from gerber2rml.loader import gerber_stem
-        try:
-            stem = gerber_stem(Path(st.gerber_dir))
-        except Exception:                               # noqa: BLE001
-            stem = None
-        kicad = fab.read_kicad(st.gerber_dir, stem) if st.gerber_dir else None
-        self._method_gap = None
-        if said in fab.IDS:
-            mid, src = said, "chosen"
-        elif kicad:
-            mid, src = kicad, "kicad"
-        else:
-            mid, self._method_gap = fab.guess(st.board)
-            src = "guessed"
+        mid, src, self._method_gap = self.method_of(
+            st.board, st.gerber_dir, key=self._method_key())
         self.action_method(mid, src, quiet=True)
         if src == "guessed" and mid != fab.FLAT:
             self.say("info", f"Made on the {fab.METHODS[mid].short.lower()}, "
@@ -1372,13 +1442,16 @@ class MainWindow(QMainWindow):
     def _sync_tier(self):
         from gerber2rml.gui2 import machine as _machine
         full = tier.is_full()
-        self.tier_chip.set("Pro" if full else "Novice",
+        asked = tier.is_bot()              # Novice's controls, asked for
+        self.tier_chip.set("Pro" if full else "Bot" if asked else "Novice",
                            "live" if full else "idle")
-        self.essential_act.setChecked(not full)
+        self.bot_act.setChecked(asked)
+        self.essential_act.setChecked(not full and not asked)
         self.full_act.setChecked(full)
         pinned = tier.pinned_tier() is not None
-        self.essential_act.setEnabled(not pinned)
-        self.full_act.setEnabled(not pinned)
+        for a in (self.bot_act, self.essential_act, self.full_act):
+            a.setEnabled(not pinned)
+        self.bot_again_act.setVisible(asked)
         for a in (self.dxf_act, self.fixture_act, self.mtest_act,
                   self.align_act, self.trim_clear_act, self.export_act,
                   self.export_folder_act, self.add_board_act, self.screw_act,
@@ -3597,10 +3670,17 @@ class MainWindow(QMainWindow):
             self, "Choose the folder KiCad plotted into",
             workspace.remembered_dir("gerber"))
         if d:
-            self.load_folder(d)
-            self._detect_sides()
-            self._detect_method()
-            self.autorun_page.board_opened()
+            self.open_board(d)
+
+    def open_board(self, folder):
+        """The operator opened a board: read it, decide one side or two from
+        its copper and how it is made from its tracks, and put it on the
+        sheet. The dialog, a board handed over from KiCad and Bot's first
+        question all come here."""
+        self.load_folder(folder)
+        self._detect_sides()
+        self._detect_method()
+        self.autorun_page.board_opened()
 
     def show_auto_face(self, top):
         """Automatic mode has one step on the rail and two faces: once the
@@ -3621,9 +3701,7 @@ class MainWindow(QMainWindow):
         board = self.state.board
         if board is None or self.state.is_panel:
             return
-        top = board.copper_top
-        two = (top is not None and not top.is_empty
-               and board.copper is not None and not board.copper.is_empty)
+        two = copper_on_both_sides(board)
         # What the operator said about THIS board last time beats the guess:
         # F.Cu is also where people draw wire links on a single-sided board,
         # and a board sent from KiCad again must not turn double-sided again.
@@ -3646,10 +3724,12 @@ class MainWindow(QMainWindow):
                              "Untick it on Your board if the top is not "
                              "milled; that is remembered for this board.")
 
-    def _sides_key(self):
-        """The setting that remembers one board folder's single/double."""
+    def _sides_key(self, folder=None):
+        """The setting that remembers one board folder's single/double:
+        the folder that is open, or ``folder`` before it is."""
         import hashlib
-        folder = str(workspace.remembered_dir("gerber") or "")
+        folder = (str(Path(folder)) if folder
+                  else str(workspace.remembered_dir("gerber") or ""))
         return "sides/" + hashlib.sha1(folder.encode("utf-8")).hexdigest()[:16]
 
     def set_no_cutout(self, on):
@@ -3706,6 +3786,14 @@ class MainWindow(QMainWindow):
                              "was not loaded. Send it again when it is done.")
             QApplication.alert(self)
             return False
+        if getattr(self, "_bot", None) is not None:
+            # Bot's questions are about the board that is open: one swapped
+            # in underneath them would be answered for the wrong board.
+            self.say("warn", "The questions are still open, so the board "
+                             "from KiCad was not loaded. Answer or cancel "
+                             "them, then send it again.")
+            QApplication.alert(self)
+            return False
         if self.isMinimized():
             self.showNormal()
         self.raise_()
@@ -3716,13 +3804,15 @@ class MainWindow(QMainWindow):
         elif str(path).lower().endswith(".srmcam"):
             self.load_setup(path)
         else:
-            self.load_folder(path)
-            self._detect_sides()
-            self._detect_method()
-            self.autorun_page.board_opened()
+            self.open_board(path)
+            if tier.is_bot():
+                # In Bot a board that arrives is a board to be asked about.
+                QTimer.singleShot(0, self.action_bot)
         return True
 
-    def action_open_demo(self):
+    def demo_folder(self):
+        """The demo board's Gerber folder, written on first use. None, and
+        said, if it cannot be made."""
         if not DEMO.exists():
             try:
                 from gerber2rml.examples.calibration import write_coupon
@@ -3732,8 +3822,14 @@ class MainWindow(QMainWindow):
                 self.report_error("The demo board could not be created", e,
                                   "It is generated on first use and needs the "
                                   "examples folder to be writable.")
-                return
-        self.load_folder(str(DEMO))
+                return None
+        return str(DEMO)
+
+    def action_open_demo(self):
+        folder = self.demo_folder()
+        if folder is None:
+            return
+        self.load_folder(folder)
         self._detect_method()
         self.autorun_page.board_opened()
 
@@ -3744,10 +3840,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.report_error(
                 "That folder could not be read as a board", e,
-                "SRM-CAM needs a copper layer, an Edge.Cuts outline and a "
-                "drill file in one folder — the set KiCad's Plot and Generate "
-                "Drill Files produce. If the folder holds a zip, unpack it "
-                "first.")
+                NOT_A_BOARD)
             return
         self._auto_top = False
         # A measured flip belongs to one physical board on the bed. Carrying it
@@ -3789,6 +3882,132 @@ class MainWindow(QMainWindow):
         self.say("ok", f"Loaded {self.state.name} — "
                        f"{len(self.state.board.holes)} holes.")
 
+    # ------------------------------------------------- taking a job back
+    def job_snapshot(self):
+        """The job as it stands, so that :meth:`job_restore` can put it back.
+
+        For Bot (gui2/bot.py): its answers go into the same controls a hand
+        would use, and Cancel on its last sheet has to leave no trace of
+        them. Kept by reference where the thing is replaced rather than
+        edited - a board read from a folder, a tool profile's three jobs -
+        and by value where it is edited in place.
+        """
+        import copy
+        from dataclasses import replace as _copy
+        st, setup, page = self.state, self.inspector.setup, self.autorun_page
+        s = workspace._settings()
+        po = self._photo_overlay
+        return {
+            "boards": list(st.boards),
+            "placed": [(m.place_x, m.place_y, m.rotate) for m in st.boards],
+            "current": st.current, "name": st.name,
+            "jobs": (_copy(st.trace), _copy(st.drill), _copy(st.cutout)),
+            "attrs": {a: copy.copy(getattr(self, a)) for a in _JOB_ATTRS},
+            "settings": {k: s.value(k) for k in s.allKeys()
+                         if k.startswith(_JOB_SETTINGS)},
+            "thickness": setup.thickness.value(),
+            "preset": setup.preset.currentText(),
+            "size": (page.w_spin.value(), page.h_spin.value()),
+            "centre": page.centre_chk.isChecked(),
+            "check": page.check_chk.isChecked(),
+            "level": (page.level_chk.isChecked(), page._level_before_laser),
+            "auto_place": page._auto_place,
+            "undo": (list(self.placement_undo._undo),
+                     list(self.placement_undo._redo)),
+            "step": (self._current_step.key
+                     if self._current_step is not None else None),
+            # What a new board throws away (_forget_output).
+            "done": set(self.traveller._done),
+            "rework": self.rework_page.state(),
+            "pads": self.boardfit_page.pads(),
+            "photo": dict(
+                po or {},
+                anchors=[list(q) for q in (self._photo_anchor_pts or [])],
+                opacity=self._photo_opacity, dim=self._photo_dim),
+        }
+
+    def job_restore(self, snap):
+        """Put back what :meth:`job_snapshot` kept: the boards, the tool
+        numbers, the sheet and every choice, on the page and in the settings.
+
+        The one thing that does not come back is a measurement on the
+        Drill-a-board-made-elsewhere page: its pads do, the readings do not.
+        """
+        st, setup, page = self.state, self.inspector.setup, self.autorun_page
+        swapped = (len(st.boards) != len(snap["boards"])
+                   or any(a is not b for a, b in zip(st.boards,
+                                                     snap["boards"])))
+        # Putting back is not a change: none of it goes on the Undo stack,
+        # which gets its own history back below.
+        self.placement_undo.restoring = True
+        try:
+            self._job_restore(snap, swapped)
+        finally:
+            self.placement_undo.restoring = False
+        self.placement_undo._undo = list(snap["undo"][0])
+        self.placement_undo._redo = list(snap["undo"][1])
+        self.placement_undo._changed()
+
+    def _job_restore(self, snap, swapped):
+        st, setup, page = self.state, self.inspector.setup, self.autorun_page
+        for m, (x, y, r) in zip(snap["boards"], snap["placed"]):
+            m.place_x, m.place_y, m.rotate = x, y, r
+        st.boards = list(snap["boards"])
+        st.current = snap["current"]
+        st.rebuild()
+        st.name = snap["name"]
+        st.trace, st.drill, st.cutout = snap["jobs"]
+        for a, v in snap["attrs"].items():
+            setattr(self, a, v)
+        s = workspace._settings()
+        for k in [k for k in s.allKeys() if k.startswith(_JOB_SETTINGS)]:
+            if k not in snap["settings"]:
+                s.remove(k)
+        for k, v in snap["settings"].items():
+            s.setValue(k, v)
+        # The controls, quietly: their handlers are what is being undone.
+        for box, val in ((setup.thickness, snap["thickness"]),
+                         (page.centre_chk, snap["centre"]),
+                         (page.check_chk, snap["check"]),
+                         (page.level_chk, snap["level"][0])):
+            box.blockSignals(True)
+            (box.setValue if box is setup.thickness else box.setChecked)(val)
+            box.blockSignals(False)
+        page._level_before_laser = snap["level"][1]
+        setup.preset.blockSignals(True)
+        setup.preset.setCurrentText(snap["preset"])
+        setup.preset.blockSignals(False)
+        page.show_size(*snap["size"])
+        page._auto_place = snap["auto_place"]
+        self._paths_cache = {}
+        self._layout_base = self._layout_key = None
+        self._edge_memo, self._edge_notes = {}, {}
+        self._drc_memo = None
+        self._laser_jobs_memo = None
+        setup.sync()
+        self.flipfit_page.sync_from_job()
+        self._sync_frame_options()
+        self._after_params()
+        self._sync_method()
+        page.sync_method()
+        self._sync_stock()
+        self._draw_screws()
+        page._sync_nocut()
+        page._sync_ref_holes()
+        if swapped:
+            self.stage._fitted = False
+            for key in snap["done"]:
+                self.traveller.set_done(key)
+            self.rework_page.restore(snap["rework"])
+            self.boardfit_page.set_pads(snap["pads"])
+            self._restore_photo(snap["photo"], [],
+                                Path(snap["photo"].get("path") or "."))
+        key = snap["step"]
+        self.select_step(key if key and self.plan.by_key(key) else "setup")
+        page._draw_bracket(page._everywhere() or page._on_this_page())
+        if swapped:
+            self.stage.fit_work()
+
     # ---------------------------------------------------- several boards
     def action_add_board(self):
         if self.state.board is None:
@@ -3822,10 +4041,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self.report_error(
                 "That folder could not be read as a board", e,
-                "SRM-CAM needs a copper layer, an Edge.Cuts outline and a "
-                "drill file in one folder — the set KiCad's Plot and Generate "
-                "Drill Files produce. If the folder holds a zip, unpack it "
-                "first.")
+                NOT_A_BOARD)
             return
         workspace.remember_dir("gerber", folder)
         if not self._custom_name:
@@ -5218,6 +5434,10 @@ class MainWindow(QMainWindow):
             except OSError:
                 pass
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
+
+    def checks(self):
+        """The pre-flight findings, as :meth:`refresh_checks` last left them."""
+        return list(self._checks)
 
     def action_copy_checks(self):
         from gerber2rml.engine.diagnostics import format_report

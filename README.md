@@ -56,6 +56,7 @@ Step by step: [Getting started](https://madsrudolph.github.io/srm-cam/getting-st
 - **KiCad plugin.** Shows the SRM-20's build area in the PCB editor, sets design rules for the way the board is made (flat mill, ball mill or laser), and sends the board to SRM-CAM.
 
 **Novice** (the default) is the automatic run. **Pro** is the same run with every control open: the stock anywhere (the probe finds its corner), every step on the rail, and export for VPanel. Click the tier chip at the top right to switch.
+**Bot** (View ▸ Bot) is Novice with the app asking: one question a pop-up - the board, how it is made, the thickness, the size of the copper, where the board goes - then the pre-flight checks, a summary of every answer, and Start. Back works at every question and Cancel leaves the app as it was. It sets Novice's own controls and runs Novice's own Start, so there is still one program; `SRM_CAM_MODE=bot` pins a seat to it.
 Automatic runs need an Arduino on the mill's SPI header ([Hardware & firmware](https://madsrudolph.github.io/srm-cam/hardware.html));
 without it, SRM-CAM exports files for VPanel like any other CAM tool.
 

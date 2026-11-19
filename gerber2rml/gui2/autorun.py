@@ -1212,6 +1212,19 @@ class AutoRunPage(inspector.Page):
                     keepout=self._bracket.keepout(), bit_mm=bit,
                     margin_mm=ar.PLACE_MARGIN_MM)
 
+    def sheet_needed(self):
+        """``(w, h)`` mm of sheet the board needs to sit where the bracket
+        puts it, or None without a board. Cut out, that is the board, the
+        margin round it and the probe tongue's reach; left in the sheet it
+        needs no more than its own size."""
+        args = self._corner_args()
+        if args is None:
+            return None
+        b = self.ctl.work_extent()
+        if self.no_cutout():
+            return (b[2] - b[0], b[3] - b[1])
+        return br.stock_needed(extent=b, **args)
+
     def place_in_corner(self, say=False):
         """Put the board in the bracket's corner of the outline. Says when the
         stock typed is too small for it to sit there whole."""
@@ -1220,15 +1233,13 @@ class AutoRunPage(inspector.Page):
             return
         ctl, st = self.ctl, self.ctl.state
         b = ctl.work_extent()
+        need = self.sheet_needed()
         if self.no_cutout():
-            # Not cut out: against the edges AWAY from the bracket, and it
-            # needs no more sheet than its own size.
+            # Not cut out: against the edges AWAY from the bracket.
             nx, ny = br.far_place(args["corner"], args["stock"], b,
                                   flipped=bool(ctl._double))
-            need = (b[2] - b[0], b[3] - b[1])
         else:
             nx, ny = br.corner_place(extent=b, **args)
-            need = br.stock_needed(extent=b, **args)
         if abs(nx - b[0]) > 1e-6 or abs(ny - b[1]) > 1e-6:
             # The whole job: a panel goes into the corner as one.
             ctl.action_move_job(nx - b[0], ny - b[1])

@@ -247,7 +247,12 @@ QCheckBox::indicator:disabled { background: $SUNK; border-color: $RULE; }
 QRadioButton::indicator {
     background: $SUNK; border: 1px solid $RULE_STRONG; border-radius: 7px;
 }
-QRadioButton::indicator:checked { background: $PRIMARY; border: 4px solid $SUNK; }
+/* Checked, the border is the ring round the dot: the dot is made smaller by
+   as much, or the button grows by 6 px and its corners stop being round. */
+QRadioButton::indicator:checked {
+    background: $PRIMARY; border: 4px solid $SUNK; width: 9px; height: 9px;
+    border-radius: 8px;
+}
 
 /* ---------------------------------------------------------------- tables */
 QTableWidget, QTableView, QTreeView, QListWidget {
