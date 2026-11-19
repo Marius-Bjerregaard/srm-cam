@@ -101,6 +101,11 @@ class Sheet(QDialog):
         then let the dialog grow to fit.
         """
         super().showEvent(e)
+        self.settle()
+
+    def settle(self):
+        """Size every wrapped label for its text, and the sheet for them.
+        Again by hand after a label's text has changed while it is open."""
         avail = max(self.width(), self.minimumWidth()) - 2 * (theme.GAP_L + 4)
         for lb in self.findChildren(QLabel):
             if not lb.wordWrap():
@@ -223,10 +228,14 @@ def about_tier(parent):
     they remember is gone or merely put away.
     """
     from gerber2rml.gui2 import tier
-    d = Sheet(parent, "What Novice and Pro differ by", width=600)
+    d = Sheet(parent, "What Bot, Novice and Pro differ by", width=600)
     d.say("Novice is one job, start to finish: load the board, put the stock "
           "in the bracket, press Start. Pro is the same program with "
           "everything else in view - the same plan, and the same cuts.")
+    d.say("Bot is Novice with the app asking: one question a pop-up, for "
+          "every setting Novice has, and then it starts. Nothing is set that "
+          "you could not have set yourself on Novice's pages, and the "
+          "answers are there to see afterwards.")
     s1 = widgets.Section("Pro adds")
     for line in tier.ADDED_BY_FULL:
         s1.add(widgets.hint("· " + line))

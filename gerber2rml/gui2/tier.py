@@ -1,4 +1,4 @@
-"""Two profiles, over one code path: Novice and Pro.
+"""Two tiers over one code path, Novice and Pro - and Bot, which asks.
 
 Most people who sit down at this mill have never used CAM and will use it
 twice; a few run double-sided boards over a probed height map and need
@@ -26,6 +26,14 @@ Three properties are kept on purpose:
 ``ESSENTIAL`` is the default on a fresh install, because the person who has
 never opened the app is exactly who a default is for.
 
+``BOT`` is not a third tier. It is Novice with someone asking the questions:
+the same three rows, the same controls, the same Start, and a run of pop-ups
+(``gui2/bot.py``) that fills those controls in from the answers. So it is a
+*profile* that can be chosen and pinned like the other two, while everything
+that decides what is on screen or what is cut still asks :func:`is_full` and
+gets Novice's answer. That is what keeps the byte-for-byte promise above true
+for it without a test of its own.
+
 ``SRM_CAM_MODE`` pins the profile machine-wide - the same variable the first
 interface reads, and the same spellings, so a lab that has already pinned its
 seats does not have to do it twice.
@@ -36,14 +44,16 @@ from PySide6.QtCore import QSettings
 
 ESSENTIAL = "essential"
 FULL = "full"
+BOT = "bot"
 
-_VALID = (ESSENTIAL, FULL)
+_VALID = (ESSENTIAL, FULL, BOT)
 _KEY = "ui/tier"
 
 # The environment variable is shared with the first interface, so its
 # vocabulary has to be accepted as well as ours.
 _ALIASES = {"novice": ESSENTIAL, "essential": ESSENTIAL,
-            "pro": FULL, "professional": FULL, "full": FULL}
+            "pro": FULL, "professional": FULL, "full": FULL,
+            "bot": BOT, "guided": BOT}
 
 
 def _settings():
@@ -51,25 +61,42 @@ def _settings():
                      "SRM-CAM", "SRM-CAM-2")
 
 
-def pinned_tier():
-    """The tier fixed by ``SRM_CAM_MODE``, or None if the user may choose."""
+def _tier_of(profile):
+    """The tier a profile runs on. Bot is Novice, asked."""
+    return ESSENTIAL if profile == BOT else profile
+
+
+def pinned_profile():
+    """The profile fixed by ``SRM_CAM_MODE``, or None if the user may choose."""
     return _ALIASES.get(os.environ.get("SRM_CAM_MODE", "").strip().lower())
 
 
-def current_tier():
-    """Active tier: the environment pin, else the stored choice, else ESSENTIAL."""
-    pin = pinned_tier()
+def pinned_tier():
+    """The tier fixed by ``SRM_CAM_MODE``, or None if the user may choose."""
+    pin = pinned_profile()
+    return _tier_of(pin) if pin else None
+
+
+def current_profile():
+    """What the Interface menu has ticked: the environment pin, else the
+    stored choice, else ESSENTIAL. One of ESSENTIAL, FULL and BOT."""
+    pin = pinned_profile()
     if pin:
         return pin
     stored = str(_settings().value(_KEY, ESSENTIAL) or ESSENTIAL).lower()
     return stored if stored in _VALID else ESSENTIAL
 
 
+def current_tier():
+    """Active tier, ESSENTIAL or FULL. Never BOT: see the note at the top."""
+    return _tier_of(current_profile())
+
+
 def set_tier(tier):
-    """Store the chosen tier. Ignored while ``SRM_CAM_MODE`` pins it."""
+    """Store the chosen profile. Ignored while ``SRM_CAM_MODE`` pins it."""
     if tier not in _VALID:
         raise ValueError(f"unknown tier {tier!r}; expected one of {_VALID}")
-    if pinned_tier():
+    if pinned_profile():
         return False
     _settings().setValue(_KEY, tier)
     return True
@@ -77,6 +104,11 @@ def set_tier(tier):
 
 def is_full():
     return current_tier() == FULL
+
+
+def is_bot():
+    """Is the app asking the questions itself? Novice's controls either way."""
+    return current_profile() == BOT
 
 
 # What FULL adds, in the words a person would use rather than the words the

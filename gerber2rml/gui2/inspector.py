@@ -121,6 +121,14 @@ class SetupPage(Page):
         st = ctl.state
         self.set_head("Step", "Set up the job")
 
+        # Bot's way back in: the questions again, for the next board or
+        # after a Cancel. Only there in Bot (see sync).
+        self.bot_btn = widgets.button(
+            "Ask me the questions", kind="primary", on=ctl.action_bot,
+            tip="The app asks for the board, how it is made and the "
+                "copper, one question at a time, and then starts the run.")
+        self.add(self.bot_btn)
+
         # -- the board ---------------------------------------------------
         src = widgets.Section("The board")
         self.folder = widgets.mono("no folder loaded")
@@ -976,6 +984,7 @@ class SetupPage(Page):
         self.ds_more.setVisible(full)
         self.save_preset_btn.setVisible(full)
         self.next_btn.setVisible(not full)
+        self.bot_btn.setVisible(tier.is_bot())
         self.add_board_btn.setVisible(full)
         self.set_head("Step", "Set up the job" if full else "Your board")
         self.next_btn.setEnabled(st.board is not None)
