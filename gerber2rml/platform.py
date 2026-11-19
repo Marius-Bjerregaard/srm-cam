@@ -53,18 +53,19 @@ def capabilities(platform=None):
     """What this OS supports.
 
     ``machine_link`` is the Arduino serial link - connect, DRO, jog, bed
-    probing, firmware flashing. Windows and macOS. Windows because the CNC PC
-    is Windows and the link was built there. macOS because a lab runs its
-    SRM-20 from a Mac: pyserial and the Arduino's USB VID ranking are the same
-    code there, and the mill itself is reached through a raw CUPS queue (see
-    ``engine/rmlspool.py``) in place of the Windows spooler. Linux stays off,
-    deliberately: the link has never been run there, and shipping an
-    unverified motion path to someone standing next to a spinning tool is not
-    a trade worth making. Losing it costs less than it looks, because a
-    height map is a file: measure the bed once on the CNC PC and carry the CSV.
+    probing, the automatic run, firmware flashing. Windows, macOS and Linux:
+    the same pyserial code and the same ranking of the Arduino's USB id on all
+    three. The mill itself is reached through the Windows spooler on Windows
+    and through a raw CUPS queue on macOS and Linux (``engine/rmlspool.py``).
+
+    Linux was held back for a long time because the link had never been run
+    there. It is on now so that one program does the same on every desktop -
+    but it has not been run at a mill from Linux, and docs/linux.md says so.
+    Any other OS stays off: nothing here has been written for it.
     """
     return Capabilities(
-        machine_link=_is_windows(platform) or _is_macos(platform))
+        machine_link=(_is_windows(platform) or _is_macos(platform)
+                      or _is_linux(platform)))
 
 
 # What to put on screen where the machine controls would have been.
@@ -76,7 +77,7 @@ def capabilities(platform=None):
 # that still works, because "probe once on the CNC PC and carry the CSV" is the
 # whole Linux levelling workflow and nobody would guess it.
 NO_MACHINE_LINK_NOTE = (
-    "The machine link runs on Windows and macOS only, so there is no "
+    "The machine link runs on Windows, macOS and Linux only, so there is no "
     "Connect here. Prepare the job, export, and send the files "
     "from VPanel on the CNC PC — or load a height map "
     "measured there to export levelled toolpaths.")

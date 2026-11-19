@@ -1095,9 +1095,10 @@ class MainWindow(QMainWindow):
 
         m = mb.addMenu("&Machine")
         from gerber2rml.engine import rmlspool
-        if rmlspool.MACOS:
+        if rmlspool.CUPS:
+            # macOS and Linux: the mill is a CUPS queue, made from here.
             from gerber2rml.gui2 import macmill
-            self._act(m, "Set up the mill on this Mac…",
+            self._act(m, macmill.MENU_LABEL,
                       lambda: macmill.setup_sheet(self))
         # Command Set and the spindle speed, which otherwise need VPanel.
         # Over libusb on macOS and Linux, through the USB printer driver on

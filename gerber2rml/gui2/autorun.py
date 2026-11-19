@@ -1698,7 +1698,7 @@ class AutoRunPage(inspector.Page):
             printer = simmachine.printer()
         else:
             from gerber2rml.engine import rmlspool
-            if rmlspool.MACOS:
+            if rmlspool.CUPS:
                 from gerber2rml.gui2 import macmill
                 name = macmill.find_or_setup(self.window())
             else:
@@ -1707,11 +1707,11 @@ class AutoRunPage(inspector.Page):
                 ctl.say("fail", "The Roland SRM-20 printer is not installed on "
                                 "this PC, so there is nothing to send jobs to."
                         + (" " + rmlspool.CUPS_SETUP_HINT
-                           if rmlspool.MACOS else ""))
+                           if rmlspool.CUPS else ""))
                 return
             printer = rmlspool.SpoolPrinter(name)
-            if rmlspool.MACOS and not macmill.preflight(self.window(),
-                                                        printer):
+            if rmlspool.CUPS and not macmill.preflight(self.window(),
+                                                       printer):
                 return
             # The mill's own settings, which used to need VPanel: the
             # command set is put right and said in the log; a run that would

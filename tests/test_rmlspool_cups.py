@@ -11,6 +11,14 @@ from gerber2rml.engine import rmlspool
 from gerber2rml.engine.rmlspool import CupsPrinter, SpoolError
 
 
+@pytest.fixture(autouse=True)
+def _on_a_mac(monkeypatch):
+    """These are the Mac's tests on whatever host runs them: which password
+    dialog comes up is the one thing here that follows the OS. Linux has its
+    own tests at the end, and turns this off."""
+    monkeypatch.setattr(rmlspool, "MACOS", True)
+
+
 class FakeRun:
     """Records argv and answers from a table keyed by the argv prefix."""
 
@@ -307,3 +315,54 @@ def test_a_job_stuck_in_the_queue_is_said_once(monkeypatch):
         r.run("PU0,0;", "traces", end_mm=(50.0, 50.0))
     stuck = [n for n in notes if "print queue" in n]
     assert len(stuck) == 1 and "traces" in stuck[0]
+
+
+# --- Linux: the same queue, polkit's dialog instead of macOS's ----------------
+
+def test_off_windows_the_mill_is_the_cups_queue(monkeypatch):
+    """macOS and Linux alike. Linux used to see no printers at all, so the
+    run had nothing to send a job to."""
+    monkeypatch.setattr(rmlspool, "CUPS", True)
+    monkeypatch.setattr(rmlspool, "cups_list_printers",
+                        lambda run=None: ["HP", "SRM-20"])
+    assert rmlspool.list_printers() == ["HP", "SRM-20"]
+    assert rmlspool.find_mill() == "SRM-20"
+
+
+def test_on_linux_the_password_dialog_is_polkits(monkeypatch):
+    monkeypatch.setattr(rmlspool, "MACOS", False)
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): REFUSED,
+                   ("pkexec",): (0, "", "")})
+    rmlspool.setup_mill_queue(run=run, say=lambda m: None, admin="gui")
+    asked = [c[0] for c in run.calls if c[0][0] == "pkexec"]
+    assert len(asked) == 1                       # one dialog, as on the Mac
+    assert asked[0][:3] == ["pkexec", "sh", "-c"]
+    for step in ("lpadmin -p SRM-20 -E -v", "-m raw ||", "cupsenable SRM-20",
+                 "cupsaccept SRM-20"):
+        assert step in asked[0][3]
+    assert not any(c[0][0] == "osascript" for c in run.calls)
+
+
+def test_on_linux_a_dismissed_password_dialog_is_not_retried(monkeypatch):
+    monkeypatch.setattr(rmlspool, "MACOS", False)
+    run = FakeRun({("lpinfo",): (0, LPINFO, ""), ("lpadmin",): REFUSED,
+                   ("pkexec",): (126, "", "Error executing command as "
+                                          "another user: Request dismissed")})
+    with pytest.raises(SpoolError, match="cancelled"):
+        rmlspool.setup_mill_queue(run=run, say=lambda m: None, admin="gui")
+    assert sum(c[0][0] == "pkexec" for c in run.calls) == 1
+
+
+def test_on_linux_lpinfo_is_also_looked_for_in_usr_sbin(monkeypatch):
+    """Debian keeps it there, off a plain user's PATH."""
+    monkeypatch.setattr(rmlspool, "MACOS", False)
+
+    class NotOnPath(FakeRun):
+        def __call__(self, argv, **kw):
+            if argv[0] == "lpinfo":
+                self.calls.append((list(argv), None))
+                raise FileNotFoundError("lpinfo")
+            return super().__call__(argv, **kw)
+
+    run = NotOnPath({("/usr/sbin/lpinfo",): (0, LPINFO, "")})
+    assert rmlspool.find_mill_uri(run=run).startswith("usb://Roland")

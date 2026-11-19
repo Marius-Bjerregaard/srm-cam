@@ -12,7 +12,10 @@ import re
 import urllib.request
 from collections import namedtuple
 
-REPO = "MadsRudolph/srm-cam"
+# This fork's own releases: a copy shared from here is told about, and sent
+# to, the builds that have what it has - not upstream's, which would replace
+# it with a program that lacks them.
+REPO = "Marius-Bjerregaard/srm-cam"
 RELEASES_API = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases/latest"
 

@@ -16,10 +16,11 @@ A printer is anything with ``send(data, name)``, ``pending()`` and
 ``purge()``; :class:`SpoolPrinter` is the real one and the simulator
 (:mod:`gerber2rml.engine.simmachine`) supplies a fake.
 
-On macOS the same API runs over CUPS instead (:class:`CupsPrinter`, at the
-end of this module): the mill is a raw queue named ``SRM-20`` on its
+On macOS and Linux the same API runs over CUPS instead (:class:`CupsPrinter`,
+at the end of this module): the mill is a raw queue named ``SRM-20`` on its
 ``usb://Roland%20DG/...`` URI, made once with :func:`setup_mill_queue`
-(``python -m gerber2rml.doctor --setup-mill``). See docs/macos.md.
+(``python -m gerber2rml.doctor --setup-mill``). See docs/macos.md and
+docs/linux.md.
 """
 import ctypes
 import os
@@ -31,6 +32,9 @@ from gerber2rml.platform import _is_macos, _is_windows
 
 WINDOWS = _is_windows()
 MACOS = _is_macos()
+# Everything that is not Windows reaches the mill through CUPS: macOS and
+# Linux ship it, and the queue is made the same way on both.
+CUPS = not WINDOWS
 
 PRINTER_ENUM_LOCAL = 0x2
 PRINTER_ENUM_CONNECTIONS = 0x4
@@ -82,11 +86,10 @@ def _err(what):
 
 
 def list_printers():
-    """Names of the printers this user can see, or [] off Windows/macOS."""
-    if MACOS:
+    """Names of the printers this user can see: the Windows spooler's, or
+    the CUPS queues on macOS and Linux."""
+    if CUPS:
         return cups_list_printers()
-    if not WINDOWS:
-        return []
     flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS
     need, got = wintypes.DWORD(0), wintypes.DWORD(0)
     _ws.EnumPrintersW(flags, None, 4, None, 0, ctypes.byref(need),
@@ -191,9 +194,10 @@ class SpoolPrinter:
 
 CUPS_QUEUE = "SRM-20"
 CUPS_SETUP_HINT = (
-    "On a Mac the mill is a CUPS printer queue named SRM-20. With the mill "
-    "on and its USB plugged in, run  python -m gerber2rml.doctor --setup-mill"
-    "  once (it asks for an admin password). See docs/macos.md.")
+    "On macOS and Linux the mill is a CUPS printer queue named SRM-20. With "
+    "the mill on and its USB plugged in, run  python -m gerber2rml.doctor "
+    "--setup-mill  once (it asks for an admin password). See docs/macos.md "
+    "or docs/linux.md.")
 
 
 def _cups(argv, run=None, input=None, timeout=15):
@@ -223,7 +227,7 @@ def cups_list_printers(run=None):
 
 
 class CupsPrinter:
-    """The mill as macOS sees it: a raw CUPS queue."""
+    """The mill as macOS and Linux see it: a raw CUPS queue."""
 
     def __init__(self, name, run=None):
         self.name = name
@@ -323,14 +327,24 @@ def _applescript_admin(commands, either=None):
             f'do shell script "{quoted}" with administrator privileges']
 
 
+def _gui_admin(commands, either=None):
+    """argv that runs ``commands`` as admin behind the desktop's own
+    password dialog: macOS's through ``osascript``, and on Linux polkit's
+    through ``pkexec`` - one dialog for the whole line on both."""
+    if MACOS:
+        return _applescript_admin(commands, either)
+    return ["pkexec", "sh", "-c", _shell_line(commands, either)]
+
+
 def _as_admin(commands, run=None, admin="sudo", timeout=300):
     """Run each argv in ``commands`` with admin rights.
 
     ``admin`` is ``"sudo"`` for a terminal (asks there, unless already root)
-    or ``"gui"`` for macOS's password dialog, which is what the app uses.
+    or ``"gui"`` for the desktop's password dialog (:func:`_gui_admin`),
+    which is what the app uses.
     """
     if admin == "gui":
-        _cups(_applescript_admin(commands), run=run, timeout=timeout)
+        _cups(_gui_admin(commands), run=run, timeout=timeout)
         return
     sudo = [] if getattr(os, "geteuid", lambda: 0)() == 0 else ["sudo"]
     for c in commands:
@@ -356,8 +370,15 @@ def find_mill_uri(run=None):
     USB only (``--include-schemes``): probing the network backends as well
     takes seconds and can never find a USB mill.
     """
-    out = _cups(["lpinfo", "--include-schemes", "usb", "-v"], run=run,
-                timeout=90)
+    args = ["--include-schemes", "usb", "-v"]
+    try:
+        out = _cups(["lpinfo"] + args, run=run, timeout=90)
+    except SpoolError:
+        # Debian keeps lpinfo in /usr/sbin, which is not on every user's
+        # PATH. Off macOS only: there the first answer is the answer.
+        if MACOS:
+            raise
+        out = _cups(["/usr/sbin/lpinfo"] + args, run=run, timeout=90)
     uris = cups_mill_uris(out)
     return uris[0] if uris else None
 
@@ -393,10 +414,13 @@ def setup_mill_queue(queue=CUPS_QUEUE, run=None, say=print, admin="sudo"):
             continue
     if not done and admin == "gui":
         try:
-            _cups(_applescript_admin(rest, either=(raw, add)), run=run,
+            _cups(_gui_admin(rest, either=(raw, add)), run=run,
                   timeout=300)
         except SpoolError as e:
-            if "cancel" in str(e).lower() or "-128" in str(e):
+            # macOS says "cancel" / -128; polkit says the request was
+            # dismissed.
+            if ("cancel" in str(e).lower() or "-128" in str(e)
+                    or "dismissed" in str(e).lower()):
                 raise SpoolError("cancelled - no password was given") from e
             raise
     elif not done:
@@ -419,5 +443,5 @@ def resume_queue(queue=CUPS_QUEUE, run=None, admin="sudo"):
         _as_admin(steps, run=run, admin=admin)
 
 
-if MACOS:
-    SpoolPrinter = CupsPrinter      # noqa: F811 - the macOS mill
+if CUPS:
+    SpoolPrinter = CupsPrinter      # noqa: F811 - the mill on macOS and Linux
