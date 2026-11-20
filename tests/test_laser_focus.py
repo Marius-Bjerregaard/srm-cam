@@ -512,3 +512,16 @@ def test_the_light_comes_back_on_when_the_diode_off_fails(monkeypatch):
         laser.measure(None, (110, 110))
     assert done[-1] == ("lights", True) and "M5" in done
 
+
+def test_a_saved_correction_that_cannot_be_read_falls_back(qt_app, monkeypatch):
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    from gerber2rml.gui2 import stencil_laser as sl
+    monkeypatch.setattr(sl, "_SETTINGS", ("SRM-CAM-tests", "laser-broken-ref"))
+    for bad in ("{not json", '{"points": "x"}', '{"z": 1}'):
+        lfu._settings().setValue(lfu.REFERENCE_KEY, bad)
+        ref = lfu.load_reference()
+        assert ref is not None and len(ref.points) >= 20      # the built-in
+        assert lfu.reference_is_builtin() and lfu.reference_broken()
+        assert "could not be read" in lfu.reference_status()
+    lfu.save_reference(None)
+    assert not lfu.reference_broken()
