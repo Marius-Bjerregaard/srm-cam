@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Bring this macOS checkout up to date with upstream and rebuild the app.
+# Bring this macOS checkout up to date and rebuild the app.
 #
 # What docs/macos.md describes by hand, in one go:
-#   1. fetch upstream and rebase this branch (the macOS patch) onto it
+#   1. fetch this fork (origin) and fast-forward this branch to its own
+#      branch there
 #   2. reinstall the package into .venv and run the doctor
 #   3. run the tests - a failure stops here, before anything is rebuilt
 #   4. packaging/build-macos.sh
@@ -40,17 +41,26 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
 fi
 
 echo
-echo "[1/5] Fetching upstream..."
-git fetch upstream
-if git merge-base --is-ancestor upstream/main HEAD; then
-  echo "  already on top of upstream/main"
-else
-  if ! git rebase upstream/main; then
-    git rebase --abort || true
-    echo "The macOS patch no longer applies cleanly to upstream." >&2
-    echo "Nothing was changed. Rebase by hand: git rebase upstream/main" >&2
-    exit 1
-  fi
+# The fork's releases are what Help > Check for updates reads
+# (engine/updates.py), so the fork is what is fetched. This used to rebase
+# onto upstream/main: "already on top of upstream/main", the same version
+# rebuilt, and the update offered again at the next start - and, once
+# upstream moved, a fork branch with merges in it flattened or conflicting.
+# Upstream's work comes in through the fork's own merges and releases.
+echo "[1/5] Fetching this fork (origin)..."
+git fetch --tags origin
+UP="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || true)"
+if [ -z "$UP" ]; then
+  echo "This branch follows nothing on origin, so there is nothing to update" >&2
+  echo "it to. Set it with: git branch -u origin/<branch>" >&2
+  exit 1
+fi
+if git merge-base --is-ancestor "$UP" HEAD; then
+  echo "  already up to date with $UP"
+elif ! git merge --ff-only "$UP"; then
+  echo "This branch has commits $UP does not, so it cannot simply move on." >&2
+  echo "Nothing was changed. Bring it up to date by hand (git pull)." >&2
+  exit 1
 fi
 
 echo
