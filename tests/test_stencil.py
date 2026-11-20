@@ -723,3 +723,32 @@ def test_curtain_vectors_never_emit_a_stationary_cutting_move():
             cuts += 1
         previous = position
     assert cuts > 1000
+
+
+# --- the laser's address is found from the network it is on -------------------
+
+def test_the_laser_is_found_on_whichever_usb_network_it_gave():
+    """The lab's F1 Ultra is 201.234.3.1; another laser answered on
+    201.234.4.1, and with the address fixed it was "no answer" although it
+    was plugged in and up (2026-11-20)."""
+    def on(prefix, me):
+        return lambda host: me if host.startswith(prefix) else "10.0.0.7"
+    assert xtool.find_host(on("201.234.4.", "201.234.4.41")) == "201.234.4.1"
+    assert xtool.find_host(on("201.234.3.", "201.234.3.9")) == "201.234.3.1"
+    # No such network on this computer: the route goes out over Wi-Fi.
+    assert xtool.find_host(lambda host: "10.209.201.171") is None
+    assert xtool.find_host(lambda host: None) is None
+
+
+def test_the_laser_uses_the_found_address_and_says_when_there_is_none(
+        monkeypatch):
+    monkeypatch.setattr(xtool, "find_host", lambda *a: "201.234.4.1")
+    assert xtool.F1Ultra().host == "201.234.4.1"
+    assert xtool.F1Ultra("127.0.0.1").host == "127.0.0.1"   # given: kept
+    monkeypatch.setattr(xtool, "find_host", lambda *a: None)
+    laser = xtool.F1Ultra(timeout=1)
+    assert laser.host == xtool.HOST
+    monkeypatch.setattr(laser, "port", 1)
+    monkeypatch.setattr(xtool, "HOST", "127.0.0.1")
+    with pytest.raises(xtool.LaserError, match="no network to the laser"):
+        laser.mode()

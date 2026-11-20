@@ -34,7 +34,7 @@ def main(argv=None):
     ap.add_argument("--burst", type=int, default=r.passes_per_burst)
     ap.add_argument("--rest", type=float, default=r.rest_s)
     ap.add_argument("--zones", type=int, default=r.zones)
-    ap.add_argument("--host", default=xtool.HOST)
+    ap.add_argument("--host", default=None)      # None: found (xtool.find_host)
     a = ap.parse_args(argv)
 
     try:
