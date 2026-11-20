@@ -143,6 +143,13 @@ def main(argv=None):
         return 0
 
     if args.setup_mill:
+        if plat._is_windows():
+            # The Roland driver installs the mill as a printer on Windows;
+            # this used to run the Mac's CUPS setup and fail on lpinfo.
+            print("--setup-mill is for macOS and Linux. On Windows, install "
+                  "Roland's driver: the mill is then a printer named "
+                  "Roland SRM-20.")
+            return 1
         from gerber2rml.engine import rmlspool
         try:
             rmlspool.setup_mill_queue()

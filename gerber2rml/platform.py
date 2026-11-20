@@ -64,10 +64,6 @@ def capabilities(platform=None):
     return Capabilities(machine_link=True)
 
 
-def _is_linux(platform=None):
-    return _plat(platform).startswith("linux")
-
-
 # --- Linux: who may open the mill's USB and the Arduino -------------------
 #
 # Both are root-owned nodes with group access (lp and uucp on Arch, lp and
