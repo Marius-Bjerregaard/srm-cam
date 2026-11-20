@@ -260,19 +260,28 @@ class SimSerial:
         m.move_to(x, y, floor, 5.0)
         return None
 
+    # How many numbers each command takes (the firmware's readLongs calls).
+    ARGS = {"P": 3, "J": 2, "M": 4, "N": 4, "O": 3, "H": 2, "U": 1, "Z": 1}
+
     def _handle(self, s):
         if not s:
             return
         m, c = self.m, s[0]
         args = [int(v) for v in re.findall(r"-?\d+", s[1:])]
         x, y, z = m.pos
+        # As the firmware: a command with its numbers missing is refused, not
+        # run with zeros (srm20_spi_probe.ino, readLongs).
+        if c in self.ARGS and len(args) != self.ARGS[c]:
+            self._say(f"E {c} ARGS")
+            return
         if c in "!%K":
             m.halt.set()
             m.spindle = 0
             self.abort = True
             if c == "!":
                 m.halt.clear()
-                m.move_to(m.pos[0], m.pos[1], self.safe_z)
+                # Up, never down: safe Z may be below the head (retractTo).
+                m.move_to(m.pos[0], m.pos[1], min(0, max(z, self.safe_z)))
                 m.halt.set()
             else:
                 self._say(f"{c} ok")
@@ -320,7 +329,7 @@ class SimSerial:
             m.spindle = rpm
             self._say(f"S {rpm}")
         elif c == "L":
-            m.move_to(x, y, self.safe_z)
+            m.move_to(x, y, min(0, max(z, self.safe_z)))
             self._say("# lifted")
         elif c == "J":
             jz = min(0, z + 5000)
