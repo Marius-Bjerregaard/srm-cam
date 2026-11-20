@@ -301,6 +301,25 @@ class MachineLink(QObject):
     def clear_abort(self):
         self._abort.clear()
 
+    def _may_start(self, name):
+        """May a move or touch asked for from the bar start now? Clears a
+        STOP only when it may.
+
+        Each of them used to clear the abort first and find out about the
+        port after. While a run or a probe grid has the port, that abort is
+        the ONLY way their STOP gets through, and the bar's own message after
+        a STOP says "raise the bit with Page Up": the Page Up cleared the
+        STOP before the run's next poll could see it, and the run cut on.
+        Refused here, nothing is touched - and a jog refused leaves no step
+        waiting (which used to stop every later jog until a STOP)."""
+        if self._external or self._ser is None:
+            self.op_failed.emit(name, "not connected" if self._ser is None
+                                and not self._external
+                                else "a run has the machine")
+            return False
+        self._abort.clear()
+        return True
+
     # -- worker ------------------------------------------------------------
     def _run(self):
         while True:
@@ -400,7 +419,8 @@ class MachineLink(QObject):
                                dz_um=int(round(dz_mm * 1000)),
                                should_abort=self.should_abort)
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_z"):
+            return
         self.submit("jog_z", op)
 
     def jog_by(self, dx_mm=0.0, dy_mm=0.0, dz_mm=0.0):
@@ -415,7 +435,8 @@ class MachineLink(QObject):
         there is never more than one move running and one waiting, so it stops
         about when the key does."""
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_by"):
+            return
         with self._jog_lock:
             p = self._jog_pending
             p[0] += dx_mm
@@ -463,7 +484,8 @@ class MachineLink(QObject):
             self.last_move_error = None if ok else "no reply"
             return ok
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_xy"):
+            return
         self.submit("jog_xy", op)
 
     def go_to_view(self):
@@ -486,7 +508,8 @@ class MachineLink(QObject):
             self.last_move_error = None if ok else "no reply"
             return ok
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("view"):
+            return
         self.submit("view", op)
 
     def has_feature(self, name):
@@ -502,7 +525,8 @@ class MachineLink(QObject):
             # that ever does honour it errs toward the value VPanel is set to.
             return spi_probe.set_spindle(ser, 7000 if on else 0)
         self._spindle_ours = bool(on)
-        self.clear_abort()
+        if not self._may_start("spindle"):
+            return
         self.submit("spindle", op)
 
     def zero_z(self):
@@ -529,7 +553,8 @@ class MachineLink(QObject):
                         should_abort=self.should_abort) is None:
                     return None
             return spi_probe.zero_z(ser, should_abort=self.should_abort)
-        self.clear_abort()
+        if not self._may_start("zero_z"):
+            return
         self.submit("zero_z", op)
 
     def copper_hint_um(self):
@@ -559,7 +584,8 @@ class MachineLink(QObject):
         def op(ser):
             return stockfind.touch_from_anywhere(ser, hint, self.should_abort,
                                                  fresh=False)
-        self.clear_abort()
+        if not self._may_start("touch"):
+            return
         self.submit("touch", op)
 
 

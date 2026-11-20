@@ -256,9 +256,17 @@ class WindowSource(ar.JobSource):
                 # Only the oval holes: the slot pieces among the holes.
                 from gerber2rml.engine.drill import drill_single_bit
                 from gerber2rml.engine.mountfid import _in_slot
-                holes = w.state.board.holes
+                holes = todo = w.state.board.holes
+                if w._double:
+                    # The drill step's own holes, in the layout's frame: the
+                    # board's are where the design put them, which on a
+                    # double-sided board is millimetres off where it is cut.
+                    from gerber2rml.doublesided import holes_not_aligned
+                    lay = w._ds_layout()
+                    holes = lay.holes
+                    todo = holes_not_aligned(lay.holes, lay.align_holes)
                 paths = drill_single_bit(
-                    [h for h in holes if _in_slot(h, holes)], w.cutting_drill())
+                    [h for h in todo if _in_slot(h, holes)], w.cutting_drill())
             else:
                 paths = w._toolpaths_for(step)[0]
             job = {"drill": w.cutting_drill(), "align": w.cutting_drill(),
@@ -660,7 +668,8 @@ class AutoRunPage(inspector.Page):
             "board's mounting holes and every step is lined up with where "
             "they really are, so holes drilled again land in the holes that "
             "are there. Use it with Start at, or Run this step.")
-        self.realign_chk.toggled.connect(lambda _on: self._fill_rows())
+        self.realign_chk.toggled.connect(
+            lambda _on: self._fill_rows() if self._thread is None else None)
         stock.add(self.realign_chk)
         # Oval holes (KiCad's slots) were never drilled before SRM-CAM read
         # them (2026-11-19): a board already made gets just those, lined up
@@ -672,7 +681,8 @@ class AutoRunPage(inspector.Page):
             "oval holes. Start then runs the drill step only, on the oval "
             "holes only. Tick the line-up above too, so they land where "
             "the board really is.")
-        self.slots_chk.toggled.connect(lambda _on: self._fill_rows())
+        self.slots_chk.toggled.connect(
+            lambda _on: self._fill_rows() if self._thread is None else None)
         stock.add(self.slots_chk)
         # The last line-up: which holes, where the board was, the fit.
         self.realign_lbl = QLabel()
@@ -1164,8 +1174,14 @@ class AutoRunPage(inspector.Page):
             self.slots_chk.setChecked(False)
 
     def board_loaded(self):
-        """A new board: it goes into the corner when this page next opens."""
+        """A new board: it goes into the corner when this page next opens,
+        and is run from the beginning. Start at, the line-up and the oval
+        holes were what the LAST board needed: kept, a new board went
+        straight to its cut-out, or got only its oval holes and "Done"."""
         self._auto_place = True
+        self.start_box.setCurrentIndex(0)
+        self.realign_chk.setChecked(False)
+        self.slots_chk.setChecked(False)
         self._sync_slots()
 
     def board_opened(self):
@@ -1873,6 +1889,16 @@ class AutoRunPage(inspector.Page):
                else ctl.state.drill.bit_diameter)
         level = self.level_chk.isChecked()
         realign = self.realign_chk.isChecked()
+        if realign and ctl._double:
+            # Its holes are taken in the board's frame and the fit is laid on
+            # the bottom's toolpaths, which on a double-sided board are in the
+            # layout's frame - millimetres apart. A double-sided board is
+            # found by its reference holes after the flip anyway.
+            ctl.say("warn", "Lining up with the board's holes is for a "
+                            "one-sided board. Untick it: a double-sided board "
+                            "is found by its reference holes.")
+            self.start_btn.setEnabled(True)
+            return
         dry = False
         check_cut = self.check_chk.isChecked()
         no_cut = self.no_cutout() and datum is not None
@@ -2249,8 +2275,12 @@ class AutoRunPage(inspector.Page):
         b = br.from_text(str(d.get("bracket") or ""))
         if b is not None:
             self.set_bracket(b)
+        from gerber2rml.gui2 import tier
         i = self.where.findData(d.get("where"))
-        if i >= 0:
+        # Pro's choice only: Novice's stock is in the bracket, and its combo
+        # is hidden - "Anywhere" there ran with no tongue and no arms
+        # (load_setup has the same guard).
+        if i >= 0 and tier.is_full():
             self.where.setCurrentIndex(i)
         try:
             w, h = (float(v) for v in d.get("size"))
