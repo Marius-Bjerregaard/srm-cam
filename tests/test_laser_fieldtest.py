@@ -97,7 +97,8 @@ def test_the_field_test_is_cut_one_height_at_a_time(qt_app, page, monkeypatch):
     text = laserlog.path().read_text(encoding="utf-8")
     assert "etch" in text and '"field_test": true' not in text  # json per line
     assert "field_test: true" in text
-    assert "bands: [[-0.6, 12], [-0.3, 12], [0.0, 30], [0.3, 12], [0.6, 12]]" in text
+    # One trench per coupon: 15 on the grid, 6 at each ladder height.
+    assert "bands: [[-0.6, 6], [-0.3, 6], [0.0, 15], [0.3, 6], [0.6, 6]]" in text
     assert "done" in text
 
 
@@ -144,3 +145,30 @@ def test_the_edge_of_the_field_gets_more_passes():
     r = xtool.traces_job(art, origin, boosted, boxes=[(30, 100, 50, 120)])
     r0 = xtool.traces_job(art, origin, plain, boxes=[(30, 100, 50, 120)])
     assert r.seconds == r0.seconds
+
+
+@pytest.mark.parametrize("mirror", [False, True])
+def test_each_band_cuts_only_its_own_coupons(qt_app, page, mirror):
+    """The heights were kept per copper shape (78), the page shows the
+    isolation round each coupon (39): by number, 24 coupons were cut at
+    another's height and four bands etched the whole sheet (review,
+    2026-11-20). Each trench now takes the height of the coupon it is round,
+    the page mirrored or not."""
+    from shapely.geometry import Point
+    from gerber2rml.gui2 import laser_fieldtest_ui as ftu
+    ftu.load(page)
+    if mirror:
+        page.mirror_box.setChecked(not page.mirror_box.isChecked())
+    page._settle()
+    assert len(page.art.apertures) == len(ft.coupons())
+    w, _h = ft.SIZE
+    zones = ftu.zones(page)
+    assert sorted(i for _dz, idx in zones for i in idx) == list(
+        range(len(page.base_art.apertures)))
+    for dz, idx in zones:
+        for k in idx:
+            c = page.base_art.apertures[k].centroid
+            x = w - c.x if page._extra_mirror else c.x
+            near = min(ft.coupons(), key=lambda q: Point(q.x, q.y).distance(
+                Point(x, c.y)))
+            assert near.dz == pytest.approx(dz), (k, near.label)

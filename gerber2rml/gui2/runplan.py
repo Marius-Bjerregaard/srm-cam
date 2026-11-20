@@ -513,7 +513,7 @@ def build(state, *, double_sided=False, registration="dowel", holes=None,
                      "bottom's holes.")
 
         seq.run("cutout_run", "Cut the board out", ordinal=5, op="cutout",
-                file=f"{name}_cutout{ext}", tool=cutout_tool,
+                side="top", file=f"{name}_cutout{ext}", tool=cutout_tool,
                 bit=cutout.bit_diameter, detail=_cutout_detail(cutout),
                 caution="Runs last - it frees the board and the dowel waste",
                 note=CUTOUT_NOTE)

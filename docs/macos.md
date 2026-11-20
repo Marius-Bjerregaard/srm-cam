@@ -450,12 +450,12 @@ entitlements without a certificate.
 
 ## Updating
 
-**Help ▸ Check for updates…** finds a new upstream release and offers
+**Help ▸ Check for updates…** finds a new release of this fork and offers
 **Update now**: Terminal opens and runs `packaging/update-macos.sh --install`
 in the checkout the app was built from. By hand:
 
 ```bash
-packaging/update-macos.sh             # fetch, rebase, doctor, tests, build
+packaging/update-macos.sh             # fetch origin, fast-forward, doctor, tests, build
 packaging/update-macos.sh --install   # ... and replace /Applications/SRM-CAM.app
 ```
 

@@ -36,6 +36,14 @@ def test_setup_values_out_of_range_are_refused_not_kept():
     assert job.offsets == 3 and set(refused) == {"cut_depth", "tool_type"}
 
 
+def test_a_feed_the_srm20_cannot_reach_is_refused():
+    # 1800 mm/min is the SRM-20's top speed on every axis: 30 mm/s.
+    job, refused = checked_job(TraceJob(), {"xy_feed": 30.0})
+    assert job.xy_feed == 30.0 and not refused
+    job, refused = checked_job(TraceJob(), {"xy_feed": 45.0})
+    assert job.xy_feed == TraceJob().xy_feed and refused == ["xy_feed"]
+
+
 def test_rml_lifts_before_it_travels_and_can_set_the_speed():
     paths = [[Move(10, 10, 2, rapid=True), Move(10, 10, -0.1), Move(20, 10, -0.1)]]
     rml = render(paths, xy_feed=4, plunge_feed=1, rpm=7000, safe_start=True)

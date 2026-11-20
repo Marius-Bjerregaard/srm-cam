@@ -227,7 +227,8 @@ class WindowSource(ar.JobSource):
         is where the fit says they came through: not the first side's frame."""
         w = self.w
         job = w.cutting_drill()
-        if w._double and w._top_fit is not None:
+        if (w._double and w._top_fit is not None
+                and getattr(self, "holes_side", "top") == "top"):
             from gerber2rml.doublesided import reflect_holes
             from gerber2rml.engine.drill import drill_holes, drill_single_bit
             lay = w._ds_layout()
@@ -256,9 +257,17 @@ class WindowSource(ar.JobSource):
                 # Only the oval holes: the slot pieces among the holes.
                 from gerber2rml.engine.drill import drill_single_bit
                 from gerber2rml.engine.mountfid import _in_slot
-                holes = w.state.board.holes
+                holes = todo = w.state.board.holes
+                if w._double:
+                    # The drill step's own holes, in the layout's frame: the
+                    # board's are where the design put them, which on a
+                    # double-sided board is millimetres off where it is cut.
+                    from gerber2rml.doublesided import holes_not_aligned
+                    lay = w._ds_layout()
+                    holes = lay.holes
+                    todo = holes_not_aligned(lay.holes, lay.align_holes)
                 paths = drill_single_bit(
-                    [h for h in holes if _in_slot(h, holes)], w.cutting_drill())
+                    [h for h in todo if _in_slot(h, holes)], w.cutting_drill())
             else:
                 paths = w._toolpaths_for(step)[0]
             job = {"drill": w.cutting_drill(), "align": w.cutting_drill(),
@@ -348,12 +357,24 @@ class _Events(QObject, ar.Events):
     job_sig = Signal(str, str, str)
     progress_sig = Signal(str, float)
 
-    def __init__(self):
+    def __init__(self, should_abort=None):
         super().__init__()
         self.flipped = threading.Event()
         self.go_on = True
         self.checked = threading.Event()
         self.answer = ("stop", 0.0)
+        # STOP on the bar sets the link's abort; the run waits here for a
+        # person, so it has to look at that too. A bare wait() held the run -
+        # and the port with it - at the flip and the check whatever STOP was
+        # pressed, though the page says STOP ends the run "at any point".
+        self.should_abort = should_abort or (lambda: False)
+
+    def _wait(self, event):
+        """Wait for ``event``; False if STOP was pressed meanwhile."""
+        while not event.wait(0.2):
+            if self.should_abort():
+                return False
+        return True
 
     def note(self, text):
         self.note_sig.emit(text)
@@ -383,13 +404,15 @@ class _Events(QObject, ar.Events):
         self.checked.clear()
         self.answer = ("stop", 0.0)
         self.check_sig.emit(traces_label, float(deeper_mm))
-        self.checked.wait()
+        if not self._wait(self.checked):
+            return ("stop", 0.0)
         return self.answer
 
     def flip(self):
         self.flipped.clear()
         self.flip_sig.emit()
-        self.flipped.wait()
+        if not self._wait(self.flipped):
+            return False
         return self.go_on
 
     def nogo(self):
@@ -407,6 +430,7 @@ class AutoRunPage(inspector.Page):
         self.ctl = ctl
         self.set_head("On the mill", "Mill it, start to finish")
         self._click = None
+        self._pre_notes = []            # said before the run's log existed
         self._thread = None
         self._events = None
         self._gui = _OnGui()
@@ -660,7 +684,8 @@ class AutoRunPage(inspector.Page):
             "board's mounting holes and every step is lined up with where "
             "they really are, so holes drilled again land in the holes that "
             "are there. Use it with Start at, or Run this step.")
-        self.realign_chk.toggled.connect(lambda _on: self._fill_rows())
+        self.realign_chk.toggled.connect(
+            lambda _on: self._fill_rows() if self._thread is None else None)
         stock.add(self.realign_chk)
         # Oval holes (KiCad's slots) were never drilled before SRM-CAM read
         # them (2026-11-19): a board already made gets just those, lined up
@@ -672,7 +697,8 @@ class AutoRunPage(inspector.Page):
             "oval holes. Start then runs the drill step only, on the oval "
             "holes only. Tick the line-up above too, so they land where "
             "the board really is.")
-        self.slots_chk.toggled.connect(lambda _on: self._fill_rows())
+        self.slots_chk.toggled.connect(
+            lambda _on: self._fill_rows() if self._thread is None else None)
         stock.add(self.slots_chk)
         # The last line-up: which holes, where the board was, the fit.
         self.realign_lbl = QLabel()
@@ -1164,9 +1190,23 @@ class AutoRunPage(inspector.Page):
             self.slots_chk.setChecked(False)
 
     def board_loaded(self):
-        """A new board: it goes into the corner when this page next opens."""
+        """A new board: it goes into the corner when this page next opens,
+        and is run from the beginning. Start at, the line-up and the oval
+        holes were what the LAST board needed: kept, a new board went
+        straight to its cut-out, or got only its oval holes and "Done"."""
         self._auto_place = True
+        self.start_box.setCurrentIndex(0)
+        self.realign_chk.setChecked(False)
+        self.slots_chk.setChecked(False)
         self._sync_slots()
+        # ...and so was the clicked start spot ("Anywhere"): the last
+        # board's, possibly not over this stock at all.
+        if self._click is not None:
+            self._click = None
+            stage = getattr(self.ctl, "stage", None)
+            if stage is not None:
+                stage.set_target(None)
+            self._arm_pick(False)
 
     def board_opened(self):
         """The operator opened a board - from KiCad, the dialog, the demo.
@@ -1536,6 +1576,48 @@ class AutoRunPage(inspector.Page):
             self.list_lay.addWidget(lab)
 
     # -- how far, and how long still ---------------------------------------
+    def _clear_old_jobs(self, printer):
+        """Windows: jobs left in the SRM-20's spooler - a VPanel job, or a
+        run's that waited while the mill was off - would cut before this
+        run's frame check, at whatever origin is set. The Mac has always
+        asked (macmill.preflight); Windows sent behind them. True to go on."""
+        from gerber2rml.engine import rmlspool
+        from gerber2rml.gui2 import dialogs
+        try:
+            left = printer.pending()
+        except rmlspool.SpoolError as e:
+            dialogs.report_error(self.window(), "The SRM-20's print queue "
+                                 "could not be read", e,
+                                 "Check the printer in Windows' Printers & "
+                                 "scanners.")
+            return False
+        if not left:
+            return True
+        d = dialogs.Sheet(self.window(), "Old jobs are waiting for the mill",
+                          level="warn", width=540)
+        d.say(f"{left} job(s) are still in the SRM-20's print queue - from "
+              f"VPanel, or an earlier run. They would cut before this run. "
+              f"Clear them?")
+        d.act("Cancel the run", on=d.reject)
+        d.act("Clear them", kind="primary", on=d.accept, default=True)
+        if not d.exec():
+            return False
+        try:
+            ok = printer.purge()
+        except rmlspool.SpoolError as e:
+            ok, why = False, e
+        else:
+            why = rmlspool.SpoolError("jobs still queued")
+        if not ok:
+            dialogs.report_error(self.window(), "The old jobs could not be "
+                                 "cleared", why,
+                                 "Someone else's jobs need an administrator "
+                                 "to remove: open the SRM-20 in Windows' "
+                                 "Printers & scanners, then Open print queue, "
+                                 "and cancel them there.")
+            return False
+        return True
+
     def _estimates(self, src):
         """``[(key, label, seconds)]`` for the run about to start.
 
@@ -1549,6 +1631,10 @@ class AutoRunPage(inspector.Page):
         from gerber2rml.engine.estimate import estimate_toolpaths_seconds
         fixed = {"stock": 45.0, "stock_top": 45.0, "fiducials": 120.0,
                  "flip": 0.0,
+                 # Four holes, each a reference touch and a search: about
+                 # what the fiducials take. It had no estimate, and fell to
+                 # the 300 s of a step whose toolpaths cannot be read.
+                 "realign": 120.0,
                  "level": 150.0 if self.level_chk.isChecked() else 2.0,
                  "level_top": 150.0 if self.level_chk.isChecked() else 2.0}
         out = []
@@ -1783,14 +1869,23 @@ class AutoRunPage(inspector.Page):
             else:
                 name = rmlspool.find_mill()
             if name is None:
-                ctl.say("fail", "The Roland SRM-20 printer is not installed on "
-                                "this PC, so there is nothing to send jobs to."
-                        + (" " + rmlspool.CUPS_SETUP_HINT
-                           if rmlspool.MACOS else ""))
+                if rmlspool.MACOS:
+                    # The packaged app has a menu for this; the hint's
+                    # terminal command is for a copy run from source.
+                    ctl.say("fail", "The SRM-20's print queue is not set up "
+                                    "on this Mac, so there is nothing to send "
+                                    "jobs to. Machine ▸ Set up the mill on "
+                                    "this Mac… makes it.")
+                else:
+                    ctl.say("fail", "The Roland SRM-20 printer is not "
+                                    "installed on this PC, so there is "
+                                    "nothing to send jobs to.")
                 return
             printer = rmlspool.SpoolPrinter(name)
             if rmlspool.MACOS and not macmill.preflight(self.window(),
                                                         printer):
+                return
+            if rmlspool.WINDOWS and not self._clear_old_jobs(printer):
                 return
             # The mill's own settings, which used to need VPanel: the
             # command set is put right and said in the log; a run that would
@@ -1798,8 +1893,15 @@ class AutoRunPage(inspector.Page):
             # cannot be read is only noted - the channel through the printer
             # driver is new there, and the run has its own checks.
             from gerber2rml.gui2 import millsettings
+
+            def say(kind, text):
+                # For the run's log too, which is only made further down:
+                # "the command set was RML-1, set to NC" was a toast and
+                # nothing else (millsettings.preflight promises the log).
+                ctl.say(kind, text)
+                self._pre_notes.append(text)
             if not millsettings.preflight(
-                    self.window(), say=ctl.say,
+                    self.window(), say=say,
                     ask_unreadable=not rmlspool.WINDOWS):
                 return
         if ctl._double:
@@ -1821,7 +1923,7 @@ class AutoRunPage(inspector.Page):
         self.progress_box.setVisible(True)
         self._clock_timer.start()
         self._tick()
-        self._events = ev = _Events()
+        self._events = ev = _Events(link.should_abort)
         ev.note_sig.connect(self._on_note)
         ev.step_sig.connect(self._set_row)
         ev.stock_sig.connect(self._on_stock)
@@ -1833,6 +1935,9 @@ class AutoRunPage(inspector.Page):
         ev.job_sig.connect(self._on_job)
         ev.progress_sig.connect(self._on_progress)
         self._new_run_dir()
+        for text in self._pre_notes:
+            self._log("Mill settings: " + text)
+        self._pre_notes = []
         # In the run's folder with its programs: Novice has no export to carry
         # it, and a file that did not get made must not stop the run. The
         # setup page keeps what it has to say.
@@ -1873,6 +1978,16 @@ class AutoRunPage(inspector.Page):
                else ctl.state.drill.bit_diameter)
         level = self.level_chk.isChecked()
         realign = self.realign_chk.isChecked()
+        if realign and ctl._double:
+            # Its holes are taken in the board's frame and the fit is laid on
+            # the bottom's toolpaths, which on a double-sided board are in the
+            # layout's frame - millimetres apart. A double-sided board is
+            # found by its reference holes after the flip anyway.
+            ctl.say("warn", "Lining up with the board's holes is for a "
+                            "one-sided board. Untick it: a double-sided board "
+                            "is found by its reference holes.")
+            self.start_btn.setEnabled(True)
+            return
         dry = False
         check_cut = self.check_chk.isChecked()
         no_cut = self.no_cutout() and datum is not None
@@ -2012,6 +2127,10 @@ class AutoRunPage(inspector.Page):
     def _on_realigned(self, report):
         """Say the line-up where it is seen, and keep it under the tick."""
         text = ar.realign_summary(report)
+        # Drawn where the holes put it, as the cuts will be: the stage went
+        # on showing the placement the line-up had just corrected.
+        if report.get("fit") is not None:
+            self.ctl.set_stock_turn(report["fit"])
         self.realign_lbl.setText(text)
         self.realign_lbl.setVisible(True)
         self.ctl.say("ok", text)
@@ -2247,10 +2366,24 @@ class AutoRunPage(inspector.Page):
         if not isinstance(d, dict):
             return
         b = br.from_text(str(d.get("bracket") or ""))
-        if b is not None:
+        here = br.from_text(str(workspace.setting("autorun/bracket", "") or ""))
+        if b is not None and here is not None and br.to_text(b) != br.to_text(
+                here):
+            # Where the bracket is screwed down is a fact about THIS mill
+            # (set_bracket saves it for every job here). A project from
+            # another lab PC rewrote it, and every later job on this one
+            # touched off at a bracket that is not there.
+            self.ctl.say("warn", "The project's bracket position is not this "
+                                 "mill's; this mill's is kept. Check it on "
+                                 "the Run it page if the bracket was moved.")
+        elif b is not None:
             self.set_bracket(b)
+        from gerber2rml.gui2 import tier
         i = self.where.findData(d.get("where"))
-        if i >= 0:
+        # Pro's choice only: Novice's stock is in the bracket, and its combo
+        # is hidden - "Anywhere" there ran with no tongue and no arms
+        # (load_setup has the same guard).
+        if i >= 0 and tier.is_full():
             self.where.setCurrentIndex(i)
         try:
             w, h = (float(v) for v in d.get("size"))
@@ -2268,6 +2401,11 @@ class AutoRunPage(inspector.Page):
             self.level_margin_spin.setValue(float(d["level_margin"]))
         except (KeyError, TypeError, ValueError):
             pass
+        try:
+            cx, cy = (float(v) for v in d.get("click"))
+            self.on_stock_click(cx, cy)
+        except (TypeError, ValueError):
+            pass                        # none saved, or not two numbers
         if "nogo" in d:
             # Boxes and clamps both (engine/nogo.py); a project carries
             # them although a session on its own does not keep them.

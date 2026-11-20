@@ -292,3 +292,49 @@ def test_skip_mode_is_only_for_traces(qt_app, monkeypatch):
         assert d._mode != "skip" and d.skip_auto.isHidden()
     finally:
         d.close()
+
+
+def test_a_focus_band_keeps_its_edge_passes_a_rework_does_not():
+    """A focus map's bands are clipped like a rework but are no rework: a
+    tilted board's edges lost their edge passes (review, 2026-11-20)."""
+    from shapely.ops import unary_union
+    aps = [box(5, 40, 8, 43), box(140, 40, 143, 43)]       # both far out
+    art = xtool.LaserArt(kind="traces", outline=box(0, 0, 150, 90),
+                         apertures=aps, mirrored=False, copper=unary_union(aps))
+    origin = (35.0, 65.0)
+    r = xtool.TracesRecipe(passes=20)
+    left = [(30, 60, 110, 160)]                          # the left half
+    band = xtool.traces_job(art, origin, r, boxes=left, rework=False)
+    redo = xtool.traces_job(art, origin, r, boxes=left)
+    rounds = lambda j: len([t for t in j.timeline if t[2] >= 0])   # noqa: E731
+    assert rounds(band) == r.passes + r.edge_passes
+    assert rounds(redo) == r.passes
+    # The band scores the outline when its recipe says so; a rework never.
+    from dataclasses import replace
+    marked = replace(r, mark_outline=True)
+    assert any(t[2] == -1 for t in xtool.traces_job(
+        art, origin, marked, boxes=left, rework=False).timeline)
+    assert not any(t[2] == -1 for t in xtool.traces_job(
+        art, origin, marked, boxes=left).timeline)
+
+
+def test_a_ring_touching_its_box_at_a_corner_is_kept():
+    """Clipped, a ring that also touches the box at a point comes back as a
+    GeometryCollection, and the whole ring was dropped."""
+    from shapely.geometry import LineString
+    clip = box(0, 0, 10, 10)
+    ring = [(5, 5), (5, 12), (10, 12), (10, 10), (12, 10), (12, 5), (5, 5)]
+    assert LineString(ring).intersection(clip).geom_type == "GeometryCollection"
+    parts = xtool._clip_ring_to(ring, clip)
+    assert parts and sum(LineString(p).length for p in parts) == pytest.approx(10.0)
+
+
+def test_trench_numbers_from_another_job_are_refused():
+    """None of them this job's: no clip, and the whole job etched."""
+    art = _art()
+    n = len(art.apertures)
+    with pytest.raises(ValueError, match="not this job's"):
+        xtool.traces_job(art, ORIGIN, xtool.DEFAULT_TRACES_RECIPE,
+                         only=[n, n + 5])
+    with pytest.raises(ValueError, match="not this job's"):
+        xtool.traces_rings(art, ORIGIN, xtool.DEFAULT_TRACES_RECIPE, only=[n])

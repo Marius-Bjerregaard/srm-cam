@@ -168,6 +168,7 @@ def test_a_second_probe_z_drops_no_closer_than_the_first(monkeypatch):
     from gerber2rml.engine import stockfind
     from gerber2rml.gui2.machine import MachineLink
     link = MachineLink()
+    link._ser = object()                        # linked (a touch needs a port)
     link.surface_z = -40.0                      # touched earlier this session
     seen = []
     monkeypatch.setattr(stockfind, "touch_from_anywhere",

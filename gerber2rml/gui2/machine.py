@@ -132,6 +132,11 @@ class MachineLink(QObject):
     op_done = Signal(str, object)
     op_failed = Signal(str, str)
     busy_changed = Signal(bool)
+    # The Arduino stopped answering the readout: (reason). The bar unlinks.
+    lost = Signal(str)
+    # Polls in a row with no position and no status before the link is
+    # called lost: about three seconds at POLL_MS.
+    SILENT_POLLS = 10
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -301,6 +306,25 @@ class MachineLink(QObject):
     def clear_abort(self):
         self._abort.clear()
 
+    def _may_start(self, name):
+        """May a move or touch asked for from the bar start now? Clears a
+        STOP only when it may.
+
+        Each of them used to clear the abort first and find out about the
+        port after. While a run or a probe grid has the port, that abort is
+        the ONLY way their STOP gets through, and the bar's own message after
+        a STOP says "raise the bit with Page Up": the Page Up cleared the
+        STOP before the run's next poll could see it, and the run cut on.
+        Refused here, nothing is touched - and a jog refused leaves no step
+        waiting (which used to stop every later jog until a STOP)."""
+        if self._external or self._ser is None:
+            self.op_failed.emit(name, "not connected" if self._ser is None
+                                and not self._external
+                                else "a run has the machine")
+            return False
+        self._abort.clear()
+        return True
+
     # -- worker ------------------------------------------------------------
     def _run(self):
         while True:
@@ -318,11 +342,27 @@ class MachineLink(QObject):
             self._current = name
             self._busy = True
             self.busy_changed.emit(True)
+            opened = None
             try:
                 if port is not None:
-                    ser = _SerialGuard(spi_probe.open_link(port))
+                    if self._ser is not None and self.firmware and \
+                            self.firmware.get("port") == port:
+                        # A second Connect queued while the first was still
+                        # opening (a click in the moment after a run hands
+                        # the port back). It used to open the port again,
+                        # fail - the first holds it - and set the link to
+                        # None, leaking the open port: every retry failed
+                        # until the app was restarted. Already linked: say so.
+                        self.linked.emit(dict(self.firmware))
+                        continue
+                    if self._ser is not None:
+                        old, self._ser = self._ser, None
+                        self._close(old, self._spindle_ours)
+                    ser = opened = _SerialGuard(spi_probe.open_link(port))
                     ver, feats = spi_probe.firmware_version(ser)
                     self._ser = ser
+                    self._silent = 0
+                    opened = None
                     self.firmware = {"version": ver, "features": sorted(feats),
                                      "port": port}
                     self.linked.emit(dict(self.firmware))
@@ -333,8 +373,14 @@ class MachineLink(QObject):
                     self.op_done.emit(name, result)
             except Exception as e:
                 self.op_failed.emit(name, f"{e.__class__.__name__}: {e}")
+                if name == "poll":
+                    self._poll_heard(False)
                 if port is not None:
                     self._ser = None
+                    if opened is not None:
+                        # Opened, then the version read failed: let go of
+                        # it, or the next Connect finds the port taken.
+                        self._close(opened, False)
             finally:
                 self._busy = False
                 self._current = None
@@ -392,7 +438,17 @@ class MachineLink(QObject):
             self.last_status = st
             self.spindle_on = bool(st.get("spindle"))
             self.status.emit(st)
+        self._poll_heard(bool(pos or st))
         return pos
+
+    def _poll_heard(self, heard):
+        """Count polls the Arduino did not answer. An unplugged board used to
+        stay "Linked" with the readout frozen at its last position - and STOP
+        said "sent" with nothing there to hear it."""
+        self._silent = 0 if heard else getattr(self, "_silent", 0) + 1
+        if self._silent == self.SILENT_POLLS:
+            self.lost.emit("the Arduino stopped answering - check its USB "
+                           "lead, then Connect again")
 
     def jog_z(self, dz_mm):
         def op(ser):
@@ -400,7 +456,8 @@ class MachineLink(QObject):
                                dz_um=int(round(dz_mm * 1000)),
                                should_abort=self.should_abort)
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_z"):
+            return
         self.submit("jog_z", op)
 
     def jog_by(self, dx_mm=0.0, dy_mm=0.0, dz_mm=0.0):
@@ -415,7 +472,8 @@ class MachineLink(QObject):
         there is never more than one move running and one waiting, so it stops
         about when the key does."""
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_by"):
+            return
         with self._jog_lock:
             p = self._jog_pending
             p[0] += dx_mm
@@ -463,7 +521,8 @@ class MachineLink(QObject):
             self.last_move_error = None if ok else "no reply"
             return ok
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("jog_xy"):
+            return
         self.submit("jog_xy", op)
 
     def go_to_view(self):
@@ -486,7 +545,8 @@ class MachineLink(QObject):
             self.last_move_error = None if ok else "no reply"
             return ok
         self.last_jog_t = time.time()
-        self.clear_abort()
+        if not self._may_start("view"):
+            return
         self.submit("view", op)
 
     def has_feature(self, name):
@@ -502,7 +562,8 @@ class MachineLink(QObject):
             # that ever does honour it errs toward the value VPanel is set to.
             return spi_probe.set_spindle(ser, 7000 if on else 0)
         self._spindle_ours = bool(on)
-        self.clear_abort()
+        if not self._may_start("spindle"):
+            return
         self.submit("spindle", op)
 
     def zero_z(self):
@@ -529,7 +590,8 @@ class MachineLink(QObject):
                         should_abort=self.should_abort) is None:
                     return None
             return spi_probe.zero_z(ser, should_abort=self.should_abort)
-        self.clear_abort()
+        if not self._may_start("zero_z"):
+            return
         self.submit("zero_z", op)
 
     def copper_hint_um(self):
@@ -559,7 +621,8 @@ class MachineLink(QObject):
         def op(ser):
             return stockfind.touch_from_anywhere(ser, hint, self.should_abort,
                                                  fresh=False)
-        self.clear_abort()
+        if not self._may_start("touch"):
+            return
         self.submit("touch", op)
 
 
@@ -911,6 +974,7 @@ class MachineBar(QWidget):
         link.status.connect(self._on_status)
         link.op_done.connect(self._on_done)
         link.op_failed.connect(self._on_failed)
+        link.lost.connect(self._on_lost)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(link.poll)
@@ -1257,6 +1321,12 @@ class MachineBar(QWidget):
             else:
                 self.chip.set("Linked", "live")
 
+    def _on_lost(self, reason):
+        if not self.link.is_connected():
+            return
+        self.message.emit("fail", "Machine link lost: %s." % reason)
+        self.link.disconnect_from(reason)
+
     def _on_done(self, name, result):
         """The two touches report here. The link has already recorded the
         surface height on a good contact; this is the sentence for it."""
@@ -1336,10 +1406,21 @@ class MachineBar(QWidget):
             self.chip.set("Link failed", "fail")
             self.connect_btn.setEnabled(True)
             self.connect_btn.setText("Connect")
+            self._connecting_until = 0.0      # the rescan may go on now
+            # On Linux the usual cause is permission, not another program:
+            # say which group the port belongs to (platform.py).
+            from gerber2rml import platform as plat
+            hint = None
+            if "PermissionError" in msg or "Permission denied" in msg:
+                try:
+                    hint = plat.serial_permission_hint(self.current_port())
+                except Exception:               # noqa: BLE001 - only a hint
+                    hint = None
             self.message.emit(
                 "fail", f"Could not open the machine link on "
-                        f"{self.current_port()}: {msg}. Check the USB lead, "
-                        f"and that no other program (VPanel, a serial "
-                        f"monitor) has the port open.")
+                        f"{self.current_port()}: {msg}. "
+                        + (hint or "Check the USB lead, and that no other "
+                                   "program (VPanel, a serial monitor) has "
+                                   "the port open."))
         elif name != "poll":
             self.message.emit("warn", f"{name}: {msg}")

@@ -62,8 +62,13 @@ def test_a_box_clicked_into_still_takes_the_wheel(qt_app):
 
 def test_the_wheel_no_longer_gives_a_box_focus(qt_app):
     area, spin, combo = _panel(qt_app)
+    # Never WheelFocus. A combo box starts at TabFocus on macOS (which the
+    # wheel never gave focus anyway) and WheelFocus elsewhere, where the
+    # guard makes it StrongFocus; asking for StrongFocus failed on a Mac.
+    for box in (spin, combo):
+        assert box.focusPolicy() != Qt.WheelFocus
+        assert box.focusPolicy() in (Qt.StrongFocus, Qt.TabFocus)
     assert spin.focusPolicy() == Qt.StrongFocus
-    assert combo.focusPolicy() == Qt.StrongFocus
     area.close()
 
 

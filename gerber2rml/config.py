@@ -113,10 +113,12 @@ class CutoutJob:
 # typed; a setup file someone else wrote is not typed, so it is checked here.
 # Generous on purpose - these catch a value that would hurt the machine
 # (a rapid below the surface, a 3 mm trace plunge, NaN), not taste.
+# Feeds stop at 30 mm/s: the SRM-20 tops out at 1800 mm/min on every axis
+# (2026-11 review: xy_feed allowed 60, twice what the machine can do).
 LIMITS = {
     "bit_diameter": (0.05, 6.0), "cut_depth": (0.01, 3.0),
     "total_depth": (0.05, 12.0), "offsets": (1, 20), "stepover": (0.05, 1.0),
-    "xy_feed": (0.1, 60.0), "plunge_feed": (0.1, 30.0),
+    "xy_feed": (0.1, 30.0), "plunge_feed": (0.1, 30.0),
     "travel_z": (0.2, 20.0), "tip_diameter": (0.01, 2.0),
     "included_angle": (5.0, 120.0), "target_width": (0.01, 5.0),
     "peck_retract": (0.0, 5.0), "tabs": (0, 20), "tab_width": (0.0, 10.0),
