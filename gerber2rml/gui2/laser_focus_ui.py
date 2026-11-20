@@ -144,18 +144,37 @@ def builtin_reference():
         return None
 
 
-def load_reference():
-    """This PC's own measurement, else the one built in."""
+def _saved_reference():
+    """``(ref, broken)``: this PC's own measurement, or None; ``broken`` when
+    one is saved but cannot be read."""
     import json
+    raw = _settings().value(REFERENCE_KEY, "") or ""
+    if not raw:
+        return None, False
     try:
-        data = json.loads(_settings().value(REFERENCE_KEY, "") or "null")
+        ref = lf.FocusMap.from_dict(json.loads(raw))
     except (TypeError, ValueError):
-        data = None
-    return lf.FocusMap.from_dict(data) if data else builtin_reference()
+        ref = None
+    if ref is None or not ref.points:
+        return None, True
+    return ref, False
+
+
+def load_reference():
+    """This PC's own measurement, else the one built in - a saved one that
+    cannot be read too. It came back None, and every map ran uncorrected:
+    up to 1.3 mm of the machine's own slope taken for the board's."""
+    ref, _broken = _saved_reference()
+    return ref if ref is not None else builtin_reference()
 
 
 def reference_is_builtin():
-    return not (_settings().value(REFERENCE_KEY, "") or "")
+    return _saved_reference()[0] is None
+
+
+def reference_broken():
+    """This PC's saved correction is there but cannot be read."""
+    return _saved_reference()[1]
 
 
 def save_reference(ref):
@@ -176,8 +195,10 @@ def reference_status():
     xs = [p[0] for p in ref.points]
     ys = [p[1] for p in ref.points]
     if reference_is_builtin():
-        return (f"Built in: the lab F1 Ultra's, measured on its bare bed at "
-                f"{len(ref.points)} points; up to {ref.spread:.2f} mm taken "
+        lost = ("This PC's saved correction could not be read, so the built-in "
+                "one is used. " if reference_broken() else "")
+        return (lost + f"Built in: the lab F1 Ultra's, measured on its bare bed "
+                f"at {len(ref.points)} points; up to {ref.spread:.2f} mm taken "
                 f"off. Measure again only for another laser.")
     return (f"Measured at {len(ref.points)} points, X {min(xs):g}-{max(xs):g}, "
             f"Y {min(ys):g}-{max(ys):g} mm; up to {ref.spread:.2f} mm taken "
@@ -209,8 +230,14 @@ def calibrate(page):
     points.append(centre)
 
     def work(progress):
-        return lf.measure_map(page.laser, page._calibration(), points,
-                              progress=lambda i, n: progress(i))
+        fmap = lf.measure_map(page.laser, page._calibration(), points,
+                              progress=lambda i, n: progress(i),
+                              should_stop=_stop_asked(page))
+        _stopped(page)
+        # The machine's slope is the spread here: only a reading off the
+        # others' surface (debris, a hole) is refused.
+        lf.check_map(fmap, max_spread=None)
+        return fmap
 
     def done(fmap):
         ref = lf.reference_from(fmap)
@@ -249,13 +276,21 @@ def measure(page):
     ref = load_reference()
 
     def work(progress):
-        return lf.measure_map(page.laser, page._calibration(), points,
-                              progress=lambda i, n: progress(i))
+        raw = lf.measure_map(page.laser, page._calibration(), points,
+                             progress=lambda i, n: progress(i),
+                             should_stop=_stop_asked(page))
+        _stopped(page)                      # a part map is not a map
+        # Checked as it will be used: the raw readings carry the machine's
+        # own slope, up to 1.3 mm on a flat sheet.
+        lf.check_map(lf.corrected(raw, ref))
+        return raw
 
     def done(fmap):
         raw = fmap
         fmap = lf.corrected(fmap, ref)
         page._focus_map = fmap
+        # Where it was measured: a map is only this board's, where it lies.
+        page._focus_map_bounds = bounds
         from gerber2rml.gui2 import laserlog
         laserlog.write("focus map", head_z=fmap.z, bounds=bounds,
                        raw=laserlog.points(raw),
@@ -282,7 +317,45 @@ def measure(page):
 
 def clear(page):
     page._focus_map = None
+    page._focus_map_bounds = None
     _draw(page)
+
+
+# How far a job may lie beyond where its map was measured before the map is
+# refused: Align moves a job a mm or two after the map, which is the same
+# board; another board, a turn or a face is not.
+MAP_REACH_MM = 5.0
+
+
+def map_problem(page):
+    """Why the page's focus map must not be used for the job as it is now,
+    or None. Kept with the map is where it was measured; a map measured for
+    one board was used for the next one placed elsewhere."""
+    fmap = getattr(page, "_focus_map", None)
+    where = getattr(page, "_focus_map_bounds", None)
+    if fmap is None or not fmap.points or where is None:
+        return None
+    now = job_bounds(page)
+    if now is None:
+        return None
+    past = max(where[0] - now[0], where[1] - now[1],
+               now[2] - where[2], now[3] - where[3])
+    if past > MAP_REACH_MM:
+        return (f"The focus map was measured somewhere else: the job now "
+                f"reaches {past:.0f} mm past it. Measure the focus map again "
+                f"where the job lies.")
+    return None
+
+
+def _stop_asked(page):
+    ev = getattr(page, "_stop_event", None)
+    return ev.is_set if ev is not None else None
+
+
+def _stopped(page):
+    ev = getattr(page, "_stop_event", None)
+    if ev is not None and ev.is_set():
+        raise xtool.Stopped(STOPPED)
 
 
 def _draw(page):
@@ -305,38 +378,96 @@ def zones_for(page, indices):
     return [(dz, [indices[k] for k in idx]) for dz, idx in groups]
 
 
-def run_zoned(laser, fmap, zones, build_job, *, progress=None, timeout_for):
-    """Run each zone with the head at its focus: ``build_job(indices)``
-    gives the job for a zone. Puts the head back where the map was measured.
-    Returns the Z of the last zone."""
-    base = fmap.z if fmap is not None else laser.z()
-    elapsed = 0.0
-    last = base
+STOPPED = "Stopped."
+
+
+def run_one(laser, text, timeout, *, progress=None, should_stop=None):
+    """One job on the laser, to its end. ``should_stop()`` True (STOP was
+    pressed) raises :class:`xtool.Stopped`: after a STOP the laser is idle,
+    which ``wait`` cannot tell from a job that finished, and the page went on
+    to say Done and tick the rail (review, 2026-11-20)."""
+    stopped = should_stop or (lambda: False)
+    if stopped():
+        raise xtool.Stopped(STOPPED)
+    laser.run(text)
+    if stopped():
+        # Pressed during the upload: the stop went first and the job
+        # started after it. make_idle (run_guarded) stops it again.
+        raise xtool.Stopped(STOPPED)
+    laser.wait(timeout, progress=progress)
+    if stopped():
+        raise xtool.Stopped(STOPPED)
+
+
+def run_guarded(laser, body, restore=None):
+    """``body()``, and whatever it raises with a job on the laser: the laser
+    stopped and seen idle (:func:`xtool.make_idle`) before ``restore()``
+    (the head back to its height) and before the page unlocks. When the
+    laser cannot be seen idle the head is left where it is and the operator
+    told it may still be running."""
     try:
-        for dz, idx in zones:
-            if not idx:
-                continue
-            job = build_job(set(idx))
-            if fmap is not None:
-                laser._json("POST", "/device/modeSwitch",
-                            {"state": "P_AUTOFOCUS"})
-                try:
-                    last = laser._goto_z(base + dz)
-                finally:
-                    laser._json("POST", "/device/modeSwitch",
-                                {"state": "P_IDLE"})
-            laser.run(job.text)
-            off = elapsed
-            laser.wait(timeout_for(job),
-                       progress=(lambda t: progress(off + t)) if progress
-                       else None)
-            elapsed += job.seconds
-    finally:
-        if fmap is not None and len(zones) > 1:
+        out = body()
+    except BaseException as e:
+        if not xtool.make_idle(laser):
+            raise xtool.LaserError(
+                f"{e} The laser did not answer afterwards: it may still be "
+                f"running. Press the stop button on the machine, and check it "
+                f"before touching the bed.") from e
+        if restore is not None:
             try:
-                laser._json("POST", "/device/modeSwitch",
-                            {"state": "P_AUTOFOCUS"})
-                laser._goto_z(base)
-            finally:
-                laser._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
-    return last
+                restore()
+            except Exception:               # noqa: BLE001 - the first error is told
+                pass
+        raise
+    if restore is not None:
+        restore()
+    return out
+
+
+def _goto(laser, z):
+    laser._json("POST", "/device/modeSwitch", {"state": "P_AUTOFOCUS"})
+    try:
+        return laser._goto_z(z)
+    finally:
+        laser._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
+
+
+def run_zoned(laser, fmap, zones, build_job, *, progress=None, timeout_for,
+              should_stop=None):
+    """Run each zone with the head at its focus: ``build_job(indices)``
+    gives the job for a zone. Puts the head back where the map was measured
+    once it has moved it, a single band too. Returns the Z of the last zone.
+    ``should_stop()`` True ends the run between bands and after each."""
+    base = fmap.z if fmap is not None else laser.z()
+    zones = [(dz, idx) for dz, idx in zones if idx]
+    stopped = should_stop or (lambda: False)
+    state = {"last": base, "moved": False, "elapsed": 0.0}
+
+    def body():
+        for k, (dz, idx) in enumerate(zones):
+            try:
+                if stopped():
+                    raise xtool.Stopped(STOPPED)
+                job = build_job(set(idx))
+                if fmap is not None:
+                    # Always to the map's height plus the band's: the head may
+                    # have moved since the map, and a band of -0.6 asked of a
+                    # map-less field test was run wherever the head was.
+                    state["moved"] = True
+                    state["last"] = _goto(laser, base + dz)
+                off = state["elapsed"]
+                run_one(laser, job.text, timeout_for(job),
+                        progress=(lambda t: progress(off + t)) if progress
+                        else None, should_stop=stopped)
+            except xtool.Stopped:
+                raise xtool.Stopped(
+                    f"Stopped in band {k + 1} of {len(zones)}: "
+                    f"{k} done, the rest not run.") from None
+            state["elapsed"] += job.seconds
+        return state["last"]
+
+    def restore():
+        if state["moved"]:
+            _goto(laser, base)
+
+    return run_guarded(laser, body, restore)
