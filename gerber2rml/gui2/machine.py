@@ -1324,6 +1324,11 @@ class MachineBar(QWidget):
     def _on_lost(self, reason):
         if not self.link.is_connected():
             return
+        # Not straight back by itself: a board that stopped answering would
+        # be linked, lost and linked again every few seconds.
+        port = (self.link.firmware or {}).get("port") or self.current_port()
+        if port:
+            self._auto_failed.add(port)
         self.message.emit("fail", "Machine link lost: %s." % reason)
         self.link.disconnect_from(reason)
 

@@ -85,3 +85,14 @@ def test_switched_off_in_the_machine_menu(bar):
     bar.set_auto_connect(False)
     _plug(bar, UNO)
     assert bar.tried == []
+
+
+def test_a_board_that_stopped_answering_is_not_relinked_in_a_loop(bar):
+    _plug(bar, UNO)
+    bar.link._ser = object()                   # linked
+    bar.link.firmware = {"port": UNO[0], "version": 5, "features": []}
+    bar.link.disconnect_from = lambda reason="": setattr(bar.link, "_ser",
+                                                         None)
+    bar._on_lost("the Arduino stopped answering")
+    _plug(bar, OTHER, UNO)                     # list changed, same board
+    assert bar.tried == [UNO[0]]
