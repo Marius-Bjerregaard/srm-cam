@@ -2369,7 +2369,10 @@ class MainWindow(QMainWindow):
                      else drill_holes(todo, dj))
             return paths, None, st.drill.bit_diameter
         if step.op == "cutout":
-            return (cut_outline(lay.outline, self.cutting_cutout()),
+            # After the flip, like the export and the autonomous run: the
+            # top-frame outline, through the measured fit.
+            return (self._fit_paths(cut_outline(lay.top_outline,
+                                                self.cutting_cutout())),
                     None, st.cutout.bit_diameter)
         tj = self.cutting_trace()
         if step.op == "top_traces":

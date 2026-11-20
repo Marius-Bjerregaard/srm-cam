@@ -3582,8 +3582,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self, "Bottom-side leveling",
                     "Bed leveling will warp the BOTTOM-side jobs (align, drill, "
-                    "bottom traces, cut-out). The top traces are cut after the flip "
-                    "on the other face, so they are left unleveled.")
+                    "bottom traces). The top traces and the cut-out are cut after "
+                    "the flip on the other face, so they are left unleveled.")
             return build_double_sided(
                 self.state.gerber_dir, out_dir, self.state.name,
                 trace=self.state.trace, drill=self.state.drill, cutout=self.state.cutout,
