@@ -361,8 +361,20 @@ def firmware_version(ser, timeout=1.5):
     """Send ``V`` -> ``(version:int, features:set[str])``. Older sketches don't
     answer ``V`` at all -> ``(1, set())`` after the timeout, so callers can gate
     v2-only features (``"retouch"``, ``"zeroz"``, ...) cleanly."""
+    # A reply left over from an earlier command (a touch-off that outlived
+    # its timeout, say) used to be read as V's answer, and taken as "an old
+    # sketch": the features went, touchstop with them, and a drop to the
+    # copper fell back to a plain move with nothing watching the probe.
+    # Stale input is dropped first, and only a V line is V's answer.
+    try:
+        ser.reset_input_buffer()
+    except Exception:
+        pass
     ser.write(b"V\n")
-    line = _read_line(ser, time.monotonic() + timeout)
+    deadline = time.monotonic() + timeout
+    line = _read_line(ser, deadline)
+    while line is not None and not line.startswith("V "):
+        line = _read_line(ser, deadline)
     if line and line.startswith("V "):
         parts = line.split()
         try:
