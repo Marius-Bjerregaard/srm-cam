@@ -1201,6 +1201,25 @@ class StencilLaserDialog(QDialog):
             "have to be drilled to size.")
         self.spot_drills.toggled.connect(
             lambda on: self.drill_through.setEnabled(on))
+        # EXPERIMENTAL: the board cut out along Edge.Cuts, after the copper.
+        self.cut_outline = QCheckBox(
+            "Cut the board out along Edge.Cuts - experimental (fin plate "
+            "under it)")
+        self.cut_outline.setChecked(False)
+        self.cut_outline.setToolTip(
+            "Untried on the machine. After the copper, the laser goes round "
+            "the board's edge and every window inside it at full power, "
+            "Cut passes times, as a few lines side by side in the waste. "
+            "Burnt FR-4 is charred at the edge and gives off toxic smoke - "
+            "run the extraction; the fin plate must be under the board. "
+            "The mill's cut-out is the one to trust.")
+        self.cut_passes = _ispin(40, 1, 400)
+        self.cut_passes_field = widgets.Field(
+            "Cut passes", self.cut_passes, unit="times round",
+            help="How many times the laser goes round the edge. Raise it "
+                 "until the board drops out; every pass is full power.")
+        self.cut_passes.setEnabled(False)
+        self.cut_outline.toggled.connect(self.cut_passes.setEnabled)
         self.cross = QCheckBox("Cross hatch: each pass at right angles to the last")
         self.one_way = QCheckBox("One way: every line drawn the same direction")
         self.mark = QCheckBox("Mark the board outline afterwards")
@@ -1244,9 +1263,12 @@ class StencilLaserDialog(QDialog):
             else:
                 wdg.valueChanged.connect(self._recipe_changed)
 
-        for c in (self.spot_drills, self.drill_through, self.cross,
-                  self.one_way, self.mark):
+        for c in (self.spot_drills, self.drill_through, self.cut_outline,
+                  self.cross, self.one_way, self.mark):
             self.recipe_more.body.addWidget(c)
+            if c is self.cut_outline:
+                self.recipe_more.body.addWidget(self.cut_passes_field)
+                self.cut_passes.valueChanged.connect(self._recipe_changed)
             if c is self.spot_drills:
                 c.toggled.connect(self._on_trace_geometry_changed)
             else:
@@ -1603,6 +1625,8 @@ class StencilLaserDialog(QDialog):
             f.setVisible(is_traces and strat == "concentric")
         self.spot_drills.setVisible(is_traces and bool(self.base_art.drills))
         self.drill_through.setVisible(is_traces and bool(self.base_art.drills))
+        self.cut_outline.setVisible(is_traces)
+        self.cut_passes_field.setVisible(is_traces)
         self._sync_spot_drills()
         self.cross.setVisible(self.kind in ("mask", "silk") or is_hatch)
         self.one_way.setVisible(self.kind in ("mask", "silk") or is_hatch)
@@ -2524,6 +2548,10 @@ class StencilLaserDialog(QDialog):
                 self._spot_auto = False
             self._sync_spot_drills()
             self.drill_through.setChecked(bool(d.get("drill_through", False)))
+            # Never brought back on by a preset: an experimental cut is
+            # ticked for this board, by hand, each time.
+            self.cut_outline.setChecked(False)
+            self.cut_passes.setValue(int(d.get("cut_passes", 40)))
             self.cross.setChecked(bool(d["cross_hatch"]))
             self.one_way.setChecked(bool(d["one_way"]))
             self.mark.setChecked(bool(d["mark_outline"]))
@@ -2743,6 +2771,8 @@ class StencilLaserDialog(QDialog):
                 spot_drills=self.spot_drills.isChecked(),
                 drill_through=(self.spot_drills.isChecked()
                                and self.drill_through.isChecked()),
+                cut_outline=self.cut_outline.isChecked(),
+                cut_passes=self.cut_passes.value(),
                 cross_hatch=self.cross.isChecked(),
                 one_way=self.one_way.isChecked(),
                 mark_outline=self.mark.isChecked(),
@@ -3489,14 +3519,16 @@ class StencilLaserDialog(QDialog):
         plate under the board, so the beam is out of focus by the time it is
         through and does not mark what is under the board. True to go on."""
         from gerber2rml.gui2 import dialogs
-        d = dialogs.Sheet(self, "The holes go through the board",
+        d = dialogs.Sheet(self, "The laser goes through the board",
                           level="warn", width=560)
         d.setObjectName("finPlateSheet")
-        d.say("Put the fin plate under the board before you go on. Through "
+        d.say("Put the fin plate (the finned plate that looks like a "
+              "heatsink) under the board before you go on. Through "
               "the board, the beam must be out of focus, or it marks the "
               "bed under it.")
         d.say("Burnt FR-4 gives off toxic smoke: run the fume extraction. "
-              "The pilot holes still have to be drilled to size.", small=True)
+              "Pilot holes still have to be drilled to size; a cut-out by "
+              "laser is experimental.", small=True)
         d.act("Cancel", on=d.reject)
         d.act("The fin plate is under it - etch", kind="primary",
               on=d.accept)
@@ -3520,11 +3552,12 @@ class StencilLaserDialog(QDialog):
         # never the page. Read per band, a Mirror pressed during band 1 etched
         # band 2 mirrored (review, 2026-11-20).
         art, origin, recipe = self.art, self.origin(), self._run_recipe()
-        if (self.kind == "traces" and not field
-                and getattr(recipe, "drill_through", False) and art.drills
-                and not self._fin_plate_ready()):
-            return self._say("Not etched: the drill holes go through the "
-                             "board, and the fin plate was not confirmed.",
+        through = (self.kind == "traces" and not field and (
+            (getattr(recipe, "drill_through", False) and art.drills)
+            or getattr(recipe, "cut_outline", False)))
+        if through and not self._fin_plate_ready():
+            return self._say("Not etched: the laser goes through the board, "
+                             "and the fin plate was not confirmed.",
                              warn=True)
         only = shapes = outline = None
         zones = build = None
@@ -3750,11 +3783,14 @@ class StencilLaserDialog(QDialog):
                   # job per band, and a Mirror mid-run etched band 2 mirrored.
                   self.mirror_box, self.flip_box, self.undo_btn, self.redo_btn,
                   self.offsets, self.trace_kerf, self.density, self.spot_drills,
-                  self.drill_through,
+                  self.drill_through, self.cut_outline, self.cut_passes,
                   self.skip_auto, self.field_test_btn, self.gerber_btn,
                   self.dxf_btn, self.empty_cal_btn):
             b.setEnabled(not on)
         if not on:
+            # Each only with what it depends on.
+            self.drill_through.setEnabled(self.spot_drills.isChecked())
+            self.cut_passes.setEnabled(self.cut_outline.isChecked())
             # The rework buttons need boxes to work on.
             n = bool(getattr(self, "rework_boxes", None))
             for b in (self.rework_btn, self.rework_clear_btn,

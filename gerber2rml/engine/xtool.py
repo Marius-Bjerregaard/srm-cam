@@ -101,6 +101,22 @@ def to_bed(ring_coords, origin, height):
     return [(ox + x, oy + (height - y)) for x, y in ring_coords]
 
 
+def cut_rings(art, origin, recipe):
+    """The rings that cut the board out (bed mm): ``recipe.cut_lines`` of
+    them per edge, a stepover apart, all in the WASTE - outside the outline,
+    inside a window - so the board keeps its drawn size."""
+    if art.outline is None or art.outline.is_empty:
+        return []
+    _, h = art.size
+    rings = []
+    for k in range(max(1, recipe.cut_lines)):
+        grown = art.outline.buffer(recipe.kerf / 2.0 + k * recipe.stepover,
+                                   join_style=1)
+        for ring in outline_rings(grown):
+            rings.append(to_bed(list(ring.coords), origin, h))
+    return rings
+
+
 def outline_rings(outline):
     """Every ring of a board outline: a Polygon, or a MultiPolygon with one
     polygon per board when a panel goes to the laser as one job."""
@@ -902,6 +918,14 @@ class TracesRecipe:
     # marking them in the copper: an option, and only with the fin plate
     # under the board, so the beam is out of focus once it is through.
     drill_through: bool = False
+    # EXPERIMENTAL: cut the board out along Edge.Cuts - the outline and any
+    # window inside it - at full power, ``cut_passes`` times, as
+    # ``cut_lines`` side-by-side rings (a laser's kerf is a few hundredths:
+    # one line cannot open a cut 1.6 mm deep). Untried on the machine;
+    # needs the fin plate, as drill_through does.
+    cut_outline: bool = False
+    cut_passes: int = 40
+    cut_lines: int = 3
     cross_hatch: bool = True
     one_way: bool = True
     mark_outline: bool = False
@@ -1514,6 +1538,20 @@ def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
         dt = _draw_seconds(outline, recipe.speed)
         timeline.append((secs, secs + dt, -1, recipe.passes))
         secs += dt
+    # Last, so the board stays in the sheet while its copper is etched:
+    # cut out along Edge.Cuts (experimental). Not on a rework, a selection
+    # or a focus band - the whole edge, once, at the end.
+    cuts = ([] if (rework or only or boxes or not recipe.cut_outline)
+            else cut_rings(art, origin, recipe))
+    if cuts:
+        check_on_bed(cuts)
+        cut_s = _draw_seconds(cuts, recipe.speed)
+        for rnd in range(recipe.cut_passes):
+            order = cuts if rnd % 2 == 0 else list(reversed(cuts))
+            if write:
+                body += _passes(order, recipe.power, recipe.speed, 1)
+            timeline.append((secs, secs + cut_s, -1, recipe.passes + rnd))
+            secs += cut_s
     lines = _head("fiber", recipe.frequency, recipe.power / 100) + body + _TAIL
     return Job(text="\r\n".join(lines) if write else "",
                zones=[len(all_rings) + len(spots)], seconds=secs,
