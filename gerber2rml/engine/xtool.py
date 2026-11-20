@@ -666,7 +666,7 @@ def hatch(polys, interval, angle_deg=0.0, one_way=True):
     across the whole job, so the beam sweeps instead of jumping shape to shape.
     ``one_way`` keeps every line in the same direction."""
     from shapely.affinity import rotate as _rotate
-    from shapely.geometry import LineString, MultiLineString
+    from shapely.geometry import LineString
     from shapely.ops import unary_union
     shape = unary_union([p for p in polys if not p.is_empty])
     if shape.is_empty:
@@ -679,8 +679,7 @@ def hatch(polys, interval, angle_deg=0.0, one_way=True):
     flip = False
     while y < y1:
         cut = flat.intersection(LineString([(x0 - 1, y), (x1 + 1, y)]))
-        parts = list(cut.geoms) if isinstance(cut, MultiLineString) else (
-            [cut] if isinstance(cut, LineString) and not cut.is_empty else [])
+        parts = line_parts(cut)
         row = []
         for ln in parts:
             (ax, ay), (bx, by) = ln.coords[0], ln.coords[-1]
@@ -1078,9 +1077,25 @@ def write_traces_dxf(art, out_dir, name):
 EDGE_RING_MM = 0.02     # an isolation pass this near the board's edge is on it
 
 
+def line_parts(geom):
+    """The lines in a shapely result: a LineString, a MultiLineString, or a
+    GeometryCollection of lines and the points where a line only touched the
+    clip. A ring that touched its box at a corner came back as a collection,
+    and taking only plain LineStrings dropped the whole ring from the job."""
+    from shapely.geometry import LineString
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom]
+    out = []
+    for g in getattr(geom, "geoms", ()):
+        out += line_parts(g)
+    return out
+
+
 def _clip_ring_to(coords, clip):
     """Closed ring coordinate list clipped to ``clip`` (artwork frame)."""
-    from shapely.geometry import LineString, MultiLineString
+    from shapely.geometry import LineString
     if clip is None:
         return [coords]
     line = LineString(coords)
@@ -1090,10 +1105,8 @@ def _clip_ring_to(coords, clip):
         return [coords]
     if not line.intersects(clip):
         return []
-    cut = line.intersection(clip)
-    parts = list(cut.geoms) if isinstance(cut, MultiLineString) else (
-        [cut] if isinstance(cut, LineString) else [])
-    return [list(p.coords) for p in parts if not p.is_empty and p.length > 1e-4]
+    parts = line_parts(line.intersection(clip))
+    return [list(p.coords) for p in parts if p.length > 1e-4]
 
 
 def boxes_region(boxes):
@@ -1114,6 +1127,19 @@ def _boxes_in_art(boxes, origin, height):
             for x0, y0, x1, y1 in boxes]
 
 
+def _check_only(art, only):
+    """``only`` must number this job's trenches. Numbers from another set
+    were silently dropped: the field test's heights were kept per copper
+    shape (78) after the page rebuilt the job as isolation regions (39), and
+    with none of a band's numbers left the band had no clip - the whole sheet
+    etched at each ladder height (review, 2026-11-20)."""
+    bad = [k for k in (only or ()) if not 0 <= k < len(art.apertures)]
+    if bad:
+        raise ValueError(f"The trenches picked are not this job's: it has "
+                         f"{len(art.apertures)}, not number {max(bad) + 1}. "
+                         f"Pick them again.")
+
+
 def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
                  boxes=None):
     """Concentric isolation rings per offset, in bed coordinates, ordered by
@@ -1128,6 +1154,7 @@ def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
         _, outline = stencil_paths(art, origin)
         return [], outline
 
+    _check_only(art, only)
     only_key = frozenset(only) if only else None
     _, h_art = art.size
     art_boxes = (tuple(tuple(round(v, 4) for v in b)
@@ -1204,20 +1231,28 @@ def edge_rings(rings, radius, centre=FIELD_CENTRE):
 
 
 def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
-               boxes=None, *, write=True):
+               boxes=None, *, rework=None, write=True):
     """One GS002 file to etch PCB copper traces on the F1 Ultra.
     ``write=False``: the seconds and timeline only, no file text; the window's
     estimate, which would otherwise build the whole job (tens of MB) per edit.
 
-    ``boxes`` (bed mm): a rework. Only the passes inside the boxes are run,
-    as the CNC's rework clips its pass, and the outline is not scored again."""
+    ``boxes`` (bed mm): only the passes inside the boxes are run, as the
+    CNC's rework clips its pass. ``rework`` (by default: when there are
+    boxes) says it is a second go at spots that did not cut through: no
+    edge-of-field passes and the outline not scored again. A focus map's
+    band is clipped the same way but is the first etch of its part of the
+    board (``rework=False``): it keeps its edge passes, and the recipe says
+    whether it scores the outline."""
     from dataclasses import replace as _replace
     from shapely.geometry import Polygon
+    _check_only(art, only)
+    rework = bool(boxes) if rework is None else bool(rework)
     region = None
     if boxes:
         region = boxes_region(boxes)
         if region is None:
             raise ValueError("Draw a rework box over the traces first.")
+    if rework:
         recipe = _replace(recipe, mark_outline=False)
 
     if recipe.strategy in ("moat", "rubout"):
@@ -1268,8 +1303,11 @@ def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
                 body += _rest(park, recipe.rest_s)
             secs += recipe.rest_s
     # The edge of the field gets more: not on a rework, which has its own.
+    # A focus band is no rework: banded by boxes, a tilted board's edges -
+    # the very part the map is for - lost their edge passes (review,
+    # 2026-11-20).
     edge = (edge_rings([rg for grp in groups for rg in grp], recipe.edge_radius)
-            if recipe.edge_passes > 0 and region is None else [])
+            if recipe.edge_passes > 0 and not rework else [])
     if edge:
         edge = _nearest_order(edge)
         edge_s = _draw_seconds(edge, recipe.speed)
