@@ -216,8 +216,9 @@ class SetupPage(Page):
         self.preset.setToolTip(
             "A saved set of bit sizes, depths and feeds. The lab's profile is "
             "the numbers this machine is known to cut well with.")
-        tools.add(widgets.Field("Profile", self.preset))
-        prow = QWidget()
+        self.preset_field = widgets.Field("Profile", self.preset)
+        tools.add(self.preset_field)
+        prow = self.preset_row = QWidget()
         ph = QHBoxLayout(prow)
         ph.setContentsMargins(0, 0, 0, 0)
         ph.setSpacing(theme.GAP_S)
@@ -245,6 +246,18 @@ class SetupPage(Page):
                  "surface. Deeper if tracks stay joined. Applying a profile "
                  "sets it back.")
         tools.add(self.trace_depth_field)
+        # Novice's tool is two things: flat or ball (How it is made, above)
+        # and how thick. The profile list said the first over again - one
+        # could be set against the other - so Novice does not have it; this
+        # is the one number a profile was otherwise needed for.
+        self.bit_dia = num(0.8, 0.3, 3.2, 0.05, 2, self._on_bit_dia,
+                           suffix=" mm")
+        self.bit_dia_field = widgets.Field(
+            "Bit diameter", self.bit_dia,
+            help="The bit in the collet. The same one isolates, drills and "
+                 "cuts the board out. A ball mill's channel is narrower than "
+                 "the ball: it is worked out from this and the cut depth.")
+        tools.add(self.bit_dia_field)
         # Only for a V-bit: a flat endmill's width does not move with depth,
         # so the picture would say nothing the line above does not.
         from gerber2rml.gui2.bitviz import BitProfile
@@ -739,6 +752,15 @@ class SetupPage(Page):
         self.ctl.state.trace.cut_depth = v
         self.ctl.action_params_changed()
 
+    def _on_bit_dia(self, v):
+        """One bit for the whole job, this thick (Novice)."""
+        st = self.ctl.state
+        if getattr(st.trace, "tool_type", "flat") != "vbit":
+            st.trace.bit_diameter = v
+        st.drill.bit_diameter = v
+        st.cutout.bit_diameter = v
+        self.ctl.action_params_changed()
+
     def _on_stock(self, *_a):
         # In Novice the stock is in the bracket and the Run page's size is
         # what the outline and Start are made from - typed here, it goes
@@ -903,6 +925,19 @@ class SetupPage(Page):
         self.trace_depth_field.setVisible(
             not tier.is_full()
             and getattr(st.trace, "tool_type", "flat") != "vbit")
+        novice_bit = (not tier.is_full()
+                      and getattr(st.trace, "tool_type", "flat") != "vbit")
+        self.preset_field.setVisible(tier.is_full())
+        self.preset_row.setVisible(tier.is_full())
+        self.bit_dia_field.setVisible(novice_bit)
+        self.bit_dia.blockSignals(True)
+        # A flat endmill under 0.6 mm reads as the ball's method (its width
+        # is what says so): Novice's flat starts there.
+        self.bit_dia.setMinimum(
+            0.3 if getattr(st.trace, "tool_type", "flat") == "ball" else 0.6)
+        self.bit_dia.setValue(st.trace.bit_diameter if novice_bit
+                              else st.drill.bit_diameter)
+        self.bit_dia.blockSignals(False)
         # The job as it will be CUT, margin included - a V-bit's width follows
         # depth, so a margin that deepens the cut also widens every trace, and
         # that is the number worth looking at.
