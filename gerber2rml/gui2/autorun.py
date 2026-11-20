@@ -108,6 +108,7 @@ class WindowSource(ar.JobSource):
         self.w, self.gui = win, gui
         self.keep_placement = False      # the outline is real: keep the board
         self.centre = False              # centre it on the stock found
+        self.slots_only = False          # drill only the oval holes
 
     def copper_nets(self, side="bottom", fitted=True):
         """One face's copper where it is cut, and its nets, for the run's
@@ -251,6 +252,13 @@ class WindowSource(ar.JobSource):
                 lay = w._ds_layout()
                 paths = w._fit_paths(cut_outline(lay.top_outline,
                                                  w.cutting_cutout()))
+            elif getattr(self, "slots_only", False) and step.op == "drill":
+                # Only the oval holes: the slot pieces among the holes.
+                from gerber2rml.engine.drill import drill_single_bit
+                from gerber2rml.engine.mountfid import _in_slot
+                holes = w.state.board.holes
+                paths = drill_single_bit(
+                    [h for h in holes if _in_slot(h, holes)], w.cutting_drill())
             else:
                 paths = w._toolpaths_for(step)[0]
             job = {"drill": w.cutting_drill(), "align": w.cutting_drill(),
@@ -295,6 +303,29 @@ class WindowSource(ar.JobSource):
                     nominal_top_fiducials(lay))
         return self.gui(go)
 
+    def realign_holes(self):
+        """The board's mounting holes - or, with none, its widest drill
+        holes - where its drill toolpaths put them."""
+        def go():
+            from gerber2rml.engine import mountfid
+            st = self.w.state
+            if st.board is None or st.board.outline is None:
+                return []
+            box, bit = st.board.outline.bounds, st.drill.bit_diameter
+            # Its mounting holes; failing those, its widest drill holes.
+            got = mountfid.pick(st.board.holes, box, bit_mm=bit)
+            if got:
+                self.realign_kind = ("the board's %d mounting holes (%.1f mm)"
+                                     % (len(got), got[0][2]))
+            else:
+                got = mountfid.pick_any(st.board.holes, box, bit_mm=bit)
+                ds = sorted({round(h[2], 2) for h in got})
+                self.realign_kind = (
+                    "%d drill holes (%s mm)" % (len(got), " / ".join(
+                        "%g" % d for d in ds)) if got else "")
+            return [tuple(h[:3]) for h in got]
+        return self.gui(go)
+
     def fiducial_clearance_um(self):
         w = self.w
         return int(max(0.15, (w._fid_diameter - w.state.drill.bit_diameter)
@@ -303,25 +334,6 @@ class WindowSource(ar.JobSource):
     def set_top_fit(self, t):
         self.gui(lambda: self.w.set_top_fit(t))
 
-    def board_holes(self):
-        return self.gui(lambda: rework_holes(self.w))
-
-    def set_turn(self, t):
-        self.gui(lambda: self.w.set_stock_turn(t))
-
-
-def rework_holes(w):
-    """The holes a single-sided board is found again by when it is put back
-    for rework: ``[(x, y, d)]`` as placed, or [] when it has none that will
-    do. The bit in the spindle then is the one that cut the traces, so it is
-    the one that has to drop into them - mounting holes, or solder holes
-    when the bit is fine enough (engine/mountfid.py)."""
-    from gerber2rml.engine import mountfid
-    b = w.state.board
-    if b is None or w._double or not b.holes or b.outline is None:
-        return []
-    return mountfid.pick(b.holes, b.outline.bounds,
-                         bit_mm=w.cutting_trace().effective_diameter())
 
 
 class _Events(QObject, ar.Events):
@@ -332,6 +344,7 @@ class _Events(QObject, ar.Events):
     check_sig = Signal(str, float)
     level_sig = Signal(str, object, int, int)
     fit_sig = Signal(object, object, object)
+    realigned_sig = Signal(object)
     job_sig = Signal(str, str, str)
     progress_sig = Signal(str, float)
 
@@ -359,6 +372,9 @@ class _Events(QObject, ar.Events):
 
     def fit(self, nominal, measured, t):
         self.fit_sig.emit(list(nominal), list(measured), t)
+
+    def realigned(self, report):
+        self.realigned_sig.emit(report)
 
     def job(self, key, label, program):
         self.job_sig.emit(key, label, program)
@@ -614,7 +630,6 @@ class AutoRunPage(inspector.Page):
         stock.add(self.check_chk)
         # A laser board is drilled and cut out here and etched on the laser:
         # the board's method says so (the chip at the top), not a tick.
-        self._level_before_laser = None
         srow = QWidget()
         h = QHBoxLayout(srow)
         h.setContentsMargins(0, 0, 0, 0)
@@ -633,22 +648,38 @@ class AutoRunPage(inspector.Page):
             "everything deeper, or drill the holes again.")
         h.addWidget(self.start_box, 1)
         stock.add(srow)
-        from gerber2rml.gui2 import workspace as _ws
-        self.holes_chk = QCheckBox("Find the board by its own holes")
-        self.holes_chk.setChecked(
-            str(_ws.setting("autorun/rework_holes", "1")) != "0")
-        self.holes_chk.toggled.connect(
-            lambda on: _ws.set_setting("autorun/rework_holes",
-                                       "1" if on else "0"))
-        self.holes_chk.setToolTip(
-            "For a board put back in the mill. The stock never goes back "
-            "quite where it lay, and going by its edges alone the re-cut "
-            "can land beside the first one. Ticked, the bit drops into the "
-            "board's mounting holes (or solder holes wide enough for it) "
-            "before anything is cut, and the job is laid on where they "
-            "really are. If they are not found, nothing is cut.")
-        self.holes_chk.setVisible(False)
-        stock.add(self.holes_chk)
+        # A board taken off and put back - to drill holes that did not go
+        # through, say - is a few tenths off where the stock corner puts it.
+        # Both tiers: it is the way to go back to a board, not a setting.
+        self.realign_chk = QCheckBox("The sheet was moved: line up with the "
+                                     "board's holes")
+        self.realign_chk.setChecked(False)
+        self.realign_chk.setToolTip(
+            "For a board that is already drilled and was taken off the bed "
+            "and put back. Before anything is cut, the probe finds the "
+            "board's mounting holes and every step is lined up with where "
+            "they really are, so holes drilled again land in the holes that "
+            "are there. Use it with Start at, or Run this step.")
+        self.realign_chk.toggled.connect(lambda _on: self._fill_rows())
+        stock.add(self.realign_chk)
+        # Oval holes (KiCad's slots) were never drilled before SRM-CAM read
+        # them (2026-11-19): a board already made gets just those, lined up
+        # on its own holes, and nothing else - no traces, no cut-out.
+        self.slots_chk = QCheckBox("Only the oval holes: drill just those")
+        self.slots_chk.setChecked(False)
+        self.slots_chk.setToolTip(
+            "For a board already drilled and cut out before SRM-CAM cut "
+            "oval holes. Start then runs the drill step only, on the oval "
+            "holes only. Tick the line-up above too, so they land where "
+            "the board really is.")
+        self.slots_chk.toggled.connect(lambda _on: self._fill_rows())
+        stock.add(self.slots_chk)
+        # The last line-up: which holes, where the board was, the fit.
+        self.realign_lbl = QLabel()
+        self.realign_lbl.setWordWrap(True)
+        self.realign_lbl.setObjectName("realignResult")
+        self.realign_lbl.setVisible(False)
+        stock.add(self.realign_lbl)
 
         # What holds the stock down. The bracket is drawn because the app
         # knows its shape; a clamp is known only if somebody says where it
@@ -1121,9 +1152,21 @@ class AutoRunPage(inspector.Page):
             spin.setValue(v)
             spin.blockSignals(False)
 
+    def _sync_slots(self):
+        """The oval-holes tick shows only for a board that has some."""
+        b = getattr(self.ctl.state, "board", None)
+        has = False
+        if b is not None and b.holes:
+            from gerber2rml.engine.mountfid import _in_slot
+            has = any(_in_slot(h, b.holes) for h in b.holes)
+        self.slots_chk.setVisible(has)
+        if not has:
+            self.slots_chk.setChecked(False)
+
     def board_loaded(self):
         """A new board: it goes into the corner when this page next opens."""
         self._auto_place = True
+        self._sync_slots()
 
     def board_opened(self):
         """The operator opened a board - from KiCad, the dialog, the demo.
@@ -1171,17 +1214,16 @@ class AutoRunPage(inspector.Page):
 
     def sync_method(self):
         """The board's method changed. On the laser the mill only drills and
-        cuts out: holes and an outline go through, so the surface is not
-        probed, and there are no traces to stop and look at."""
+        cuts out, and there are no traces to stop and look at.
+
+        The surface is still probed. Holes and an outline 2.0 mm deep in a
+        1.6 mm board have 0.4 mm to spare, and a 124 mm sheet bows more than
+        that: drums1 (2026-11-19), zeroed at one spot and not levelled, came
+        out with only its left- and right-most holes through and the
+        cut-out partly through. The levelling tick is left as it was set."""
         on = self.traces_on_laser()
         self.set_head("On the mill", "Drill and cut out, on tabs" if on
                       else "Mill it, start to finish")
-        if on and self._level_before_laser is None:
-            self._level_before_laser = self.level_chk.isChecked()
-            self.level_chk.setChecked(False)
-        elif not on and self._level_before_laser is not None:
-            self.level_chk.setChecked(self._level_before_laser)
-            self._level_before_laser = None
         self.check_chk.setEnabled(not on and not self.no_cutout())
         if self._thread is None:
             self._fill_rows()
@@ -1440,7 +1482,11 @@ class AutoRunPage(inspector.Page):
     # -- the checklist -------------------------------------------------------
     def _plan_rows(self):
         src = WindowSource(self.ctl, self._gui)
-        rows = [("stock", "Find the stock"), ("level", "Probe the surface")]
+        rows = [("stock", "Find the stock")]
+        if getattr(self, "realign_chk", None) is not None \
+                and self.realign_chk.isChecked():
+            rows.append(("realign", "Line up with the board's holes"))
+        rows.append(("level", "Probe the surface"))
         rows += src.bottom_steps()
         if self.ctl._double:
             rows += [("flip", "Turn it over"),
@@ -1595,6 +1641,11 @@ class AutoRunPage(inspector.Page):
             self._tick()
 
     def _set_row(self, key, state):
+        if state == "done":
+            # Every step that finished is done on the rail, and in the
+            # project - even when a later one stops the run.
+            self._finished_steps = getattr(self, "_finished_steps", set())
+            self._finished_steps.add(key)
         if self._clock is not None:
             self._clock.step(key, state)
             self._tick()
@@ -1676,6 +1727,15 @@ class AutoRunPage(inspector.Page):
         if ctl.state.board is None:
             ctl.say("warn", "Load a board first.")
             return
+        slots_only = self.slots_chk.isChecked() and not self.slots_chk.isHidden()
+        if slots_only and only is None and ctl.plan is not None:
+            # The oval holes alone: the drill step, nothing after it.
+            drill = next((st for st in ctl.plan.steps
+                          if st.kind == "run" and st.op == "drill"), None)
+            if drill is None:
+                ctl.say("warn", "This board has no drill step to run.")
+                return
+            only = drill.key
         one = ctl.plan.by_key(only) if (only and ctl.plan) else None
         if only and (one is None or one.kind != "run"):
             ctl.say("warn", "There is no step to run there.")
@@ -1709,20 +1769,28 @@ class AutoRunPage(inspector.Page):
             printer = simmachine.printer()
         else:
             from gerber2rml.engine import rmlspool
-            if rmlspool.CUPS:
+            if rmlspool.MACOS:
                 from gerber2rml.gui2 import macmill
                 name = macmill.find_or_setup(self.window())
+            elif rmlspool.LINUX:
+                from gerber2rml.gui2 import linuxmill
+                name = linuxmill.find_or_setup(self.window())
+                if name is None:
+                    ctl.say("fail", "The SRM-20's USB is not reachable, so "
+                                    "there is nothing to send jobs to. "
+                            + rmlspool.LINUX_SETUP_HINT)
+                    return
             else:
                 name = rmlspool.find_mill()
             if name is None:
                 ctl.say("fail", "The Roland SRM-20 printer is not installed on "
                                 "this PC, so there is nothing to send jobs to."
                         + (" " + rmlspool.CUPS_SETUP_HINT
-                           if rmlspool.CUPS else ""))
+                           if rmlspool.MACOS else ""))
                 return
             printer = rmlspool.SpoolPrinter(name)
-            if rmlspool.CUPS and not macmill.preflight(self.window(),
-                                                       printer):
+            if rmlspool.MACOS and not macmill.preflight(self.window(),
+                                                        printer):
                 return
             # The mill's own settings, which used to need VPanel: the
             # command set is put right and said in the log; a run that would
@@ -1761,6 +1829,7 @@ class AutoRunPage(inspector.Page):
         ev.check_sig.connect(self._on_check)
         ev.level_sig.connect(self._on_level)
         ev.fit_sig.connect(self._on_fit)
+        ev.realigned_sig.connect(self._on_realigned)
         ev.job_sig.connect(self._on_job)
         ev.progress_sig.connect(self._on_progress)
         self._new_run_dir()
@@ -1793,6 +1862,7 @@ class AutoRunPage(inspector.Page):
         src = WindowSource(ctl, self._gui)
         src.keep_placement = datum is not None
         src.centre = self.centre_chk.isChecked()
+        src.slots_only = slots_only
         self.start_btn.setEnabled(False)
         self._last_port = port
         self._measured = None
@@ -1802,6 +1872,7 @@ class AutoRunPage(inspector.Page):
         bit = (one.bit if one is not None and one.bit
                else ctl.state.drill.bit_diameter)
         level = self.level_chk.isChecked()
+        realign = self.realign_chk.isChecked()
         dry = False
         check_cut = self.check_chk.isChecked()
         no_cut = self.no_cutout() and datum is not None
@@ -1811,8 +1882,6 @@ class AutoRunPage(inspector.Page):
         only_keys = [one.key] if one is not None else None
         done_msg = (f"Done: {one.title}." if one is not None
                     else "The board is done.")
-        self._sync_holes_chk()
-        by_holes = self.by_holes() if one is None else False
         nogo = self.nogo()
         level_margin = self.level_margin_spin.value()
         from gerber2rml.gui2 import workspace
@@ -1843,7 +1912,7 @@ class AutoRunPage(inspector.Page):
                                  check_cut=check_cut,
                                  start_at=start_at, nogo=nogo,
                                  level_margin=level_margin,
-                                 by_holes=by_holes, only=only_keys)
+                                 only=only_keys, realign=realign)
                 try:
                     ok = run.run()
                 finally:
@@ -1871,6 +1940,7 @@ class AutoRunPage(inspector.Page):
         # The link let go of the port before the run took it: "not connected"
         # would be the wrong thing to say for as long as the run has it.
         self._sync_offline()
+        self._run_is_sim = sim
         if sim:
             self._sim_timer.start()
         ctl.say("info", (f"Running one step: {one.title}. " if one is not None
@@ -1938,6 +2008,13 @@ class AutoRunPage(inspector.Page):
                 continue
             self._log("fiducial %d at %.3f, %.3f - off by %.3f mm"
                       % (i, m[0], m[1], next(res)))
+
+    def _on_realigned(self, report):
+        """Say the line-up where it is seen, and keep it under the tick."""
+        text = ar.realign_summary(report)
+        self.realign_lbl.setText(text)
+        self.realign_lbl.setVisible(True)
+        self.ctl.say("ok", text)
 
     def _on_job(self, key, label, rml):
         if getattr(self, "run_dir", None) is None:
@@ -2159,7 +2236,6 @@ class AutoRunPage(inspector.Page):
             "level": self.level_chk.isChecked(),
             "level_margin": self.level_margin_spin.value(),
             "check": self.check_chk.isChecked(),
-            "rework_holes": self.holes_chk.isChecked(),
             "nogo": nogo_to_text(self._nogo),
             "surface_z": str(workspace.setting("autorun/surface_z", "") or ""),
         }
@@ -2185,8 +2261,7 @@ class AutoRunPage(inspector.Page):
         for box, key in ((self.centre_chk, "centre"),
                          (self.nocut_chk, "no_cutout"),
                          (self.level_chk, "level"),
-                         (self.check_chk, "check"),
-                         (self.holes_chk, "rework_holes")):
+                         (self.check_chk, "check")):
             if key in d:
                 box.setChecked(bool(d[key]))
         try:
@@ -2259,27 +2334,6 @@ class AutoRunPage(inspector.Page):
         self.rework_tools.setVisible(
             not self.check_box.isHidden()
             or self.start_box.currentData() == ar.START_AT_CHECK)
-        self._sync_holes_chk()
-
-    def _sync_holes_chk(self):
-        """Finding the board by its holes: offered for a single-sided board
-        started at Rework (a double-sided one is found by its reference
-        holes anyway), and only when it has holes that will do."""
-        rework = (self.start_box.currentData() == ar.START_AT_CHECK
-                  and not self.ctl._double)
-        self.holes_chk.setVisible(rework)
-        if not rework:
-            return
-        n = len(rework_holes(self.ctl))
-        self.holes_chk.setEnabled(n >= 2)
-        self.holes_chk.setText(
-            "Find the board by its own holes (%d of them)" % n if n >= 2
-            else "Find the board by its own holes - it has none wide "
-                 "enough and far enough apart")
-
-    def by_holes(self):
-        return (not self.holes_chk.isHidden() and self.holes_chk.isEnabled()
-                and self.holes_chk.isChecked())
 
     def _answer(self, what, mm, boxes=None):
         self._clock_wait(False)
@@ -2339,13 +2393,36 @@ class AutoRunPage(inspector.Page):
         one, self._only = getattr(self, "_only", None), None
         if ok and one and hasattr(self.ctl, "traveller"):
             self.ctl.traveller.set_done(one, True)
+        finished, self._finished_steps = getattr(self, "_finished_steps",
+                                                 set()), set()
+        plan = getattr(self.ctl, "plan", None)
+        if plan is not None and hasattr(self.ctl, "traveller"):
+            for key in finished:
+                step = plan.by_key(key)
+                if step is not None and step.kind == "run":
+                    self.ctl.traveller.set_done(key, True)
         link = self.ctl.link
         link.mark_external(False)
         port = getattr(self, "_last_port", None)
         if port:
             link.connect_to(port)
 
+    def _sim_live(self):
+        """Whether the simulator is what the bed shows: connected to it, or a
+        run on it still going."""
+        if self._thread is not None:
+            return bool(getattr(self, "_run_is_sim", False))
+        port = self._port()
+        return bool(port) and simmachine.is_sim(port)
+
     def _draw_sim(self):
+        if not self._sim_live():
+            # Left on, its stock - turned 1.2 degrees on purpose - stayed on
+            # the bed over a real mill's board (2026-11-19, seen as a skewed
+            # dotted outline after using the laser page).
+            self._sim_timer.stop()
+            self.ctl.stage.set_sim(None)
+            return
         m = simmachine.machine()
         self.ctl.stage.set_sim(m.view())
         if self._thread is not None:

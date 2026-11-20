@@ -24,7 +24,7 @@ levelling, from a single program.
 |---|---|---|
 | Windows | `SRM-CAM-Setup.exe` | Unsigned: on the first run, SmartScreen needs *More info ▸ Run anyway*. |
 | macOS (Apple Silicon) | `SRM-CAM-macOS-arm64.dmg` | Not notarised: right-click ▸ Open the first time. See [docs/macos.md](docs/macos.md). |
-| Linux | `SRM-CAM-x86_64.AppImage` | `chmod +x` and run. See [docs/linux.md](docs/linux.md). |
+| Linux | `SRM-CAM-x86_64.AppImage` | `chmod +x` and run. Drives the mill too: once, *Machine ▸ Set up USB access…* (asks for your password). No VPanel or driver needed. |
 
 All from the [latest release](https://github.com/Marius-Bjerregaard/srm-cam/releases/latest).
 The three do the same: the machine link, the automatic run and the mill's
@@ -98,7 +98,7 @@ and write the same files.
 | [User guide](https://madsrudolph.github.io/srm-cam/) | How to use it: start here |
 | [docs/usage.md](docs/usage.md) | Full reference: every setting, presets, the CLI |
 | [docs/macos.md](docs/macos.md) | macOS: the mill as a print queue, its settings without VPanel |
-| [docs/linux.md](docs/linux.md) | Linux: the same, and what has not been run at a mill yet |
+| [docs/linux.md](docs/linux.md) | Linux: the machine link and the mill, set up once |
 | [kicad-plugin/](kicad-plugin) | The KiCad plugin |
 | [packaging/README.md](packaging/README.md) | Building the installers, cutting a release |
 | [MAINTAINING.md](MAINTAINING.md) | Keeping it running: locked builds, CI, handover |

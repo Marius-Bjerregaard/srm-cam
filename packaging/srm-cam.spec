@@ -23,6 +23,9 @@ KICAD_PLUGIN = ROOT / "kicad-plugin"
 datas = []
 datas += collect_data_files("pyqtgraph")           # icons, shaders, colormaps
 datas += collect_data_files("gerbonara")           # any packaged resources
+# The lab F1 Ultra's focus correction (gerber2rml/data), loaded by path.
+datas += [(str(p), "gerber2rml/data")
+          for p in (ROOT / "gerber2rml" / "data").glob("*.json")]
 # the preload demo board, so a fresh install opens with something on screen
 if DEMO.is_dir():
     for f in DEMO.iterdir():
@@ -60,17 +63,17 @@ hiddenimports += ["qrcode"]                        # phone photo QR (function-le
 # library is copied in beside the executable, where millsetup looks first.
 # Without Homebrew's libusb the app still builds; the Machine menu then says
 # what is missing instead of reading the mill.
-# Linux the same, with the distribution's libusb. Windows needs neither: it
-# reaches the mill through the USB printer driver (engine/usbprint_win.py).
+# Windows needs neither: it reaches the mill through the USB printer driver
+# (engine/usbprint_win.py).
 binaries = []
-if sys.platform == "darwin" or sys.platform.startswith("linux"):
+if sys.platform.startswith("linux"):
+    # Linux: libusb is part of every desktop install (udev depends on it), so
+    # only the Python side is bundled and the system's libusb is loaded.
+    hiddenimports += ["usb", "usb.core", "usb.backend.libusb1"]
+if sys.platform == "darwin":
     hiddenimports += ["usb", "usb.core", "usb.backend.libusb1"]
     for _lib in (Path("/opt/homebrew/lib/libusb-1.0.0.dylib"),
-                 Path("/usr/local/lib/libusb-1.0.0.dylib"),
-                 Path("/usr/lib/x86_64-linux-gnu/libusb-1.0.so.0"),
-                 Path("/lib/x86_64-linux-gnu/libusb-1.0.so.0"),
-                 Path("/usr/lib64/libusb-1.0.so.0"),
-                 Path("/usr/lib/libusb-1.0.so.0")):
+                 Path("/usr/local/lib/libusb-1.0.0.dylib")):
         if _lib.is_file():
             binaries.append((str(_lib), "."))
             break

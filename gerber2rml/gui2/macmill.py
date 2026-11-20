@@ -1,13 +1,12 @@
-"""The mill's print queue on a Mac or a Linux PC, from inside the app.
+"""The mill's print queue on a Mac, from inside the app.
 
-On Windows the Roland driver installs the mill as a printer. On macOS and
-Linux there is no driver: the mill is a raw CUPS queue named SRM-20
+On Windows the Roland driver installs the mill as a printer. On a Mac there
+is no driver: the mill is a raw CUPS queue named SRM-20
 (:mod:`gerber2rml.engine.rmlspool`). This is what the setup sheet says and
 does about that queue, so nobody has to open a terminal:
 
-* **Machine ▸ Set up the mill on this Mac…** (or "…this computer") makes the
-  queue (the system asks for an admin password in its own dialog, if one is
-  needed).
+* **Machine ▸ Set up the mill on this Mac…** makes the queue (macOS asks for
+  an admin password in its own dialog).
 * **Before a run** (:func:`preflight`): a missing queue is offered for setup,
   a queue CUPS stopped after a failed job is offered for resuming, and jobs
   left over from an earlier run - which would cut before this one - are
@@ -18,18 +17,6 @@ from PySide6.QtWidgets import QApplication
 
 from gerber2rml.engine import rmlspool
 from gerber2rml.gui2 import dialogs
-
-# The same sheets on macOS and Linux - both reach the mill through CUPS -
-# in each one's own words. (The module keeps its name: it was the Mac's.)
-MAC = rmlspool.MACOS
-HERE = "this Mac" if MAC else "this computer"
-OS_ASKS = ("macOS will then ask for an administrator password." if MAC else
-           "If your account may not manage printers, the system then asks "
-           "for an administrator password.")
-BY_HAND = "docs/macos.md" if MAC else "docs/linux.md"
-PRINTERS = ("System Settings ▸ Printers & Scanners" if MAC else
-            "your desktop's printer settings (or http://localhost:631)")
-MENU_LABEL = f"Set up the mill on {HERE}…"
 
 
 def _busy(fn):
@@ -42,11 +29,11 @@ def _busy(fn):
 
 def setup_sheet(parent, run=None):
     """Explain, then make the SRM-20 queue. Returns the queue name or None."""
-    d = dialogs.Sheet(parent, f"Set up the mill on {HERE}", width=560)
+    d = dialogs.Sheet(parent, "Set up the mill on this Mac", width=560)
     d.say("SRM-CAM sends jobs to the SRM-20 through a printer queue named "
-          f"SRM-20. It is made once per {'Mac' if MAC else 'computer'}.")
-    d.say(f"Switch the mill on and plug its USB cable into {HERE} first. "
-          + OS_ASKS, small=True)
+          "SRM-20. It is made once per Mac.")
+    d.say("Switch the mill on and plug its USB cable into this Mac first. "
+          "macOS will then ask for an administrator password.", small=True)
     d.setObjectName("millSetupSheet")
     d.act("Not now", on=d.reject)
     d.act("Set it up", kind="primary", on=d.accept, default=True)
@@ -59,11 +46,11 @@ def setup_sheet(parent, run=None):
         dialogs.report_error(
             parent, "The mill could not be set up", e,
             "Check that the mill is switched on and its USB cable is in, "
-            f"then try again. {BY_HAND} has the commands to do it by "
+            "then try again. docs/macos.md has the commands to do it by "
             "hand.")
         return None
     done = dialogs.Sheet(parent, "The mill is ready", width=520)
-    done.say(f"Jobs now go to the {queue} queue on {HERE}.")
+    done.say(f"Jobs now go to the {queue} queue on this Mac.")
     done.act("Close", kind="primary", on=done.accept, default=True)
     done.exec()
     return queue
@@ -91,7 +78,7 @@ def preflight(parent, printer, run=None):
         st = printer.state()
         if st["exists"] and (st["stopped"] or not st["accepting"]):
             if not _ask(parent, "The SRM-20 queue is paused",
-                        "The system stops a printer queue after a job fails - "
+                        "macOS stops a printer queue after a job fails - "
                         "usually because the mill was off or unplugged. "
                         "Jobs sent now would wait there and never cut. "
                         "Resume it (asks for an administrator password)?",
@@ -111,11 +98,12 @@ def preflight(parent, printer, run=None):
                     parent, "The old jobs could not be cleared",
                     rmlspool.SpoolError("jobs still queued"),
                     "Someone else's jobs need an administrator to remove: "
-                    f"open {PRINTERS}, then the SRM-20 queue, and delete "
-                    "them there.")
+                    "open System Settings ▸ Printers & Scanners ▸ SRM-20 ▸ "
+                    "Open Print Queue and delete them.")
                 return False
     except rmlspool.SpoolError as e:
         dialogs.report_error(parent, "The SRM-20 queue could not be read", e,
-                             f"Check the queue in {PRINTERS}.")
+                             "Check the queue in System Settings ▸ Printers "
+                             "& Scanners.")
         return False
     return True

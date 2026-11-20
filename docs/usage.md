@@ -14,9 +14,8 @@ Windows: load, check, place, level, export. The run plan, the shorts check and
 the double-sided flow are all the same code and produce the same files.
 
 **The machine link runs on Linux too** - Connect, the position readout,
-jogging, probing and the automatic run, with the mill as a CUPS print queue.
-It has not been run at a mill from Linux yet; [linux.md](linux.md) has the
-setup and says what is unproven.
+jogging, probing and the automatic run, with jobs written straight to the
+mill's USB printer node. [linux.md](linux.md) has the one-time setup.
 
 ### Levelling a board you prepared on Linux
 

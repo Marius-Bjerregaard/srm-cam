@@ -284,6 +284,18 @@ def test_the_dot_gives_the_height():
         assert cal.height(dot) == pytest.approx(dz, abs=0.3)
 
 
+def test_a_dim_dot_on_a_cut_line_is_still_found():
+    """At the machine a dot on the stencil's cut outline scored 282-290 over a
+    black background; a fixed 300 called that no dot at all."""
+    import numpy as np
+    cal = _fake_calibration()
+    rgb = np.zeros((1000, 1000, 3), np.uint8)
+    px, py = 50 + 4 * 110, 30 + 4 * 110
+    rgb[py - 2:py + 3, px - 2:px + 3] = (20, 20, 200)     # 200 + 80 = 280
+    dot, _n = cal.find_dot(rgb)
+    assert cal.height(dot) == pytest.approx(0.0, abs=0.3)
+
+
 def test_no_dot_is_a_sentence():
     import numpy as np
     from gerber2rml.engine.xtool_camera import CameraError
@@ -531,7 +543,8 @@ def test_concentric_traces_job_beats_rubout_and_clears_drills():
     lines = con_job.text.split("\r\n")
     assert "G22" in lines and "G0Q30" in lines and "G21" not in lines
     assert any(l.endswith("S1000F36000") for l in lines)
-    assert len(con_job.timeline) == 10
+    # 10 passes, then the edge of the field's 5 more (xtool.EDGE_PASSES).
+    assert len(con_job.timeline) == 10 + xtool.EDGE_PASSES
     # Alternating offset sweep order between round 0 and round 1
     groups, _ = xtool.traces_rings(art, (40.0, 40.0), xtool.DEFAULT_TRACES_RECIPE)
     assert len(groups) == 6

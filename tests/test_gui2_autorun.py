@@ -994,39 +994,6 @@ def test_started_at_rework_boxes_drawn_beforehand_are_there_at_the_check(
     page.nocut_chk.setChecked(False)
 
 
-def test_rework_on_a_single_sided_board_offers_to_find_it_by_its_holes(
-        win, qt_app, monkeypatch):
-    """Put back the day after, a board is not where the stock's edges say:
-    started at Rework it is found by its own holes, and the run is told."""
-    from gerber2rml.engine import mountfid
-    from gerber2rml.gui2.autorun import rework_holes
-    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 0.7)
-    win.select_step("autorun")
-    page = win.autorun_page
-    page._fill_rows()
-    assert page.holes_chk.isHidden() and not page.by_holes()
-    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
-    assert not page.holes_chk.isHidden()
-    holes = rework_holes(win)
-    assert len(holes) >= 2 and page.holes_chk.isEnabled()
-    at = {(round(x, 2), round(y, 2)) for x, y, _d in win.state.board.holes}
-    assert all((round(x, 2), round(y, 2)) in at for x, y, _d in holes)
-    page.holes_chk.setChecked(True)
-    assert page.by_holes()
-    page.holes_chk.setChecked(False)
-    assert not page.by_holes()
-    page.holes_chk.setChecked(True)
-    # No holes the bit drops into: said so, and the run goes by the stock.
-    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 50.0)
-    page._sync_holes_chk()
-    assert not page.holes_chk.isEnabled() and not page.by_holes()
-    # A double-sided board has its reference holes for this already.
-    monkeypatch.setattr(mountfid, "ROOM_FOR_BIT", 0.7)
-    win.action_double_sided(True)
-    page._fill_rows()
-    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
-    page._sync_holes_chk()
-    assert page.holes_chk.isHidden() and not page.by_holes()
 def test_a_laser_board_is_drilled_and_cut_out_only(win, qt_app):
     from gerber2rml.engine import method as fab
     win.link.connect_to("SIM")
@@ -1042,7 +1009,9 @@ def test_a_laser_board_is_drilled_and_cut_out_only(win, qt_app):
     keys = [k for k, _t in page._plan_rows()]
     assert not any("traces" in k for k in keys)
     assert any("drill" in k for k in keys) and any("cutout" in k for k in keys)
-    assert not page.level_chk.isChecked() and not page.check_chk.isEnabled()
+    # Levelling stays on: the drill and the cut-out need the copper's real
+    # height as much as traces do (drums1, 2026-11-19).
+    assert page.level_chk.isChecked() and not page.check_chk.isEnabled()
     assert all("traces" not in str(page.start_box.itemData(i))
                for i in range(page.start_box.count()))
     done = []
@@ -1137,3 +1106,92 @@ def test_the_steps_are_folded_away_under_the_run_in_pro(win, qt_app):
     trav._folds["steps"][0].set_open(True, clicked=True)
     assert workspace.setting("rail/steps_open") == "true"
     workspace.set_setting("rail/steps_open", "false")
+
+
+@pytest.mark.parametrize("mode", ["novice", "pro"])
+def test_the_line_up_tick_is_on_the_run_page_in_both_tiers(win, monkeypatch,
+                                                           mode):
+    """A re-seated sheet is lined up with the board's holes in Novice too."""
+    monkeypatch.setenv("SRM_CAM_MODE", mode)
+    win.select_step("autorun")
+    page = win.autorun_page
+    page.sync_tier()
+    assert not page.realign_chk.isHidden()
+    assert "realign" not in [k for k, _t in page._plan_rows()]
+    page.realign_chk.setChecked(True)
+    keys = [k for k, _t in page._plan_rows()]
+    assert keys.index("stock") < keys.index("realign") < keys.index("level")
+
+
+def test_a_board_without_mounting_holes_lines_up_by_its_drill_holes(win):
+    from gerber2rml.gui2.autorun import WindowSource
+    holes = WindowSource(win, lambda f: f()).realign_holes()
+    assert len(holes) >= 2
+    assert all(d > win.state.drill.bit_diameter for _x, _y, d in holes)
+
+
+def test_the_line_up_result_is_shown_under_the_tick(win):
+    page = win.autorun_page
+    report = {"kind": "the board's 4 mounting holes (3.2 mm)",
+              "shift": (-0.21, 0.35), "turn": -0.26, "worst": 0.021,
+              "mean": 0.012, "found": 4, "used": 3,
+              "holes": [{"n": i} for i in range(1, 5)]}
+    page._on_realigned(report)
+    text = page.realign_lbl.text()
+    assert not page.realign_lbl.isHidden()
+    assert "4 mounting holes (3.2 mm)" in text and "4 of 4 found, 3 used" in text
+    assert "X -0.21, Y +0.35" in text and "-0.26°" in text
+    assert "worst 0.021" in text
+
+
+def test_the_window_says_which_holes_it_lines_up_with(win):
+    from gerber2rml.gui2.autorun import WindowSource
+    src = WindowSource(win, lambda f: f())
+    holes = src.realign_holes()
+    assert src.realign_kind.startswith("%d drill holes (" % len(holes))
+
+
+def test_only_the_oval_holes_drills_just_the_slots(win, qt_app, tmp_path):
+    """Boards milled before SRM-CAM cut slots get their oval holes alone:
+    the drill step, on the slots, lined up on the board (2026-11-19)."""
+    import shutil
+    from gerber2rml.engine.mountfid import _in_slot
+    from gerber2rml.loader import slot_hits
+    page = win.autorun_page
+    # A board with a slot added to its drill data.
+    b = win.state.board
+    b.holes = list(b.holes) + slot_hits(30.0, 30.0, 30.3, 30.0, 1.8)
+    page._sync_slots()
+    assert not page.slots_chk.isHidden()
+    page.slots_chk.setChecked(True)
+    from gerber2rml.gui2.autorun import WindowSource
+    src = WindowSource(win, lambda f: f())
+    src.slots_only = True
+    key = next(s.key for s in win.plan.steps if s.op == "drill")
+    paths, _xy, _pl = src.toolpaths(key)
+    pts = [(m.x, m.y) for p in paths for m in p if m.z < 0]
+    assert pts and all(abs(x - 30.15) < 1.2 and abs(y - 30.0) < 1.2
+                       for x, y in pts)        # only round the slot
+    src.slots_only = False
+    assert len(src.toolpaths(key)[0]) > len(paths)
+
+
+def test_the_oval_holes_tick_is_hidden_without_slots(win):
+    win.autorun_page._sync_slots()
+    assert win.autorun_page.slots_chk.isHidden()
+
+
+def test_the_simulators_stock_leaves_the_bed_with_the_simulator(win, qt_app):
+    """Its stock is turned 1.2 degrees on purpose; drawn on after the
+    simulator was left, it sat skewed over the real mill's board."""
+    win.link.connect_to("SIM")
+    assert _wait(qt_app, win.link.is_connected, 10)
+    win.select_step("autorun")
+    page = win.autorun_page
+    page._draw_sim()
+    assert win.stage._sim_view
+    win.link.disconnect_from("test")
+    assert _wait(qt_app, lambda: not win.link.is_connected(), 10)
+    page._draw_sim()
+    assert not win.stage._sim_view
+    assert not page._sim_timer.isActive()

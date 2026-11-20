@@ -575,11 +575,8 @@ class PutBackBoard(Board):
         super().place(pose, margin_mm)
         self.off = (self.off[0] + self.OFF[0], self.off[1] + self.OFF[1])
 
-    def board_holes(self):
+    def realign_holes(self):
         return [(*self._p(15, 15), 1.6), (*self._p(25, 15), 1.6)]
-
-    def set_turn(self, t):
-        self.turn = t
 
 
 def _cut_then_put_back(**kw):
@@ -598,14 +595,12 @@ def _cut_then_put_back(**kw):
     return was, again, run2, notes
 
 
-def test_a_board_put_back_for_rework_is_found_by_its_own_holes():
-    was, again, run2, notes = _cut_then_put_back(by_holes=True)
+def test_a_board_put_back_for_rework_is_lined_up_with_its_own_holes():
+    was, again, run2, notes = _cut_then_put_back(realign=True)
     with pytest.raises(RunStopped):
         run2.run()
     now = run2.rotation.apply(*again._p(15, 15))
     assert math.dist(now, was) < 0.1         # where it was cut, not 0.86 off
-    assert again.turn is run2.rotation
-    assert any("found by 2 of its holes" in n for n in notes)
 
 
 def test_without_its_holes_a_board_put_back_goes_by_the_stock():
@@ -617,9 +612,9 @@ def test_without_its_holes_a_board_put_back_goes_by_the_stock():
 
 
 def test_a_board_with_no_holes_to_find_it_by_is_not_cut():
-    was, again, run2, notes = _cut_then_put_back(by_holes=True)
-    again.board_holes = lambda: []
-    with pytest.raises(RunFailed, match="no holes it can be found by"):
+    was, again, run2, notes = _cut_then_put_back(realign=True)
+    again.realign_holes = lambda: []
+    with pytest.raises(RunFailed, match="no holes to line it up with"):
         run2.run()
 
 
@@ -762,3 +757,129 @@ def test_one_step_that_is_not_in_the_job_is_refused():
     m, ser, board, log, run = _run(False, level=False, only=["nope"])
     with pytest.raises(RunFailed):
         run.run()
+
+
+def test_a_moved_sheet_is_lined_up_with_its_own_holes():
+    """drums2 (2026-11-19): holes not through, the sheet re-seated, the drill
+    run again. The stock corner alone puts the job a few tenths off; the
+    board's own holes say where it really is."""
+    m, ser, board, log, run = _run(False)
+    assert run.run() is True
+    real = [run.rotation.apply(*board._p(x, y)) for x, y in ((15, 15), (25, 15))]
+
+    # The placement is now 0.6, -0.4 mm off the holes that are there.
+    placed = board.place
+    board.place = lambda pose, margin_mm, flush=None: (
+        placed(pose, margin_mm),
+        setattr(board, "off", (board.off[0] + 0.6, board.off[1] - 0.4)))
+    board.realign_holes = lambda: [(*board._p(15, 15), 1.6),
+                                   (*board._p(25, 15), 1.6)]
+    log2 = Log()
+    again = AutoRun(ser, sm.printer(), board, log2, click_mm=(90, 70),
+                    stock_mm=(100, 80), double=False, runner_opts=FAST,
+                    level=False, only=["drill"], realign=True)
+    assert again.run() is True
+    assert ("realign", "done") in log2.steps
+    for (x, y), want in zip(((15, 15), (25, 15)), real):
+        got = again.rotation.apply(*board._p(x, y))
+        assert math.hypot(got[0] - want[0], got[1] - want[1]) < 0.08
+
+
+def test_realign_refuses_a_board_without_holes_to_find():
+    m, ser, board, log, run = _run(False, level=False, realign=True)
+    sent = []
+    log.job = lambda key, label, prog: sent.append(key)
+    with pytest.raises(RunFailed, match="no holes to line it up with"):
+        run.run()
+    assert sent == []
+
+
+def test_one_misread_hole_of_four_is_left_out(monkeypatch):
+    """drums2, 2026-11-19: holes 1, 3 and 4 agreed to 0.02 mm, hole 2 was
+    read 0.2 mm off; the run refused. Three still check each other."""
+    m, ser, board, log, run = _run(False)
+    run.pose = stockfind.StockPose(30.0, 20.0, 0.0, 100.0, 80.0, -40.0)
+    run.rotation = about(30.0, 20.0, 0.0)
+    holes = [(6.0, 6.0, 3.2), (122.46, 6.0, 3.2), (122.46, 84.36, 3.2),
+             (6.0, 84.36, 3.2)]
+    board.realign_holes = lambda: holes
+    seen = iter([(53.21, 39.93), (169.67, 39.12), (170.02, 117.75),
+                 (53.53, 118.27)])
+    monkeypatch.setattr(run, "_locate", lambda *a, **k: next(seen))
+    notes = []
+    log.note = notes.append
+    t = run._realign()
+    assert any("Hole 2 disagrees" in n for n in notes)
+    assert any("4 of 4 found, 3 used" in n for n in notes)
+    assert any("hole 2 (3.20 mm)" in n and "left out" in n for n in notes)
+    assert math.hypot(*(a - b for a, b in zip(t.apply(6.0, 84.36),
+                                              (53.53, 118.27)))) < 0.03
+
+
+def test_two_bad_holes_of_four_still_stop_the_run(monkeypatch):
+    m, ser, board, log, run = _run(False)
+    run.pose = stockfind.StockPose(30.0, 20.0, 0.0, 100.0, 80.0, -40.0)
+    run.rotation = about(30.0, 20.0, 0.0)
+    board.realign_holes = lambda: [(6.0, 6.0, 3.2), (122.46, 6.0, 3.2),
+                                   (122.46, 84.36, 3.2), (6.0, 84.36, 3.2)]
+    seen = iter([(53.21, 39.93), (169.67, 38.6), (170.6, 117.75),
+                 (53.53, 118.27)])
+    monkeypatch.setattr(run, "_locate", lambda *a, **k: next(seen))
+    with pytest.raises(RunFailed, match="disagree"):
+        run._realign()
+
+
+def test_holes_barely_wider_than_the_bit_are_found_too():
+    """1.0 mm holes round a 0.8 mm bit: 0.1 mm to spare either way."""
+    m, ser, board, log, run = _run(False)
+    small = lambda x, y, r=0.1, z=-1.9: ring(x, y, r, z)   # 2*(0.1+0.4) = 1.0
+    drill = board.toolpaths
+    board.toolpaths = lambda key: (
+        ([small(*board._p(15, 15)), small(*board._p(25, 15)),
+          small(*board._p(5, 25))], 4.0, 1.0) if key == "drill"
+        else drill(key))
+    assert run.run() is True
+    real = [run.rotation.apply(*board._p(x, y))
+            for x, y in ((15, 15), (25, 15), (5, 25))]
+    placed = board.place
+    board.place = lambda pose, margin_mm, flush=None: (
+        placed(pose, margin_mm),
+        setattr(board, "off", (board.off[0] + 0.3, board.off[1] + 0.2)))
+    board.realign_holes = lambda: [(*board._p(15, 15), 1.0),
+                                   (*board._p(25, 15), 1.0),
+                                   (*board._p(5, 25), 1.0)]
+    again = AutoRun(ser, sm.printer(), board, Log(), click_mm=(90, 70),
+                    stock_mm=(100, 80), double=False, runner_opts=FAST,
+                    level=False, only=["drill"], realign=True)
+    assert again.run() is True
+    for (x, y), want in zip(((15, 15), (25, 15), (5, 25)), real):
+        got = again.rotation.apply(*board._p(x, y))
+        assert math.hypot(got[0] - want[0], got[1] - want[1]) < 0.08
+
+
+def test_the_line_up_says_where_the_board_was_and_how_well_it_fits():
+    m, ser, board, log, run = _run(False)
+    assert run.run() is True
+    placed = board.place
+    board.place = lambda pose, margin_mm, flush=None: (
+        placed(pose, margin_mm),
+        setattr(board, "off", (board.off[0] + 0.6, board.off[1] - 0.4)))
+    board.realign_holes = lambda: [(*board._p(15, 15), 1.6),
+                                   (*board._p(25, 15), 1.6)]
+    board.realign_kind = "the board's 2 mounting holes (1.6 mm)"
+    log2, reports, notes = Log(), [], []
+    log2.realigned = reports.append
+    log2.note = notes.append
+    again = AutoRun(ser, sm.printer(), board, log2, click_mm=(90, 70),
+                    stock_mm=(100, 80), double=False, runner_opts=FAST,
+                    level=False, only=["drill"], realign=True)
+    assert again.run() is True
+    (r,) = reports
+    assert r["kind"] == "the board's 2 mounting holes (1.6 mm)"
+    # The job thought the board 0.6, -0.4 mm off where it really is.
+    assert r["shift"][0] == pytest.approx(-0.6, abs=0.08)
+    assert r["shift"][1] == pytest.approx(0.4, abs=0.08)
+    assert r["worst"] < 0.08 and r["used"] == 2
+    assert [h["n"] for h in r["holes"]] == [1, 2]
+    said = [n for n in notes if n.startswith("Lined up with the board's 2")]
+    assert said and "X -0.6" in said[0] and "Fit: worst" in said[0]

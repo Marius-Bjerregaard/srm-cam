@@ -154,10 +154,8 @@ before the run has probed anything.
 - **macOS and Linux**: pyusb and libusb, straight to the device, the system's
   printer driver left in place. Linux's usbfs lets a vendor request past the
   `usblp` driver without claiming the interface; it needs read/write access
-  to the device, which a udev rule gives
-  (`SUBSYSTEM=="usb", ATTR{idVendor}=="0b75", ATTR{idProduct}=="039f",
-  MODE="0666"` in `/etc/udev/rules.d/60-srm20.rules`). Linux has no machine
-  link yet, so there it is the settings sheet only.
+  to the device, which *Machine ▸ Set up USB access…* gives once (a udev
+  rule in `/etc/udev/rules.d/60-srm-cam.rules`, see [linux.md](linux.md)).
 - **Windows**: the Roland driver owns the device and libusb cannot open it
   without replacing that driver, which would take the printer queue with it.
   So the transfers go through the USB printer driver instead

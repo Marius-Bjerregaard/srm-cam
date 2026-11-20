@@ -1,5 +1,7 @@
 """The laser's focus map: where it measures, what it makes of the heights,
 and how a job is split into bands that are each in focus."""
+import math
+
 import pytest
 
 from gerber2rml.engine import laser_focus as lf
@@ -83,6 +85,48 @@ def test_measure_map_walks_the_points_and_ends_idle():
     assert calls == ["P_AUTOFOCUS", "P_IDLE"]
 
 
+def test_a_point_without_a_dot_is_left_out_not_the_whole_map():
+    from gerber2rml.engine.xtool_camera import CameraError
+    calls = []
+
+    class Laser:
+        def _json(self, method, path, body=None):
+            calls.append(body["state"])
+
+        def z(self):
+            return 12.0
+
+        def measure(self, cal, at):
+            if at == (20, 10):
+                raise CameraError("No dot in the photo")
+            return 0.1
+
+    m = lf.measure_map(Laser(), None, [(10, 10), (20, 10), (30, 10), (40, 10)])
+    assert [p[:2] for p in m.points] == [(10, 10), (30, 10), (40, 10)]
+    assert m.skipped == [(20.0, 10.0)] and calls == ["P_AUTOFOCUS", "P_IDLE"]
+    assert "1 left out" in lf.describe(m, lf.plan_zones([[(10, 10)]], m))
+
+
+def test_a_map_with_too_few_points_read_fails():
+    import pytest
+    from gerber2rml.engine.xtool_camera import CameraError
+
+    class Laser:
+        def _json(self, method, path, body=None):
+            pass
+
+        def z(self):
+            return 12.0
+
+        def measure(self, cal, at):
+            if at != (10, 10):
+                raise CameraError("No dot in the photo")
+            return 0.0
+
+    with pytest.raises(CameraError, match="Only 1 of 3"):
+        lf.measure_map(Laser(), None, [(10, 10), (20, 10), (30, 10)])
+
+
 def test_zone_indices_keep_every_shape_once():
     m = lf.FocusMap([(0, 0, 0.0), (200, 0, 0.8)])
     centres = [(x, 0) for x in range(0, 201, 20)]
@@ -147,7 +191,7 @@ def test_run_zoned_without_a_map_just_runs():
 
 
 def test_the_laser_page_runs_a_tilted_board_in_bands(qt_app, monkeypatch):
-    """A mask job over a board tilted 0.6 mm across: the page runs it in
+    """A mask job over a board tilted 1.2 mm across: the page runs it in
     bands, each at its own height, and every shape once."""
     import time
     from shapely.geometry import box
@@ -183,8 +227,8 @@ def test_the_laser_page_runs_a_tilted_board_in_bands(qt_app, monkeypatch):
     d.photo_after.setChecked(False)
     x0, y0, x1, y1 = __import__(
         "gerber2rml.gui2.laser_focus_ui", fromlist=["x"]).job_bounds(d)
-    d._focus_map = lf.FocusMap([(x0, y0, 0.0), (x1, y0, 0.6),
-                                (x0, y1, 0.0), (x1, y1, 0.6)], z=10.0)
+    d._focus_map = lf.FocusMap([(x0, y0, 0.0), (x1, y0, 1.2),
+                                (x0, y1, 0.0), (x1, y1, 1.2)], z=10.0)
     d._fill()
     t0 = time.time()
     while d._worker_running() and time.time() - t0 < 20:
@@ -194,7 +238,7 @@ def test_the_laser_page_runs_a_tilted_board_in_bands(qt_app, monkeypatch):
     zs = [e[1] for e in log if e[0] == "z"]
     assert len(runs) >= 2, log
     assert zs[-1] == 10.0                       # back where it was measured
-    assert min(zs[:-1]) < 10.2 and max(zs[:-1]) > 10.4
+    assert min(zs[:-1]) < 10.4 and max(zs[:-1]) > 10.8
     d.close()
 
 
@@ -255,3 +299,150 @@ def test_the_focus_moves_with_the_design(qt_app, monkeypatch):
     d.rotate(1)                           # a quarter turn clockwise
     assert d.focus_point() == (80, 110)   # right of the middle -> below it
     d.close()
+
+
+def test_bands_follow_the_surface_not_each_regions_middle():
+    """A board tilted up the bed: the isolation round its edge is one region
+    centred in the middle, but its front and back must run at their own
+    heights. The bands split the area by height and cover it once."""
+    m = lf.FocusMap([(0, 0, -1.2), (100, 0, -1.2), (0, 100, 1.2),
+                     (100, 100, 1.2), (50, 50, 0.0)])
+    bands = lf.band_boxes(m, (0, 0, 100, 100))
+    assert len(bands) >= 4
+    dzs = [dz for dz, _b in bands]
+    assert dzs == sorted(dzs) and dzs[0] < -0.8 and dzs[-1] > 0.8
+    area = sum((x1 - x0) * (y1 - y0) for _dz, bx in bands for x0, y0, x1, y1 in bx)
+    assert area == pytest.approx(102 * 102)
+    front = [b for dz, bx in bands if dz < -0.8 for b in bx]
+    assert max(b[3] for b in front) < 50
+
+
+def test_a_flat_map_is_one_band():
+    m = lf.FocusMap([(0, 0, 0.05), (100, 100, -0.05)])
+    assert len(lf.band_boxes(m, (0, 0, 100, 100))) == 1
+
+
+def test_the_machines_slope_is_taken_off_and_a_real_tilt_kept():
+    """On a flat sheet the dot read a slope up the bed; measured once as the
+    reference, it comes off later maps, and only what is really there stays."""
+    slope = lambda y: (y - 110) * 0.014
+    flat = lf.FocusMap([(x, y, slope(y) + 0.3) for x in (40, 110, 180)
+                        for y in (80, 110, 160)], z=19.0)
+    ref = lf.reference_from(flat)
+    assert ref.at(110, 110) == pytest.approx(0.0)
+    tilted = lf.FocusMap([(x, y, slope(y) + 0.005 * (x - 110)) for x in (40, 110, 180)
+                          for y in (80, 110, 160)], z=19.0, skipped=[(1.0, 2.0)])
+    got = lf.corrected(tilted, ref)
+    for x, y, dz in got.points:
+        assert dz == pytest.approx(0.005 * (x - 110), abs=1e-9)
+    assert got.skipped == [(1.0, 2.0)] and got.z == 19.0
+    assert lf.corrected(tilted, None) is tilted
+
+
+def test_the_reference_knows_where_it_was_measured():
+    ref = lf.FocusMap([(40, 80, 0.0), (180, 160, 0.0), (110, 110, 0.0)])
+    assert lf.reference_covers(ref, (39, 76, 179, 160))
+    assert not lf.reference_covers(ref, (0, 0, 220, 220))
+    assert not lf.reference_covers(None, (39, 76, 179, 160))
+
+
+def _square(x, y, r):
+    return [(x - r, y - r), (x + r, y - r), (x + r, y + r), (x - r, y + r)]
+
+
+def test_a_focus_map_point_never_lands_in_a_hole():
+    """A student's map put a point in a mounting hole: the dot read the
+    hole's depth as the surface and the whole map went off."""
+    board = [(40, 40), (120, 40), (120, 100), (40, 100)]
+    hole = _square(70, 70, 1.6)                    # a 3.2 mm mounting hole
+    safe = lf.safe_area([board], [hole])
+    moved = []
+    pts = lf.grid_points((40, 40, 120, 100), safe=safe, moved=moved)
+    for x, y in pts:
+        assert math.hypot(x - 70, y - 70) > 1.6 + lf.HOLE_CLEAR_MM
+        assert 40 + lf.EDGE_CLEAR_MM <= x <= 120 - lf.EDGE_CLEAR_MM
+        assert x % 10 == 0 and y % 10 == 0         # still the factory grid
+    assert (70, 70) not in pts                      # the middle was the hole
+    assert any(was == (70.0, 70.0) and now for was, now in moved)
+
+
+def test_without_holes_the_points_are_as_before():
+    board = [(40, 40), (120, 40), (120, 100), (40, 100)]
+    plain = lf.grid_points((40, 40, 120, 100))
+    safe = lf.grid_points((40, 40, 120, 100),
+                          safe=lf.safe_area([board], []))
+    assert set(safe) <= set(plain) | set(safe)
+    assert len(safe) >= lf.MIN_POINTS
+
+
+def test_the_autofocus_cross_moves_off_a_hole(qt_app, monkeypatch):
+    d = _page(qt_app, monkeypatch)
+    cx, cy = d.focus_point()                 # a hole right under the cross
+    holes = [_square(cx, cy, 1.6)]
+    monkeypatch.setattr(d, "_hole_paths", lambda *a, **k: holes)
+    d._focus_dropped(cx, cy)
+    fx, fy = d.focus_point()
+    from shapely.geometry import Point, Polygon
+    assert not Polygon(holes[0]).buffer(lf.HOLE_CLEAR_MM).contains(Point(fx, fy))
+    assert fx % 10 == 0 and fy % 10 == 0
+    d.close()
+
+
+def test_the_focus_map_spacing_changes_the_points(qt_app, monkeypatch):
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    d = _page(qt_app, monkeypatch)
+    few, _ = lfu.plan(d, spacing=60.0, inset=3.0)
+    many, _ = lfu.plan(d, spacing=10.0, inset=3.0)
+    assert len(many) > len(few) >= 2
+    d.close()
+
+
+def test_the_bed_can_be_looked_round_while_the_laser_runs(qt_app, monkeypatch):
+    """While a job runs the bed zooms and pans; nothing changes the job."""
+    from PySide6.QtCore import QPoint, QPointF, Qt
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+    d = _page(qt_app, monkeypatch)
+    d.resize(1400, 900)
+    d.show()
+    qt_app.processEvents()
+    d._busy(True)
+    v = d.view
+    assert v.isEnabled() and v.locked
+    before = v.transform().m11()
+    e = QWheelEvent(QPointF(50, 50), QPointF(v.mapToGlobal(QPoint(50, 50))),
+                    QPoint(0, 0), QPoint(0, 120), Qt.NoButton, Qt.NoModifier,
+                    Qt.NoScrollPhase, False)
+    QApplication.sendEvent(v.viewport(), e)
+    assert v.transform().m11() > before          # zoomed
+    nudged, menus = [], []
+    v.nudge.connect(lambda *a: nudged.append(a))
+    v.context.connect(lambda *a: menus.append(a))
+    x = d.x.value()
+    QTest.keyClick(v, Qt.Key_Left)
+    assert nudged == [] and d.x.value() == x     # the job stays put
+    d._busy(False)
+    assert not v.locked
+    QTest.keyClick(v, Qt.Key_Left)
+    assert nudged                                # and moves again after
+    d.close()
+
+
+def test_the_machines_correction_is_built_in(qt_app, monkeypatch):
+    """The lab F1 Ultra's own error ships with the app: a new PC need not
+    measure it (2026-11-19)."""
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    from gerber2rml.gui2 import stencil_laser as sl
+    monkeypatch.setattr(sl, "_SETTINGS", ("SRM-CAM-tests", "laser-builtin-ref"))
+    lfu.save_reference(None)
+    ref = lfu.load_reference()
+    assert ref is not None and len(ref.points) >= 20
+    assert lfu.reference_is_builtin()
+    assert lfu.reference_status().startswith("Built in")
+    assert abs(ref.at(*lf.REFERENCE_CENTRE)) < 0.05      # 0 at the middle
+    mine = lf.FocusMap([(100, 100, 0.0), (120, 100, 0.2), (100, 120, 0.1)], 18.0)
+    lfu.save_reference(mine)
+    assert not lfu.reference_is_builtin()
+    assert len(lfu.load_reference().points) == 3          # this PC's wins
+    lfu.save_reference(None)

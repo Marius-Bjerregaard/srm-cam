@@ -37,7 +37,6 @@ def _job(win, tmp_path):
     shutil.copytree(FIXT, src)
     win.load_folder(str(src))
     win.action_double_sided(True)
-    win.state.set_placement(31.0, 22.0)
     win.state.trace.cut_depth = 0.17
     win._top_fit = Transform(theta=0.01, scale=1.0, tx=0.3, ty=-0.2)
     win._fid_measured = [(10.0, 11.0), None]
@@ -45,10 +44,12 @@ def _job(win, tmp_path):
     page.w_spin.setValue(123.0)
     page.h_spin.setValue(97.0)
     page.level_margin_spin.setValue(7.5)
-    page.centre_chk.setChecked(True)
+    page.centre_chk.setChecked(False)   # Centre on would place it itself
     page._nogo = [(5.0, 6.0, 15.0, 16.0), (80.0, 12.0, 26.0)]   # box, clamp
     page._save_nogo()
     workspace.set_setting("autorun/surface_z", "-41.250")
+    # Last: ticking Centre puts the board in the middle of the sheet.
+    win.state.set_placement(31.0, 22.0)
     return src
 
 
@@ -73,7 +74,6 @@ def test_a_project_holds_the_gerbers_and_opens_without_the_folder(
     page.w_spin.setValue(50.0)
     page.h_spin.setValue(50.0)
     page.level_margin_spin.setValue(2.0)
-    page.centre_chk.setChecked(False)
     workspace.set_setting("autorun/surface_z", "")
     win._top_fit = None
     win.action_double_sided(False)
@@ -91,7 +91,7 @@ def test_a_project_holds_the_gerbers_and_opens_without_the_folder(
     assert win._fid_measured == [(10.0, 11.0), None]
     assert (page.w_spin.value(), page.h_spin.value()) == (123.0, 97.0)
     assert page.level_margin_spin.value() == 7.5
-    assert page.centre_chk.isChecked()
+    assert not page.centre_chk.isChecked()
     assert page._nogo == [(5.0, 6.0, 15.0, 16.0), (80.0, 12.0, 26.0)]
     assert float(workspace.setting("autorun/surface_z")) == -41.25
 

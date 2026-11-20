@@ -24,7 +24,8 @@ the SRM-20. Same code as Windows and Linux; the macOS patch lives on the
 | `kicad-plugin/` | **Send to SRM-CAM** and **Set design rules for SRM-CAM** (plugin 1.5.0) |
 | `packaging/` | `build-macos.sh` (app, DMG, signing, notarising), `update-macos.sh`, entitlements |
 
-Linux has the link too, over the same CUPS queue: see [linux.md](linux.md).
+Linux has the link too, with the mill as a USB printer node instead of a CUPS
+queue: see [linux.md](linux.md).
 
 ## Install (from source)
 
