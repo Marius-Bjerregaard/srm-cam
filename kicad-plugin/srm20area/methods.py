@@ -174,6 +174,32 @@ def describe(op, zone_names=()):
     return "%s %s %s -> %.2f mm" % (where, label, old_s, new)
 
 
+def not_kept(after, ops, zone_names=()):
+    """The operations of :func:`plan` that the board does not show after
+    they were carried out (``after`` is ``rules.read_current`` read again),
+    as lines. A rule written and then not there is what the board will be
+    drawn and checked with - said, not taken on trust."""
+    out = []
+    for op in ops:
+        target, key, _old, new = op
+        if target == "board":
+            got = after.get("board", {}).get(key)
+        elif target == "zone_defaults":
+            if "zone_defaults" not in after:
+                continue            # an older KiCad cannot read them back
+            got = after["zone_defaults"].get(key)
+        elif target[0] == "class":
+            got = after.get("classes", {}).get(target[1], {}).get(key)
+        else:
+            zones = after.get("zones", [])
+            got = zones[target[1]].get(key) if target[1] < len(zones) else None
+        if not _same(got, new):
+            out.append("%s, but it reads %s" % (
+                describe(op, zone_names),
+                "unset" if got is None else "%.2f mm" % got))
+    return out
+
+
 def too_tight(current, wanted):
     """What a board asks for that its method cannot make, as lines. Empty when
     every gap is at least the method's floor and no hole is under the drill.
@@ -182,7 +208,9 @@ def too_tight(current, wanted):
     out = []
     b = current.get("board", {})
     if b.get("floor") is not None and b["floor"] < floor - 0.0005:
-        out.append("Board minimum clearance: %.2f mm" % b["floor"])
+        out.append("Board minimum clearance: %s" % (
+            "%.2f mm" % b["floor"] if b["floor"] > 0.0005 else
+            "not set (0 mm) - nothing stops a gap the bit cannot cut"))
     for name, c in current.get("classes", {}).items():
         if c.get("clearance") is not None and c["clearance"] < floor - 0.0005:
             out.append("Net class %s clearance: %.2f mm" % (name, c["clearance"]))

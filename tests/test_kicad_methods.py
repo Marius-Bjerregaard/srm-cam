@@ -252,3 +252,35 @@ def test_a_guessed_laser_board_passes_the_laser_check_and_fails_the_mill():
     guess = M.guess_from_rules(board, 0.8)
     assert M.too_tight(board, M.defaults(guess, 0.8)) == []
     assert M.too_tight(board, M.defaults("mill_flat", 0.8))
+
+
+def test_rules_kicad_did_not_keep_are_said():
+    """Set, then read back: a rule the board does not show after Apply is
+    what KiCad will draw and check with, and was taken on trust."""
+    before = _board(floor=0.8, clearance=0.85, track=1.0)
+    ops = M.plan(before, M.defaults("mill_ball", 0.8))
+    kept = _board(floor=0.44, clearance=0.5, track=0.5, pour=0.5,
+                  thermal=0.5)
+    assert M.not_kept(kept, [op for op in ops if op[0] != "zone_defaults"]) \
+        == []
+    lost = _board(floor=0.0, clearance=0.5, track=0.5)
+    lines = M.not_kept(lost, ops)
+    assert any("minimum clearance" in ln and "reads 0.00 mm" in ln
+               for ln in lines)
+
+
+def test_an_unset_board_minimum_is_said_as_unset():
+    lines = M.too_tight(_board(floor=0.0), M.defaults("mill_ball", 0.8))
+    assert any("not set" in ln for ln in lines)
+
+
+def test_board_setup_is_found_by_its_label():
+    path = kicadplugin.bundled_source() / "srm20area" / "board_setup.py"
+    spec = importlib.util.spec_from_file_location("_srm20area_bs", path)
+    bs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bs)              # no wx needed to load it
+    for label in ("Board Setup...", "&Board Setup…", "Board Setup",
+                  "Board Setup...\tCtrl+Shift+B"):
+        assert bs.is_board_setup(label), label
+    for label in ("Board Setup Wizard", "Page Settings...", "", None):
+        assert not bs.is_board_setup(label), label
