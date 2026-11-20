@@ -516,3 +516,62 @@ def test_double_sided_export_writes_no_dry_run(tmp_path):
     assert not any("airpass" in pp.name for pp in written)
     rp = (tmp_path / "ds_runplan.txt").read_text(encoding="utf-8")
     assert "DRY RUN" not in rp
+
+
+# An L-shaped board: 40 x 10 mm foot, 20 x 30 mm leg on its left. Not
+# symmetric about either flip axis, so the bottom and top frames of its
+# outline are different places.
+_L_EDGE = """%FSLAX46Y46*%
+%MOMM*%
+%ADD10C,0.100000*%
+D10*
+X0Y0D02*
+X40000000Y0D01*
+X40000000Y10000000D01*
+X20000000Y10000000D01*
+X20000000Y30000000D01*
+X0Y30000000D01*
+X0Y0D01*
+M02*
+"""
+_L_CU = """%FSLAX46Y46*%
+%MOMM*%
+%ADD10C,0.300000*%
+D10*
+X5000000Y5000000D02*
+X35000000Y5000000D01*
+M02*
+"""
+
+
+def test_double_sided_cutout_is_cut_in_the_top_frame(tmp_path):
+    """The cut-out runs LAST, after the flip. The export wrote it from the
+    BOTTOM-frame outline (2026-11 review): on an L-shaped board that cut
+    straight through the flipped board. It must be the top-frame outline,
+    the one build_top_cutout and the autonomous run cut."""
+    from shapely.geometry import Point
+    from gerber2rml.doublesided import build_double_sided
+    from gerber2rml.engine.gcode_parse import parse_file
+    board = tmp_path / "board"
+    board.mkdir()
+    (board / "l-Edge_Cuts.gbr").write_text(_L_EDGE)
+    (board / "l-B_Cu.gbr").write_text(_L_CU)
+    (board / "l-F_Cu.gbr").write_text(_L_CU)
+    out = tmp_path / "out"
+    level = lambda x, y: -0.05            # would show up in the cut depths
+    build_double_sided(board, out, name="l", level=level, lead_in=False)
+    lay = layout_double_sided(board)
+    assert not lay.outline.equals(lay.top_outline)      # really asymmetric
+    pts = [(m.x, m.y) for path in parse_file(out / "l_cutout.nc")
+           for m in path if not m.rapid and m.z < 0]
+    assert pts
+    # Every cut point sits just outside the TOP outline (half a bit away)...
+    assert all(lay.top_outline.exterior.distance(Point(p)) < 1.5 for p in pts)
+    assert not any(lay.top_outline.buffer(-0.2).contains(Point(p))
+                   for p in pts)
+    # ...and none of the bottom height map's -0.05 is in it: the top face
+    # was never probed.
+    depths = {round(m.z, 3) for path in parse_file(out / "l_cutout.nc")
+              for m in path if m.z < 0}
+    from gerber2rml.config import CutoutJob
+    assert min(depths) >= -CutoutJob().total_depth - 1e-6
