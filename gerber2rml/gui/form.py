@@ -66,7 +66,7 @@ _RANGES = {
     "target_width": (0.05, 6.0), "cut_depth": (0.001, 10.0),
     "total_depth": (0.001, 60.0), "travel_z": (0.1, 40.0),
     "tab_width": (0.1, 20.0), "peck_retract": (0.05, 10.0),
-    "xy_feed": (0.1, 60.0), "plunge_feed": (0.1, 60.0),
+    "xy_feed": (0.1, 30.0), "plunge_feed": (0.1, 30.0),   # SRM-20: 1800 mm/min
     "included_angle": (5.0, 180.0), "stepover": (0.05, 1.0),
 }
 

@@ -289,6 +289,10 @@ def _place(gx0, gy0, gx1, gy1, spec):
     fn = _place_grid if spec.mode == "grid" else _place_fresh
     if _axis_of(spec) == "vertical":
         return fn(gx0, gy0, gx1, gy1, spec)
+    # The grid's pitches are transposed with the box: in transposed space
+    # "x" is the bed's Y. Left as they were, a grid that is not square put
+    # the left/right dowels between its holes (2026-11 review).
+    spec = replace(spec, pitch_x=spec.pitch_y, pitch_y=spec.pitch_x)
     align_t, axis_t, dxt, dyt = fn(gy0, gx0, gy1, gx1, spec)
     align = [(y, x, d) for (x, y, d) in align_t]
     return align, axis_t, dyt, dxt    # flip_pos is now a y; dx/dy swap back
@@ -484,8 +488,8 @@ def build_double_sided(folder, out_dir, name, trace=None, drill=None, cutout=Non
 
     ``level`` (optional) is a height-map callable ``hmap(x, y) -> dz`` measured in
     the BOTTOM-side machine frame. It warps the Z of the operations cut in that
-    setup — the dowel/align holes, bottom drill, bottom traces and the cut-out —
-    but NOT the top traces, which are milled after the flip on the other face
+    setup — the dowel/align holes, bottom drill and bottom traces — but NOT the
+    top traces or the cut-out, which are milled after the flip on the other face
     (that surface isn't the one we probed; it would need a second probe pass).
     """
     name = clean_name(name)
@@ -537,13 +541,18 @@ def build_double_sided(folder, out_dir, name, trace=None, drill=None, cutout=Non
     _write(f"{name}_top_traces{ext}",
            _leadin(isolate(lay.top_copper, trace, outline=top_outline)),
            trace, leveled=False)
+    # The cut-out runs LAST, after the flip (the run plan says so, and the
+    # autonomous run and build_top_cutout cut it so): top frame, and not on
+    # the bottom face's height map. Until 2026-11 this wrote the bottom-frame
+    # outline, which is the same place only on a board symmetric about the
+    # flip axis; on an L-shaped board the file cut through the board itself.
     _write(f"{name}_cutout{ext}",
-           _leadin(cut_outline(lay.outline, cutout)), cutout, leveled=True)
+           _leadin(cut_outline(top_outline, cutout)), cutout, leveled=False)
 
     drill_step = _drill_runplan_line(bottom_drill_files, drill)
     level_block = ("Bed leveling applied to the BOTTOM-side jobs (align, drill, "
-                   "bottom traces, cut-out); top traces are NOT leveled (cut after "
-                   "the flip).\n" if level is not None else "")
+                   "bottom traces); top traces and the cut-out are NOT leveled "
+                   "(cut after the flip).\n" if level is not None else "")
     est_block = (level_block
                  + "Estimated run time (excludes tool changes, spin-up and pauses):\n"
                  + "".join(f"   {fn}: ~{format_duration(est[fn])}\n"

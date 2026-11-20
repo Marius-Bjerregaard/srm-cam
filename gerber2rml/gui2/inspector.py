@@ -1425,7 +1425,7 @@ class StepPage(Page):
 
         speed = widgets.Disclosure("Feeds and lift height", key="feeds")
         speed.add(widgets.Field(
-            "Across the copper", num(job.xy_feed, 0.2, 40.0, 0.5, 1,
+            "Across the copper", num(job.xy_feed, 0.2, 30.0, 0.5, 1,
                                      lambda v: self._set(job, "xy_feed", v),
                                      suffix=" mm/s")))
         speed.add(widgets.Field(

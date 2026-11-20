@@ -9,5 +9,5 @@ Board mirrored for bottom-up milling: True.
 Estimated run time (excludes tool changes, spin-up and pauses):
    golden_gcode_drill.nc: ~2m 17s
    golden_gcode_traces.nc: ~14m 49s
-   golden_gcode_cutout.nc: ~5m 31s
-   TOTAL: ~22m 37s
+   golden_gcode_cutout.nc: ~5m 37s
+   TOTAL: ~22m 43s

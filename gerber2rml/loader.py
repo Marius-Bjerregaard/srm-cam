@@ -115,9 +115,12 @@ but is a generator — not a list.  Prefer _drill_layers for indexed access.
 
 ### Units
 
-All coordinates from LayerStack.open() are in millimetres by default
-(gerbonara normalises units on parse).  ExcellonFile coordinates are also
-normalised to mm.  No manual unit conversion is needed.
+gerbonara does NOT normalise units: every object (and its aperture or drill
+tool) stays in the unit of the file it came from. A KiCad plot is in mm by
+default, but its drill dialog offers inches, and a hand-edited or older
+plot may be in inches throughout. Every object read here therefore goes
+through :func:`_in_mm` first, apertures through :func:`_ap_mm`, and regions
+through ``to_primitives(MM)``; see those for why.
 """
 
 from __future__ import annotations
@@ -135,6 +138,7 @@ from gerbonara.apertures import (
     ObroundAperture,
     RectangleAperture,
 )
+from gerbonara.utils import MM
 from shapely import set_precision
 from shapely.affinity import scale, translate as _translate
 from shapely.strtree import STRtree
@@ -174,15 +178,40 @@ class Board:
 # Aperture → shapely helpers
 # ---------------------------------------------------------------------------
 
+def _in_mm(obj):
+    """The gerbonara object with its coordinates in mm.
+
+    gerbonara keeps every object in its own file's unit. Until 2026-11 this
+    module read ``x``/``y`` straight off the objects, so an inch drill file
+    (KiCad's drill dialog offers inches) put every hole at 1/25.4 of its
+    place, piled up in the board's corner, and an inch Gerber shrank the
+    whole board the same way. ``converted`` leaves the aperture alone, so its
+    sizes go through :func:`_ap_mm`. An object already in mm is returned as
+    it is, so a mm board loads exactly as before.
+    """
+    unit = getattr(obj, "unit", None)
+    if unit is None or unit == MM:
+        return obj
+    return obj.converted(MM)
+
+
+def _ap_mm(ap, value):
+    """An aperture's (or drill tool's) size ``value`` in mm: apertures keep
+    their file's unit even when the object using them was converted."""
+    return MM.convert_from(getattr(ap, "unit", None), value)
+
+
 def _circle_aperture(flash) -> object:
     """CircleAperture Flash → filled circle."""
-    return Point(flash.x, flash.y).buffer(flash.aperture.diameter / 2)
+    return Point(flash.x, flash.y).buffer(
+        _ap_mm(flash.aperture, flash.aperture.diameter) / 2)
 
 
 def _rect_aperture(flash) -> object:
     """RectangleAperture Flash → axis-aligned box."""
     x, y = flash.x, flash.y
-    w, h = flash.aperture.w, flash.aperture.h
+    w = _ap_mm(flash.aperture, flash.aperture.w)
+    h = _ap_mm(flash.aperture, flash.aperture.h)
     return box(x - w / 2, y - h / 2, x + w / 2, y + h / 2)
 
 
@@ -243,7 +272,8 @@ def _obround_aperture(flash) -> object:
         except Exception:
             pass
     x, y = flash.x, flash.y
-    w, h = flash.aperture.w, flash.aperture.h
+    w = _ap_mm(flash.aperture, flash.aperture.w)
+    h = _ap_mm(flash.aperture, flash.aperture.h)
     return box(x - w / 2, y - h / 2, x + w / 2, y + h / 2)
 
 
@@ -281,6 +311,7 @@ def _copper_nets(layer, copper):
         attrs = getattr(obj, "attrs", None)
         if not isinstance(attrs, dict):
             continue
+        obj = _in_mm(obj)
         name = attrs.get(".N")
         name = name[0] if isinstance(name, (tuple, list)) and name else name
         if not name or name == "N/C":
@@ -344,11 +375,25 @@ def _copper_to_shapely(b_cu_layer) -> object:
 
     for obj in b_cu_layer.objects:
         obj_type = type(obj).__name__
+        if obj_type != 'Region':         # a region converts itself, below
+            obj = _in_mm(obj)
 
         if obj_type == 'Line':
-            width = obj.aperture.diameter
+            width = _ap_mm(obj.aperture, obj.aperture.diameter)
             ls = LineString([(obj.x1, obj.y1), (obj.x2, obj.y2)])
             shapes.append(ls.buffer(width / 2, cap_style="round"))
+
+        elif obj_type == 'Arc':
+            # A curved track (KiCad 6+ draws them as G02/G03). These were
+            # skipped until 2026-11, so the copper under a curve was simply
+            # not there and the isolation pass cut straight across the track.
+            # The flattened arc is stroked like a Line.
+            width = _ap_mm(obj.aperture, obj.aperture.diameter)
+            segs = obj.approximate(max_error=_ARC_TOLERANCE, unit=MM)
+            if not segs:
+                continue
+            pts = [(segs[0].x1, segs[0].y1)] + [(g.x2, g.y2) for g in segs]
+            shapes.append(LineString(pts).buffer(width / 2, cap_style="round"))
 
         elif obj_type == 'Flash':
             geom = _flash_to_shapely(obj)
@@ -356,13 +401,23 @@ def _copper_to_shapely(b_cu_layer) -> object:
                 shapes.append(geom)
 
         elif obj_type == 'Region':
-            pts = list(obj.outline)
+            # to_primitives converts the outline AND the arc centres to mm
+            # (Region.converted cannot: it is not a dataclass). A region
+            # whose edge has arcs - a pour around a curved board edge - is
+            # flattened along the arcs; Polygon(outline) alone would join
+            # their end points with straight chords.
+            arc_poly = next(iter(obj.to_primitives(MM)), None)
+            if arc_poly is None:
+                continue
+            if any(c and c[0] is not None for c in arc_poly.arc_centers):
+                arc_poly = arc_poly.approximate_arcs(max_error=_ARC_TOLERANCE)
+            pts = list(arc_poly.outline)
             if len(pts) < 3:
                 continue
             poly = Polygon(pts).buffer(0)
             shapes.append(poly)
 
-        # Arc and other types not seen in the fixture — skip silently.
+        # Other types (none known in a copper layer) are skipped.
 
     if not shapes:
         return Point(0, 0).buffer(0)  # empty geometry
@@ -390,6 +445,8 @@ def _outline_to_shapely(outline_layer) -> object:
     edge_lines = []
     for obj in outline_layer.objects:
         t = type(obj).__name__
+        if t in ('Line', 'Arc'):
+            obj = _in_mm(obj)
         if t == 'Line':
             edge_lines.append(LineString([(obj.x1, obj.y1), (obj.x2, obj.y2)]))
         elif t == 'Arc':
@@ -453,12 +510,34 @@ def slot_hits(x1, y1, x2, y2, width):
             for k in range(n + 1)]
 
 
+_DRILL_SUFFIXES = ("-PTH", "-NPTH", "_PTH", "_NPTH")
+
+
+def layer_stem(path):
+    """The board name a KiCad plot file carries: ``buck-B_Cu.gbr`` ->
+    ``buck``, ``buck-PTH.drl`` -> ``buck``; a Protel-style ``buck.gbl`` is
+    its plain stem."""
+    name = Path(path).stem
+    for sep in ("-B_Cu", "-F_Cu", "-Edge_Cuts") + _DRILL_SUFFIXES:
+        if name.upper().endswith(sep.upper()):
+            return name[:-len(sep)]
+    return name
+
+
 def select_drill_holes(
     folder: Path | str,
     outline=None,
     margin: float = 1.0,
+    stem: str | None = None,
 ) -> List[HoleTuple]:
     """Read drill hits from a Gerber folder with robust file selection.
+
+    With ``stem`` (the board's name, see :func:`layer_stem`) only that
+    board's drill files are read. Two boards plotted into one folder used to
+    get each other's holes: the copper came from one board's files and the
+    holes from every ``.drl`` there, and the other board's holes inside this
+    one's outline were drilled through its tracks. When no drill file
+    carries the name (renamed by hand), all of them are read, as before.
 
     Preference order:
     1. KiCad split files (``*-PTH.drl`` / ``*-NPTH.drl`` or ``*_PTH.drl`` /
@@ -471,9 +550,13 @@ def select_drill_holes(
     """
     folder = Path(folder)
     drl = sorted(folder.glob("*.drl"))
+    if stem:
+        mine = [p for p in drl
+                if layer_stem(p).lower() == str(stem).lower()]
+        drl = mine or drl
     split = [
         p for p in drl
-        if p.stem.upper().endswith(("-PTH", "-NPTH", "_PTH", "_NPTH"))
+        if p.stem.upper().endswith(_DRILL_SUFFIXES)
     ]
     sources = split if split else drl
 
@@ -481,13 +564,18 @@ def select_drill_holes(
     for p in sources:
         ex = ExcellonFile.open(str(p))
         for o in ex.objects:
-            if type(o).__name__ == "Flash":
-                holes.append((o.x, o.y, getattr(o.aperture, "diameter", 0) or 0))
-            elif type(o).__name__ == "Line":
+            kind = type(o).__name__
+            if kind not in ("Flash", "Line"):
+                continue
+            # An inch drill file stays in inches in gerbonara: see _in_mm.
+            o = _in_mm(o)
+            dia = _ap_mm(o.aperture, getattr(o.aperture, "diameter", 0) or 0)
+            if kind == "Flash":
+                holes.append((o.x, o.y, dia))
+            else:
                 # A routed slot (KiCad writes oval holes as G85): a row of
                 # overlapping hits along its line, which cut the oval.
-                holes.extend(slot_hits(o.x1, o.y1, o.x2, o.y2,
-                                       getattr(o.aperture, "diameter", 0) or 0))
+                holes.extend(slot_hits(o.x1, o.y1, o.x2, o.y2, dia))
 
     # Deduplicate
     seen: set = set()
@@ -624,7 +712,10 @@ def load_board(folder: Path | str, *, mirror: bool = True) -> Board:
     # select_drill_holes prefers KiCad split (-PTH/-NPTH) files over a stale
     # combined <name>.drl, deduplicates, and filters to the raw (pre-mirror)
     # outline so phantom holes from mis-matched origins are dropped.
-    holes: List[HoleTuple] = select_drill_holes(folder, outline=outline)
+    # Only this board's drill files: the copper and outline are one board's
+    # (the first B.Cu found), and so must the holes be.
+    holes: List[HoleTuple] = select_drill_holes(
+        folder, outline=outline, stem=layer_stem(bcu_path))
     if not holes:
         warnings.warn(
             f"No drill file found in {folder}; holes will be empty.",
