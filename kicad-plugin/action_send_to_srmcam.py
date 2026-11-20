@@ -114,7 +114,8 @@ def choose_rules(board, info):
     pcbnew.Refresh()
     # Read back: what the board now says is what KiCad will use.
     names = [z["name"] for z in current.get("zones", [])]
-    missed = methods.not_kept(rules.read_current(board), ops, names)
+    missed = (methods.not_kept(rules.read_current(board), ops, names)
+              + rules.zone_style_not_kept(board))
     remembered = ""
     if board_file:
         try:

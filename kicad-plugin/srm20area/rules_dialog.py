@@ -62,7 +62,8 @@ class RulesDialog(wx.Dialog):
 
         foot = wx.StaticText(self, label=(
             "Sets the net classes, the board's minimums, every pour and the "
-            "defaults for new pours, then refills the pours. Tracks are not "
+            "defaults for new pours (pads joined solid, islands kept), then "
+            "refills the pours. Tracks are not "
             "moved: run DRC afterwards. Save to keep, or close without "
             "saving to undo."))
         top.Add(foot, 0, wx.EXPAND | wx.ALL, pad)

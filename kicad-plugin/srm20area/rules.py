@@ -256,6 +256,63 @@ def _raise_vias(board, drill_mm):
     return out
 
 
+# Every pour, whatever the method: pads joined to it solid, and no islands
+# removed. Thermal spokes are thin bridges of copper the bit has to cut
+# round on both sides, and on a milled board they tear; and an island KiCad
+# removes is still copper on the sheet - isolation milling only cuts round
+# what is drawn - so KiCad's picture should keep it, as the board will.
+# The operator's choice (2026-11-20).
+def _zone_style_wanted():
+    return pcbnew.ISLAND_REMOVAL_MODE_NEVER, pcbnew.ZONE_CONNECTION_FULL
+
+
+def zone_style(board):
+    """Set every pour and the defaults for new ones to never remove islands
+    and to join pads solid. Returns the lines of what changed."""
+    islands, pads = _zone_style_wanted()
+    out = []
+    zones = fill_zones(board)
+    n_isl = n_pad = 0
+    for z in zones:
+        if z.GetIslandRemovalMode() != islands:
+            z.SetIslandRemovalMode(islands)
+            n_isl += 1
+        if z.GetPadConnection() != pads:
+            z.SetPadConnection(pads)
+            n_pad += 1
+    if n_isl:
+        out.append("%d zone(s): remove islands -> Never" % n_isl)
+    if n_pad:
+        out.append("%d zone(s): pad connections -> Solid" % n_pad)
+    try:
+        ds = board.GetDesignSettings()
+        zd = ds.GetDefaultZoneSettings()
+        if (zd.GetIslandRemovalMode() != islands
+                or zd.GetPadConnection() != pads):
+            zd.SetIslandRemovalMode(islands)
+            zd.SetPadConnection(pads)
+            ds.SetDefaultZoneSettings(zd)
+            out.append("New zones: remove islands Never, pad connections "
+                       "Solid")
+    except Exception:                               # noqa: BLE001 - older API
+        pass
+    return out
+
+
+def zone_style_not_kept(board):
+    """Pours that do not read Never/Solid after :func:`zone_style`, as
+    lines."""
+    islands, pads = _zone_style_wanted()
+    out = []
+    for z in fill_zones(board):
+        name = z.GetNetname() or z.GetZoneName() or "?"
+        if z.GetIslandRemovalMode() != islands:
+            out.append("Zone %s remove islands -> Never" % name)
+        if z.GetPadConnection() != pads:
+            out.append("Zone %s pad connections -> Solid" % name)
+    return out
+
+
 def apply_plan(board, ops, drill_mm):
     """Carry out methods.plan(): set every rule it lists, raise the vias
     already placed to the drill, and refill the zones. Tracks stay where they
@@ -298,6 +355,7 @@ def apply_plan(board, ops, drill_mm):
     names = [z.GetNetname() or z.GetZoneName() or "?" for z in zones]
     changed = [methods.describe(op, names) for op in ops]
     changed += _raise_vias(board, drill_mm)
+    changed += zone_style(board)
     if zones:
         pcbnew.ZONE_FILLER(board).Fill(board.Zones())
     return changed
