@@ -1162,6 +1162,10 @@ class MainWindow(QMainWindow):
         self._act(m, "The mill's settings…",
                   lambda: millsettings.settings_sheet(self))
         m.addSeparator()
+        self.auto_connect_act = self._act(
+            m, "Connect by itself when the Arduino is plugged in",
+            self.bar.set_auto_connect, checkable=True)
+        self.auto_connect_act.setChecked(self.bar.auto_connect_on())
         self._act(m, "Rescan the serial ports", self.bar.refresh_ports)
         self._act(m, "Connect / disconnect", self.bar._toggle_connect, "Ctrl+L")
         m.addSeparator()
