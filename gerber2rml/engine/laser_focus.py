@@ -415,6 +415,71 @@ def measure_map(laser, cal, points, *, progress=None, should_stop=None):
     return FocusMap(out, z, skipped)
 
 
+# What a map may hold before it is refused. A board, tilted or bowed, lies
+# within a mm or so over the bed; the dot in a hole, on a slug or on the
+# cut-out reads the hole's depth (a 1.6 mm board: 1.6 mm off), and banding by
+# that reading etched a part of the board well out of focus. Off the plane
+# allows a bow (FR4 may bow 0.75 %, 1.2 mm over 160 mm, mostly as a slope);
+# the lab's flat-sheet reference sits within 0.13 mm of its plane.
+MAX_SPREAD_MM = 1.5
+MAX_OFF_PLANE_MM = 1.0
+
+
+def _plane(points):
+    """The best plane z = a x + b y + c through ``points``, or None."""
+    n = len(points)
+    if n < 3:
+        return None
+    mx = sum(p[0] for p in points) / n
+    my = sum(p[1] for p in points) / n
+    mz = sum(p[2] for p in points) / n
+    sxx = sum((p[0] - mx) ** 2 for p in points)
+    syy = sum((p[1] - my) ** 2 for p in points)
+    sxy = sum((p[0] - mx) * (p[1] - my) for p in points)
+    sxz = sum((p[0] - mx) * (p[2] - mz) for p in points)
+    syz = sum((p[1] - my) * (p[2] - mz) for p in points)
+    det = sxx * syy - sxy * sxy
+    if abs(det) < 1e-9:
+        return None
+    a = (sxz * syy - syz * sxy) / det
+    b = (syz * sxx - sxz * sxy) / det
+    return a, b, mz - a * mx - b * my
+
+
+def check_map(fmap, max_spread=MAX_SPREAD_MM, max_off_plane=MAX_OFF_PLANE_MM):
+    """Raise ValueError, saying where, when ``fmap`` cannot be a board on the
+    bed: a spread over ``max_spread`` (None: not checked - a flat sheet's raw
+    readings carry the machine's own slope), or a point over
+    ``max_off_plane`` from the plane through the others (one stray reading
+    fits a plane to itself, so each point is judged by the rest)."""
+    pts = list(fmap.points if fmap is not None else [])
+    # The one stray point first: it says where to look.
+    worst, off = None, 0.0
+    for k, p in enumerate(pts if max_off_plane is not None and len(pts) >= 4
+                          else ()):
+        plane = _plane(pts[:k] + pts[k + 1:])
+        if plane is None:
+            continue
+        a, b, c = plane
+        d = abs(p[2] - (a * p[0] + b * p[1] + c))
+        if d > off:
+            worst, off = p, d
+    if worst is not None and off > max_off_plane:
+        raise ValueError(
+            f"The focus map's point at X{worst[0]:g} Y{worst[1]:g} reads "
+            f"{off:.2f} mm off the surface the other points make: the dot was "
+            f"likely on a hole, a slug or dirt. Clear it, or move the points "
+            f"(Focus map points), and measure again.")
+    if max_spread is not None and fmap is not None and fmap.spread > max_spread:
+        lo = min(pts, key=lambda p: p[2])
+        hi = max(pts, key=lambda p: p[2])
+        raise ValueError(
+            f"The focus map reads {fmap.spread:.2f} mm from the lowest point "
+            f"(X{lo[0]:g} Y{lo[1]:g}) to the highest (X{hi[0]:g} Y{hi[1]:g}): "
+            f"more than a board lying on the bed. Check nothing is under it "
+            f"and no point is on a hole or the cut-out, then measure again.")
+
+
 def zone_indices(centres, fmap, tolerance=DEFAULT_TOLERANCE_MM):
     """``[(dz, [index])]``: shapes whose middles on the bed are ``centres``
     (in their order), grouped as :func:`plan_zones` groups paths. The laser

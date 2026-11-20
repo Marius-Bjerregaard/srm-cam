@@ -378,6 +378,10 @@ class LaserError(RuntimeError):
     pass
 
 
+class Stopped(LaserError):
+    """STOP was pressed: the run ends here, and is not done."""
+
+
 class F1Ultra:
     """The laser over its USB network link. Every call is one short HTTP request."""
 
@@ -539,8 +543,8 @@ class F1Ultra:
         mode."""
         from gerber2rml.engine.xtool_camera import DOT_AT, decode_jpeg
         at = snap_to_grid(at or DOT_AT)
-        self.lights(False)
         try:
+            self.lights(False)
             self.gcode(f"G0X{at[0]:g}Y{at[1]:g}F60000")
             time.sleep(0.3)
             self.gcode("M3S30")             # the blue diode at a glow
@@ -548,12 +552,27 @@ class F1Ultra:
             photo = self._raw(self.CAMERA_PORT,
                               "/camera/snap?width=4656&height=3496&timeOut=30000",
                               timeout=60)
-        finally:
-            self.gcode("M3S0")
-            self.gcode("M5")
-            self.lights(True)
+        except BaseException:
+            self._after_dot()               # the first error is the one told
+            raise
+        problems = self._after_dot()
+        if problems:
+            raise problems[0]
         dot, _n = cal.find_dot(decode_jpeg(photo), at)
         return cal.height(dot, at)
+
+    def _after_dot(self):
+        """The diode off and the light back on, each tried on its own: one
+        chained ``finally`` stopped at the first that failed, and a dropped
+        M3S0 left the light off for every photo after. The errors, if any."""
+        problems = []
+        for step in (lambda: self.gcode("M3S0"), lambda: self.gcode("M5"),
+                     lambda: self.lights(True)):
+            try:
+                step()
+            except Exception as e:              # noqa: BLE001 - the rest still run
+                problems.append(e)
+        return problems
 
     def autofocus(self, cal, at=None, tolerance=0.1, tries=4, bias=0.0):
         """Move the head until the surface under ``at`` is in focus. Returns
@@ -562,14 +581,56 @@ class F1Ultra:
         reference), taken off each reading."""
         self._json("POST", "/device/modeSwitch", {"state": "P_AUTOFOCUS"})
         try:
-            for _ in range(tries):
+            for attempt in range(tries + 1):
                 dz = self.measure(cal, at) - bias
                 if abs(dz) <= tolerance:
                     return self.z()
+                if attempt == tries:
+                    # The last move was never checked: this said "in focus"
+                    # wherever the head had got to.
+                    raise LaserError(
+                        f"Autofocus did not settle: after {tries} moves the "
+                        f"dot still reads {dz:+.2f} mm off focus. Check the "
+                        f"sheet lies flat under the cross and try again.")
                 self._goto_z(self.z() + dz)
-            return self.z()
         finally:
             self._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
+
+
+IDLE_MODES = ("P_IDLE", "P_WORK_DONE", "P_SLEEP")
+
+
+def make_idle(laser, timeout=60.0, poll=1.0):
+    """After something failed with a job sent: stop the laser if it may be
+    running and wait until it says it is idle. True when it said so; False
+    when it could not be told (no answer), so it may still be running.
+
+    A timeout or a dropped link while uploading or waiting does not mean the
+    job did not start: the upload autostarts. The page used to move the head
+    back and unlock with the laser still etching (review, 2026-11-20)."""
+    t0 = time.time()
+    sent = False
+    while True:
+        try:
+            m = laser.mode()
+        except Exception:                       # noqa: BLE001 - no answer
+            m = None
+        if m in IDLE_MODES:
+            return True
+        if m == "P_AUTOFOCUS":                  # a refocus between bands broke
+            try:
+                laser._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
+            except Exception:                   # noqa: BLE001 - tried again
+                pass
+        elif not sent or m is not None:
+            try:
+                laser.stop()
+                sent = True
+            except Exception:                   # noqa: BLE001 - tried again
+                pass
+        if time.time() - t0 > timeout:
+            return False
+        time.sleep(poll)
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +727,7 @@ def hatch(polys, interval, angle_deg=0.0, one_way=True):
     across the whole job, so the beam sweeps instead of jumping shape to shape.
     ``one_way`` keeps every line in the same direction."""
     from shapely.affinity import rotate as _rotate
-    from shapely.geometry import LineString, MultiLineString
+    from shapely.geometry import LineString
     from shapely.ops import unary_union
     shape = unary_union([p for p in polys if not p.is_empty])
     if shape.is_empty:
@@ -679,8 +740,7 @@ def hatch(polys, interval, angle_deg=0.0, one_way=True):
     flip = False
     while y < y1:
         cut = flat.intersection(LineString([(x0 - 1, y), (x1 + 1, y)]))
-        parts = list(cut.geoms) if isinstance(cut, MultiLineString) else (
-            [cut] if isinstance(cut, LineString) and not cut.is_empty else [])
+        parts = line_parts(cut)
         row = []
         for ln in parts:
             (ax, ay), (bx, by) = ln.coords[0], ln.coords[-1]
@@ -1078,9 +1138,25 @@ def write_traces_dxf(art, out_dir, name):
 EDGE_RING_MM = 0.02     # an isolation pass this near the board's edge is on it
 
 
+def line_parts(geom):
+    """The lines in a shapely result: a LineString, a MultiLineString, or a
+    GeometryCollection of lines and the points where a line only touched the
+    clip. A ring that touched its box at a corner came back as a collection,
+    and taking only plain LineStrings dropped the whole ring from the job."""
+    from shapely.geometry import LineString
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom]
+    out = []
+    for g in getattr(geom, "geoms", ()):
+        out += line_parts(g)
+    return out
+
+
 def _clip_ring_to(coords, clip):
     """Closed ring coordinate list clipped to ``clip`` (artwork frame)."""
-    from shapely.geometry import LineString, MultiLineString
+    from shapely.geometry import LineString
     if clip is None:
         return [coords]
     line = LineString(coords)
@@ -1090,10 +1166,8 @@ def _clip_ring_to(coords, clip):
         return [coords]
     if not line.intersects(clip):
         return []
-    cut = line.intersection(clip)
-    parts = list(cut.geoms) if isinstance(cut, MultiLineString) else (
-        [cut] if isinstance(cut, LineString) else [])
-    return [list(p.coords) for p in parts if not p.is_empty and p.length > 1e-4]
+    parts = line_parts(line.intersection(clip))
+    return [list(p.coords) for p in parts if p.length > 1e-4]
 
 
 def boxes_region(boxes):
@@ -1114,6 +1188,19 @@ def _boxes_in_art(boxes, origin, height):
             for x0, y0, x1, y1 in boxes]
 
 
+def _check_only(art, only):
+    """``only`` must number this job's trenches. Numbers from another set
+    were silently dropped: the field test's heights were kept per copper
+    shape (78) after the page rebuilt the job as isolation regions (39), and
+    with none of a band's numbers left the band had no clip - the whole sheet
+    etched at each ladder height (review, 2026-11-20)."""
+    bad = [k for k in (only or ()) if not 0 <= k < len(art.apertures)]
+    if bad:
+        raise ValueError(f"The trenches picked are not this job's: it has "
+                         f"{len(art.apertures)}, not number {max(bad) + 1}. "
+                         f"Pick them again.")
+
+
 def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
                  boxes=None):
     """Concentric isolation rings per offset, in bed coordinates, ordered by
@@ -1128,6 +1215,7 @@ def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
         _, outline = stencil_paths(art, origin)
         return [], outline
 
+    _check_only(art, only)
     only_key = frozenset(only) if only else None
     _, h_art = art.size
     art_boxes = (tuple(tuple(round(v, 4) for v in b)
@@ -1204,20 +1292,28 @@ def edge_rings(rings, radius, centre=FIELD_CENTRE):
 
 
 def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
-               boxes=None, *, write=True):
+               boxes=None, *, rework=None, write=True):
     """One GS002 file to etch PCB copper traces on the F1 Ultra.
     ``write=False``: the seconds and timeline only, no file text; the window's
     estimate, which would otherwise build the whole job (tens of MB) per edit.
 
-    ``boxes`` (bed mm): a rework. Only the passes inside the boxes are run,
-    as the CNC's rework clips its pass, and the outline is not scored again."""
+    ``boxes`` (bed mm): only the passes inside the boxes are run, as the
+    CNC's rework clips its pass. ``rework`` (by default: when there are
+    boxes) says it is a second go at spots that did not cut through: no
+    edge-of-field passes and the outline not scored again. A focus map's
+    band is clipped the same way but is the first etch of its part of the
+    board (``rework=False``): it keeps its edge passes, and the recipe says
+    whether it scores the outline."""
     from dataclasses import replace as _replace
     from shapely.geometry import Polygon
+    _check_only(art, only)
+    rework = bool(boxes) if rework is None else bool(rework)
     region = None
     if boxes:
         region = boxes_region(boxes)
         if region is None:
             raise ValueError("Draw a rework box over the traces first.")
+    if rework:
         recipe = _replace(recipe, mark_outline=False)
 
     if recipe.strategy in ("moat", "rubout"):
@@ -1268,8 +1364,11 @@ def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
                 body += _rest(park, recipe.rest_s)
             secs += recipe.rest_s
     # The edge of the field gets more: not on a rework, which has its own.
+    # A focus band is no rework: banded by boxes, a tilted board's edges -
+    # the very part the map is for - lost their edge passes (review,
+    # 2026-11-20).
     edge = (edge_rings([rg for grp in groups for rg in grp], recipe.edge_radius)
-            if recipe.edge_passes > 0 and region is None else [])
+            if recipe.edge_passes > 0 and not rework else [])
     if edge:
         edge = _nearest_order(edge)
         edge_s = _draw_seconds(edge, recipe.speed)

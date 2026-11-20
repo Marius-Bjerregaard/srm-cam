@@ -2166,6 +2166,10 @@ class MainWindow(QMainWindow):
         step = self.plan.by_key(key)
         if step is None:
             return
+        if ((step.kind == "laser" or (key == "rework" and self.laser_method()
+                                      and self.state.board))
+                and self._laser_busy()):
+            return
         if key == "rework" and self.laser_method() and self.state.board:
             # A laser board's copper was etched, not milled: its spots are
             # fixed where they were made, with the laser's rework boxes.
@@ -6252,7 +6256,20 @@ class MainWindow(QMainWindow):
             return arts[0]
         raise ValueError(f"Unknown laser job kind: {kind}")
 
+    def _laser_busy(self):
+        """True, and says so, while the laser page runs a job. A rail row
+        clicked mid-run put another job or face on the page, and a banded
+        run built its next band from it (review, 2026-11-20)."""
+        page = self.laser_view
+        if page is None or not page.is_running():
+            return False
+        self.say("warn", "The laser is running: wait for it, or press STOP, "
+                         "before opening another laser job.")
+        return True
+
     def _open_laser_kind(self, kind):
+        if self._laser_busy():
+            return
         st = self.state
         if st.board is None:
             self.say("warn", "Load a Gerber folder first.")

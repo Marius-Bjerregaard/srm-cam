@@ -5,6 +5,7 @@ import math
 import pytest
 
 from gerber2rml.engine import laser_focus as lf
+from gerber2rml.engine import xtool
 
 
 def test_points_cover_the_corners_and_the_middle_on_the_grid():
@@ -446,3 +447,183 @@ def test_the_machines_correction_is_built_in(qt_app, monkeypatch):
     assert not lfu.reference_is_builtin()
     assert len(lfu.load_reference().points) == 3          # this PC's wins
     lfu.save_reference(None)
+
+
+def test_a_map_no_board_could_make_is_refused():
+    """The dot in a hole reads the hole's depth; banding by it etched part
+    of the board out of focus (review, 2026-11-20)."""
+    flat = [(x, y, 0.001 * x) for x in (60, 110, 160) for y in (80, 120, 150)]
+    lf.check_map(lf.FocusMap(flat, 10.0))
+    hole = [p if p[:2] != (110, 120) else (110, 120, 1.6) for p in flat]
+    with pytest.raises(ValueError, match="X110 Y120"):
+        lf.check_map(lf.FocusMap(hole, 10.0))
+    steep = [(x, y, 0.02 * (x - 60)) for x, y, _ in flat]       # 2 mm across
+    with pytest.raises(ValueError, match="more than a board"):
+        lf.check_map(lf.FocusMap(steep, 10.0))
+    lf.check_map(lf.FocusMap(steep, 10.0), max_spread=None)      # a flat sheet's slope
+
+
+def test_the_built_in_reference_passes_its_own_check():
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    lf.check_map(lfu.builtin_reference(), max_spread=None)
+
+
+def test_a_saved_correction_that_cannot_be_read_falls_back(qt_app, monkeypatch):
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    from gerber2rml.gui2 import stencil_laser as sl
+    monkeypatch.setattr(sl, "_SETTINGS", ("SRM-CAM-tests", "laser-broken-ref"))
+    for bad in ("{not json", '{"points": "x"}', '{"z": 1}'):
+        lfu._settings().setValue(lfu.REFERENCE_KEY, bad)
+        ref = lfu.load_reference()
+        assert ref is not None and len(ref.points) >= 20      # the built-in
+        assert lfu.reference_is_builtin() and lfu.reference_broken()
+        assert "could not be read" in lfu.reference_status()
+    lfu.save_reference(None)
+    assert not lfu.reference_broken()
+
+
+def test_one_band_puts_the_head_back_too():
+    from types import SimpleNamespace
+    from gerber2rml.gui2.laser_focus_ui import run_zoned
+    zs = []
+
+    class Laser:
+        def _json(self, *a, **k):
+            pass
+
+        def _goto_z(self, z):
+            zs.append(round(z, 3))
+            return z
+
+        def z(self):
+            return 19.0
+
+        def run(self, text):
+            pass
+
+        def wait(self, timeout, progress=None):
+            pass
+
+    run_zoned(Laser(), lf.FocusMap([], 19.0), [(-0.6, [0])],
+              lambda idx: SimpleNamespace(text="job", seconds=1.0),
+              timeout_for=lambda job: 10)
+    assert zs == [18.4, 19.0]
+
+
+def test_stop_ends_the_focus_map_without_a_map(qt_app, monkeypatch):
+    """A STOP while measuring left a map of the points read so far."""
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    page = _page(qt_app, monkeypatch)
+    page.x.setValue(60)
+    page.y.setValue(60)
+    calls = []
+
+    class Laser:
+        def _json(self, *a, **k):
+            pass
+
+        def z(self):
+            return 10.0
+
+        def measure(self, cal, at):
+            calls.append(at)
+            if len(calls) == 2:
+                page._stop_event.set()          # what STOP does
+            return 0.0
+
+        def stop(self):
+            pass
+
+    page.laser = Laser()
+    page._calibration = lambda: None
+    lfu.measure(page)
+    import time
+    t0 = time.monotonic()
+    while page._locked() and time.monotonic() - t0 < 10:
+        qt_app.processEvents()
+        time.sleep(0.01)
+    page._worker.wait(5000)
+    assert len(calls) == 2
+    assert page._focus_map is None
+    assert page.status.text().startswith("Stopped")
+    page.close()
+
+
+class _Dot:
+    """An F1Ultra whose dot reads ``readings`` in turn; nothing on a wire."""
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+        self.head = 10.0
+        self.log = []
+
+    def make(self):
+        laser = xtool.F1Ultra.__new__(xtool.F1Ultra)
+        laser._lit = True
+        laser._json = lambda *a, **k: None
+        laser.measure = lambda cal, at: self.readings.pop(0)
+        laser.z = lambda: self.head
+        laser._goto_z = lambda z: setattr(self, "head", z) or z
+        return laser
+
+
+def test_autofocus_checks_its_last_move():
+    """It said in focus after its last move without looking."""
+    ok = _Dot([0.5, 0.2, 0.04]).make()
+    assert xtool.F1Ultra.autofocus(ok, None, tries=4) == pytest.approx(10.7)
+    never = _Dot([0.5] * 5).make()
+    with pytest.raises(xtool.LaserError, match="did not settle"):
+        xtool.F1Ultra.autofocus(never, None, tries=4)
+
+
+def test_the_light_comes_back_on_when_the_diode_off_fails(monkeypatch):
+    monkeypatch.setattr(xtool.time, "sleep", lambda s: None)
+    laser = xtool.F1Ultra.__new__(xtool.F1Ultra)
+    laser._lit = True
+    done = []
+
+    def gcode(line):
+        done.append(line)
+        if line == "M3S0":
+            raise xtool.LaserError("no answer")
+    laser.gcode = gcode
+    laser.lights = lambda on: done.append(("lights", on))
+    laser._raw = lambda *a, **k: b""
+    with pytest.raises(xtool.LaserError, match="no answer"):
+        laser.measure(None, (110, 110))
+    assert done[-1] == ("lights", True) and "M5" in done
+
+
+
+def test_a_reading_off_the_others_is_not_kept_as_the_map(qt_app, monkeypatch):
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    page = _page(qt_app, monkeypatch)
+    page.x.setValue(60)
+    page.y.setValue(60)
+    calls = []
+
+    class Laser:
+        def _json(self, *a, **k):
+            pass
+
+        def z(self):
+            return 10.0
+
+        def measure(self, cal, at):
+            calls.append(at)
+            return 1.6 if len(calls) == 3 else 0.0     # the dot in a hole
+
+    page.laser = Laser()
+    page._calibration = lambda: None
+    monkeypatch.setattr(lfu, "load_reference", lambda: None)
+    lfu.measure(page)
+    import time
+    t0 = time.monotonic()
+    while page._locked() and time.monotonic() - t0 < 10:
+        qt_app.processEvents()
+        time.sleep(0.01)
+    page._worker.wait(5000)
+    assert len(calls) >= 4
+    assert page._focus_map is None
+    assert "off the surface the other points make" in page.status.text()
+    page.close()
