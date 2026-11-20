@@ -382,7 +382,9 @@ def test_the_mills_boxes_zones_clamps_and_screws_are_undone(qt_app, sl, monkeypa
         assert rw._regions == []
         w.action_undo()
         assert len(rw._regions) == 1
-        ar.add_nogo(50, 50, 60, 60)
+        # Beside the board: a zone on its work is refused (_on_the_work).
+        b = w.work_bounds()
+        ar.add_nogo(b[2] + 5, b[1], b[2] + 15, b[1] + 10)
         assert len(ar._nogo) == 1
         w.action_undo()
         assert ar._nogo == []
