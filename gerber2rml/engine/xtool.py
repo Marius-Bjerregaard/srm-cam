@@ -378,6 +378,10 @@ class LaserError(RuntimeError):
     pass
 
 
+class Stopped(LaserError):
+    """STOP was pressed: the run ends here, and is not done."""
+
+
 class F1Ultra:
     """The laser over its USB network link. Every call is one short HTTP request."""
 
@@ -539,8 +543,8 @@ class F1Ultra:
         mode."""
         from gerber2rml.engine.xtool_camera import DOT_AT, decode_jpeg
         at = snap_to_grid(at or DOT_AT)
-        self.lights(False)
         try:
+            self.lights(False)
             self.gcode(f"G0X{at[0]:g}Y{at[1]:g}F60000")
             time.sleep(0.3)
             self.gcode("M3S30")             # the blue diode at a glow
@@ -548,12 +552,27 @@ class F1Ultra:
             photo = self._raw(self.CAMERA_PORT,
                               "/camera/snap?width=4656&height=3496&timeOut=30000",
                               timeout=60)
-        finally:
-            self.gcode("M3S0")
-            self.gcode("M5")
-            self.lights(True)
+        except BaseException:
+            self._after_dot()               # the first error is the one told
+            raise
+        problems = self._after_dot()
+        if problems:
+            raise problems[0]
         dot, _n = cal.find_dot(decode_jpeg(photo), at)
         return cal.height(dot, at)
+
+    def _after_dot(self):
+        """The diode off and the light back on, each tried on its own: one
+        chained ``finally`` stopped at the first that failed, and a dropped
+        M3S0 left the light off for every photo after. The errors, if any."""
+        problems = []
+        for step in (lambda: self.gcode("M3S0"), lambda: self.gcode("M5"),
+                     lambda: self.lights(True)):
+            try:
+                step()
+            except Exception as e:              # noqa: BLE001 - the rest still run
+                problems.append(e)
+        return problems
 
     def autofocus(self, cal, at=None, tolerance=0.1, tries=4, bias=0.0):
         """Move the head until the surface under ``at`` is in focus. Returns
@@ -562,14 +581,56 @@ class F1Ultra:
         reference), taken off each reading."""
         self._json("POST", "/device/modeSwitch", {"state": "P_AUTOFOCUS"})
         try:
-            for _ in range(tries):
+            for attempt in range(tries + 1):
                 dz = self.measure(cal, at) - bias
                 if abs(dz) <= tolerance:
                     return self.z()
+                if attempt == tries:
+                    # The last move was never checked: this said "in focus"
+                    # wherever the head had got to.
+                    raise LaserError(
+                        f"Autofocus did not settle: after {tries} moves the "
+                        f"dot still reads {dz:+.2f} mm off focus. Check the "
+                        f"sheet lies flat under the cross and try again.")
                 self._goto_z(self.z() + dz)
-            return self.z()
         finally:
             self._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
+
+
+IDLE_MODES = ("P_IDLE", "P_WORK_DONE", "P_SLEEP")
+
+
+def make_idle(laser, timeout=60.0, poll=1.0):
+    """After something failed with a job sent: stop the laser if it may be
+    running and wait until it says it is idle. True when it said so; False
+    when it could not be told (no answer), so it may still be running.
+
+    A timeout or a dropped link while uploading or waiting does not mean the
+    job did not start: the upload autostarts. The page used to move the head
+    back and unlock with the laser still etching (review, 2026-11-20)."""
+    t0 = time.time()
+    sent = False
+    while True:
+        try:
+            m = laser.mode()
+        except Exception:                       # noqa: BLE001 - no answer
+            m = None
+        if m in IDLE_MODES:
+            return True
+        if m == "P_AUTOFOCUS":                  # a refocus between bands broke
+            try:
+                laser._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
+            except Exception:                   # noqa: BLE001 - tried again
+                pass
+        elif not sent or m is not None:
+            try:
+                laser.stop()
+                sent = True
+            except Exception:                   # noqa: BLE001 - tried again
+                pass
+        if time.time() - t0 > timeout:
+            return False
+        time.sleep(poll)
 
 
 # ---------------------------------------------------------------------------

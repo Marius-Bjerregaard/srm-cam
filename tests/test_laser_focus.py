@@ -5,6 +5,7 @@ import math
 import pytest
 
 from gerber2rml.engine import laser_focus as lf
+from gerber2rml.engine import xtool
 
 
 def test_points_cover_the_corners_and_the_middle_on_the_grid():
@@ -446,3 +447,68 @@ def test_the_machines_correction_is_built_in(qt_app, monkeypatch):
     assert not lfu.reference_is_builtin()
     assert len(lfu.load_reference().points) == 3          # this PC's wins
     lfu.save_reference(None)
+
+
+def test_a_map_no_board_could_make_is_refused():
+    """The dot in a hole reads the hole's depth; banding by it etched part
+    of the board out of focus (review, 2026-11-20)."""
+    flat = [(x, y, 0.001 * x) for x in (60, 110, 160) for y in (80, 120, 150)]
+    lf.check_map(lf.FocusMap(flat, 10.0))
+    hole = [p if p[:2] != (110, 120) else (110, 120, 1.6) for p in flat]
+    with pytest.raises(ValueError, match="X110 Y120"):
+        lf.check_map(lf.FocusMap(hole, 10.0))
+    steep = [(x, y, 0.02 * (x - 60)) for x, y, _ in flat]       # 2 mm across
+    with pytest.raises(ValueError, match="more than a board"):
+        lf.check_map(lf.FocusMap(steep, 10.0))
+    lf.check_map(lf.FocusMap(steep, 10.0), max_spread=None)      # a flat sheet's slope
+
+
+def test_the_built_in_reference_passes_its_own_check():
+    from gerber2rml.gui2 import laser_focus_ui as lfu
+    lf.check_map(lfu.builtin_reference(), max_spread=None)
+
+
+class _Dot:
+    """An F1Ultra whose dot reads ``readings`` in turn; nothing on a wire."""
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+        self.head = 10.0
+        self.log = []
+
+    def make(self):
+        laser = xtool.F1Ultra.__new__(xtool.F1Ultra)
+        laser._lit = True
+        laser._json = lambda *a, **k: None
+        laser.measure = lambda cal, at: self.readings.pop(0)
+        laser.z = lambda: self.head
+        laser._goto_z = lambda z: setattr(self, "head", z) or z
+        return laser
+
+
+def test_autofocus_checks_its_last_move():
+    """It said in focus after its last move without looking."""
+    ok = _Dot([0.5, 0.2, 0.04]).make()
+    assert xtool.F1Ultra.autofocus(ok, None, tries=4) == pytest.approx(10.7)
+    never = _Dot([0.5] * 5).make()
+    with pytest.raises(xtool.LaserError, match="did not settle"):
+        xtool.F1Ultra.autofocus(never, None, tries=4)
+
+
+def test_the_light_comes_back_on_when_the_diode_off_fails(monkeypatch):
+    monkeypatch.setattr(xtool.time, "sleep", lambda s: None)
+    laser = xtool.F1Ultra.__new__(xtool.F1Ultra)
+    laser._lit = True
+    done = []
+
+    def gcode(line):
+        done.append(line)
+        if line == "M3S0":
+            raise xtool.LaserError("no answer")
+    laser.gcode = gcode
+    laser.lights = lambda on: done.append(("lights", on))
+    laser._raw = lambda *a, **k: b""
+    with pytest.raises(xtool.LaserError, match="no answer"):
+        laser.measure(None, (110, 110))
+    assert done[-1] == ("lights", True) and "M5" in done
+
