@@ -61,3 +61,30 @@ def test_save_and_load_user_preset(tmp_path, monkeypatch):
     presets = load_presets()
     assert "mine" in presets
     assert presets["mine"]["trace"]["bit_diameter"] == 0.6
+
+
+def test_a_ball_mill_written_the_old_way_becomes_a_ball():
+    """Until 0.22.1.3 the ball profile's trace bit was "0.44 mm flat" beside
+    a 0.8 mm drill: two bits to the run plan, which refused every automatic
+    run. Saved profiles and setups still say it that way."""
+    from gerber2rml.app.presets import jobs_of
+    from gerber2rml.engine import method as fab
+    old = {"trace": {"bit_diameter": 0.44, "cut_depth": 0.08,
+                     "cut_pinches": True},
+           "drill": {"bit_diameter": 0.8}, "cutout": {"bit_diameter": 0.8}}
+    trace, drill, _cutout = jobs_of(old)
+    assert (trace.tool_type, trace.bit_diameter) == ("ball", 0.8)
+    assert abs(trace.effective_diameter() - 0.44) < 1e-9
+    assert fab.of_trace(trace) == fab.BALL
+    # A real fine flat endmill is left alone.
+    fine = jobs_of({"trace": {"bit_diameter": 0.4},
+                    "drill": {"bit_diameter": 0.8}})[0]
+    assert (fine.tool_type, fine.bit_diameter) == ("flat", 0.4)
+
+
+def test_a_ball_cut_deep_is_still_the_ball_method():
+    from gerber2rml.config import TraceJob
+    from gerber2rml.engine import method as fab
+    deep = TraceJob(tool_type="ball", bit_diameter=0.8, cut_depth=0.25)
+    assert deep.effective_diameter() > 0.6      # wider than "under 0.6 mm"
+    assert fab.of_trace(deep) == fab.BALL

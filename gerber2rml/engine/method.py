@@ -85,6 +85,14 @@ def from_profile(trace_bit_mm):
         return FLAT
 
 
+def of_trace(trace):
+    """The method a trace job implies: a ball mill is the ball's, whatever
+    its channel comes to at this depth; any other bit by its width."""
+    if getattr(trace, "tool_type", "flat") == "ball":
+        return BALL
+    return from_profile(trace.effective_diameter())
+
+
 # ------------------------------------------------------------- from KiCad
 def read_kicad(folder, stem=None):
     """The method KiCad stored for the board plotted into ``folder``, or None.

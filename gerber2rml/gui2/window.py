@@ -1307,7 +1307,7 @@ class MainWindow(QMainWindow):
         ``fab.LASER``. Until a board has said, the tool profile says."""
         if self._method in fab.IDS:
             return self._method
-        return fab.from_profile(self.state.trace.effective_diameter())
+        return fab.of_trace(self.state.trace)
 
     @property
     def _traces_on_laser(self):
@@ -1344,13 +1344,13 @@ class MainWindow(QMainWindow):
         board's folder; a mill method brings its tool profile with it."""
         if mid not in fab.IDS:
             return
+        self._modernise_jobs()
         old = self.method_id()
         self._method, self._method_source = mid, source
         if (source == "chosen" and self.remember_board_choices
                 and self.state.board is not None):
             workspace.set_setting(self._method_key(), mid)
-        if fab.is_mill(mid) and fab.from_profile(
-                self.state.trace.effective_diameter()) != mid:
+        if fab.is_mill(mid) and fab.of_trace(self.state.trace) != mid:
             self._apply_method_profile(mid)
         self._sync_laser_method(old, mid)
         self._drc_memo = None
@@ -1364,12 +1364,18 @@ class MainWindow(QMainWindow):
                               "laser." if mid == fab.LASER else
                               "the checks and the tool are this bit's now."))
 
+    def _modernise_jobs(self):
+        """A ball mill still written the old way (a setup or session from
+        before 0.22.1.3) becomes a ball: config.legacy_ball."""
+        from gerber2rml.config import legacy_ball
+        if legacy_ball(self.state.trace, self.state.drill):
+            self._paths_cache = {}
+
     def _apply_method_profile(self, mid):
         """The first tool profile that is this method's, applied."""
         table = presets_mod.load_presets()
         for name, preset in table.items():
-            bit = presets_mod.trace_width(preset.get("trace") or {})
-            if fab.from_profile(bit) == mid:
+            if fab.of_trace(presets_mod.jobs_of(preset)[0]) == mid:
                 presets_mod.apply_preset(self.state, preset)
                 self._apply_auto_depth()
                 combo = self.inspector.setup.preset
@@ -3925,8 +3931,7 @@ class MainWindow(QMainWindow):
             # a one-sided setup after a double-sided laser board) came back
             # double-sided - reference holes and a flip it does not have.
             self._double_before_laser = None
-            self._sync_laser_method(fab.LASER, fab.from_profile(
-                self.state.trace.effective_diameter()))
+            self._sync_laser_method(fab.LASER, fab.of_trace(self.state.trace))
         self._method, self._method_source = None, "profile"
         self._method_gap = None
         from gerber2rml.loader import gerber_stem
@@ -6800,6 +6805,7 @@ class MainWindow(QMainWindow):
                     # Unknown to this version, or a value that would hurt the
                     # machine: kept out, and said so.
                     foreign.append("%s: %s" % (key, ", ".join(refused)))
+        self._modernise_jobs()
         boards = data.get("boards") or []
         # A project keeps its Gerber folders beside the setup, by relative
         # path: they are wherever the project was unpacked.
