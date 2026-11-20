@@ -15,7 +15,8 @@ def test_builtin_presets_are_the_flat_and_ball_mill_profiles():
 
 def test_ball_mill_preset_holds_the_measured_settings():
     ball = BUILTIN_PRESETS[list(BUILTIN_PRESETS)[1]]
-    assert ball["trace"]["bit_diameter"] == 0.44    # measured channel, not the shank
+    assert ball["trace"]["tool_type"] == "ball"     # the ball's own size...
+    assert ball["trace"]["bit_diameter"] == 0.8     # ...its channel worked out
     assert ball["trace"]["cut_depth"] == 0.08
     assert ball["trace"]["cut_pinches"] is True
     assert ball["drill"]["bit_diameter"] == 0.8     # real holes and outline
@@ -27,8 +28,8 @@ def test_ball_mill_preset_holds_the_measured_settings():
 def test_ball_mill_preset_applies_every_field():
     st = ProjectState()
     apply_preset(st, BUILTIN_PRESETS[list(BUILTIN_PRESETS)[1]])
-    assert st.trace.tool_type == "flat"
-    assert st.trace.effective_diameter() == 0.44
+    assert st.trace.tool_type == "ball"
+    assert abs(st.trace.effective_diameter() - 0.44) < 1e-9   # as measured
     assert st.trace.cut_pinches is True
     assert st.drill.bit_diameter == 0.8
     assert st.cutout.bit_diameter == 0.8
