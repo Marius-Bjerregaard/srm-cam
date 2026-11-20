@@ -227,7 +227,8 @@ class WindowSource(ar.JobSource):
         is where the fit says they came through: not the first side's frame."""
         w = self.w
         job = w.cutting_drill()
-        if w._double and w._top_fit is not None:
+        if (w._double and w._top_fit is not None
+                and getattr(self, "holes_side", "top") == "top"):
             from gerber2rml.doublesided import reflect_holes
             from gerber2rml.engine.drill import drill_holes, drill_single_bit
             lay = w._ds_layout()
@@ -2126,6 +2127,10 @@ class AutoRunPage(inspector.Page):
     def _on_realigned(self, report):
         """Say the line-up where it is seen, and keep it under the tick."""
         text = ar.realign_summary(report)
+        # Drawn where the holes put it, as the cuts will be: the stage went
+        # on showing the placement the line-up had just corrected.
+        if report.get("fit") is not None:
+            self.ctl.set_stock_turn(report["fit"])
         self.realign_lbl.setText(text)
         self.realign_lbl.setVisible(True)
         self.ctl.say("ok", text)

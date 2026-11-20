@@ -34,6 +34,7 @@ After that every move is incremental, and Z is machine Z: the probed
 copper height plus the path's depth (backends/gcode.render_incremental).
 """
 import math
+import re
 import threading
 import time
 
@@ -663,6 +664,11 @@ class AutoRun:
             if what == "holes":
                 self.ev.note("Drilling the holes again, %.2f mm deeper…"
                              % float(mm))
+                # Which face the board shows now, for the source: the top's
+                # holes come through the flip's fit (t None), the bottom's are
+                # turned here (t). Without it a double-sided board stopped
+                # at the bottom's check got the top's - the fit, then t.
+                self.src.holes_side = "top" if t is None else "bottom"
                 self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
                 continue
             if what != "again":
@@ -825,8 +831,12 @@ class AutoRun:
         return tx, ty
 
     def _find_by_edges(self, click, again):
+        # A sheet that is drilled already - the flipped side, or one put
+        # back to finish (Start at) or to line up again - has holes an edge
+        # walk can stop at and call the edge.
+        drilled = again or self.start_at is not None or self.realign
         return stockfind.find_stock(self.ser, click, self.size,
-                                    holes=again,
+                                    holes=drilled,
                                     hint_mm=(self.pose.z if again else
                                              self.surface_hint),
                                     hint_fresh=again,
@@ -1430,7 +1440,10 @@ class AutoRun:
                     first = (fx, fy)
                     break
                 except ProbeError as e:
-                    if str(e) == "stopped":
+                    # STOP, whatever the error says: an abort that surfaced
+                    # as "the head did not lift" was taken for "no copper
+                    # here", and the next nudge was touched after the STOP.
+                    if str(e) == "stopped" or self.should_abort():
                         raise
             if first is None:
                 raise RunFailed("no copper at the first surface point %.1f, "
@@ -1462,10 +1475,19 @@ class AutoRun:
                             self._over(px, py)
                     dx = int(round((px - first[0]) * 1000))
                     dy = int(round((py - first[1]) * 1000))
+                    if self.should_abort():
+                        raise RunStopped("stopped")
                     r = stockfind._cmd(self.ser, "P %d %d %d" % (i, dx, dy),
                                        self.should_abort)
                     at = (px, py)
-                    if r and r.startswith("R "):
+                    # This point's reply, and a whole one: a garbled R line
+                    # ended the run with "list index out of range", and a late
+                    # reply to an earlier P (same id after a timeout) was
+                    # taken for this point's height.
+                    parts = r.split() if r else []
+                    if (len(parts) >= 5 and parts[0] == "R"
+                            and parts[1] == str(i)
+                            and re.fullmatch(r"-?\d+", parts[4])):
                         break
                 else:
                     raise RunFailed("the surface probe failed at %.1f, %.1f "
@@ -1723,6 +1745,14 @@ class AutoRun:
             if worst > FIT_WORST_MM:
                 raise RunFailed("the board's holes disagree by %.2f mm - one "
                                 "was misread. Nothing was cut." % worst)
+            if len(got) == 2:
+                # Two points fit any turn and shift exactly: a misread rim
+                # (what the search's "go on past it" is for) would move every
+                # re-drilled hole and nothing here could tell. Said, with
+                # what was found, so it can be judged before the cut.
+                self.ev.note("Lined up on only two holes: two always fit, "
+                             "so the line-up could not check itself. Look at "
+                             "the offsets below before letting it cut.")
             self.rotation = t
             self._report_realign(holes, measured, got, placed, t)
             return t
@@ -1750,7 +1780,7 @@ class AutoRun:
                   "turn": math.degrees(t.theta - placed.theta),
                   "worst": max(fit_r), "mean": sum(fit_r) / len(fit_r),
                   "found": sum(1 for h in rows if h["found"] is not None),
-                  "used": len(fit_r), "holes": rows}
+                  "used": len(fit_r), "holes": rows, "fit": t}
         for h in rows:
             if h["found"] is None:
                 self.ev.note("  hole %d (%.2f mm): not found" % (
@@ -1814,7 +1844,7 @@ class AutoRun:
                                        self.should_abort, ref)
                 break
             except ProbeError as e:
-                if str(e) == "stopped":
+                if str(e) == "stopped" or self.should_abort():
                     raise
         else:
             raise RunFailed("no copper around fiducial at %.1f, %.1f"
