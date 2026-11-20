@@ -36,3 +36,22 @@ def test_feed_line_not_repeated_for_consecutive_cuts():
 def test_empty_toolpaths_produces_safe_header_footer():
     rml = render([], xy_feed=4.0, plunge_feed=1.0)
     assert rml == "^IN;!MC1;\n!MC0;^IN;\n"
+
+
+def test_a_program_lifts_straight_up_before_its_first_move():
+    """After zeroing Z on the copper the bit is ON the copper, and a first
+    `Z x,y,z` from there is a diagonal that drags the spinning bit across
+    the board (2026-11 review). Every program lifts first, where it stands."""
+    paths = [[Move(10, 10, 2, rapid=True), Move(10, 10, -0.1),
+              Move(20, 10, -0.1), Move(20, 10, 2, rapid=True)]]
+    lines = render(paths, xy_feed=4.0, plunge_feed=1.0).splitlines()
+    assert lines[0] == "^IN;!MC1;"
+    first_z = next(i for i, l in enumerate(lines) if l.startswith("Z"))
+    assert "!PZ0,200;PU;" in lines[:first_z]
+    assert lines[first_z] == "Z1000,1000,200;"   # level, at the lift height
+
+
+def test_no_lift_that_would_go_down():
+    # Nothing above the surface: a bare PU to Z2 <= 0 would plunge.
+    rml = render([[Move(20.0, 0.0, -0.1)]], xy_feed=4.0, plunge_feed=1.0)
+    assert "PU" not in rml
