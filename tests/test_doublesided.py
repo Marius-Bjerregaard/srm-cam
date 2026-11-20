@@ -114,6 +114,23 @@ def test_grid_pins_land_on_grid_holes_and_are_keyed_by_spacing():
     assert abs((y0 - by) - (ty - y1)) > 0.5
 
 
+def test_leftright_grid_pins_land_on_a_grid_that_is_not_square():
+    """Left/right dowels on a 10 x 15 mm grid: the flip axis is a grid ROW
+    (a multiple of pitch_y) and the dowels sit on grid COLUMNS (multiples of
+    pitch_x). The transposed solve used to swap the two."""
+    spec = DowelSpec(mode="grid", placement="leftright", pitch_x=10.0,
+                     pitch_y=15.0, grid_pin=4.0)
+    lay = layout_double_sided(FIXT, dowels=spec)
+    assert lay.axis == "horizontal"
+    (lx, ly, _), (rx, ry, _) = lay.align_holes
+    assert abs(ly - lay.flip_pos) < 1e-6 and abs(ry - lay.flip_pos) < 1e-6
+    assert abs(round(lay.flip_pos / 15.0) - lay.flip_pos / 15.0) < 1e-6
+    for x in (lx, rx):
+        assert abs(round(x / 10.0) - x / 10.0) < 1e-6
+    x0, _y0, x1, _y1 = lay.outline.bounds
+    assert lx < x0 and rx > x1
+
+
 def test_grid_and_fresh_keep_positive_quadrant():
     for spec in (DowelSpec(), DowelSpec(mode="grid")):
         lay = layout_double_sided(FIXT, dowels=spec)

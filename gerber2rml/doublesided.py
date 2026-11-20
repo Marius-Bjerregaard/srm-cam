@@ -289,6 +289,10 @@ def _place(gx0, gy0, gx1, gy1, spec):
     fn = _place_grid if spec.mode == "grid" else _place_fresh
     if _axis_of(spec) == "vertical":
         return fn(gx0, gy0, gx1, gy1, spec)
+    # The grid's pitches are transposed with the box: in transposed space
+    # "x" is the bed's Y. Left as they were, a grid that is not square put
+    # the left/right dowels between its holes (2026-11 review).
+    spec = replace(spec, pitch_x=spec.pitch_y, pitch_y=spec.pitch_x)
     align_t, axis_t, dxt, dyt = fn(gy0, gx0, gy1, gx1, spec)
     align = [(y, x, d) for (x, y, d) in align_t]
     return align, axis_t, dyt, dxt    # flip_pos is now a y; dx/dy swap back
