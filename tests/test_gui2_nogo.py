@@ -32,6 +32,14 @@ def win(qt_app, monkeypatch, tmp_path):
     w.close()
 
 
+
+def _put_zone(page, x0, y0, x1, y1):
+    """A zone on the work, as a saved setup or a board dragged in under a
+    clamp brings one - marking one there by hand is refused (_on_the_work)."""
+    from gerber2rml.engine.nogo import normal
+    page._nogo.append(normal((x0, y0, x1, y1)))
+    page._save_nogo()
+
 def test_zones_survive_the_settings_string():
     zones = [(10.0, 20.0, 30.5, 40.25), (1.0, 2.0, 3.0, 4.0)]
     assert page_mod.nogo_from_text(page_mod.nogo_to_text(zones)) == zones
@@ -248,7 +256,7 @@ def test_a_zone_over_copper_edges_or_a_hole_is_an_error(win):
     _load_with_a_margin(w)
     b = w.work_bounds()
     # The hole is 8 mm in from the board's corner; so is this zone.
-    w.autorun_page.add_nogo(b[0] + 6, b[1] + 6, b[0] + 10, b[1] + 10)
+    _put_zone(w.autorun_page, b[0] + 6, b[1] + 6, b[0] + 10, b[1] + 10)
     c = _nogo_check(w)
     assert [x.level for x in c] == ["fail"]
     assert "1 hole" in c[0].detail and "bottom copper" in c[0].detail
@@ -283,11 +291,11 @@ def test_left_in_the_sheet_copper_edges_in_a_zone_are_a_warning_not_an_error(win
     w.set_no_cutout(True)
     b = w.work_bounds()
     # Over the copper's edge (5 mm in), away from the hole (8 mm in).
-    w.autorun_page.add_nogo(b[0] + 40, b[1] + 3, b[0] + 50, b[1] + 7)
+    _put_zone(w.autorun_page, b[0] + 40, b[1] + 3, b[0] + 50, b[1] + 7)
     c = _nogo_check(w)
     assert [x.level for x in c] == ["warn"]
     assert "left uncut" in c[0].title
-    w.autorun_page.add_nogo(b[0] + 6, b[1] + 6, b[0] + 10, b[1] + 10)
+    _put_zone(w.autorun_page, b[0] + 6, b[1] + 6, b[0] + 10, b[1] + 10)
     assert sorted(x.level for x in _nogo_check(w)) == ["fail", "warn"]
 
 
@@ -296,7 +304,7 @@ def test_cut_out_copper_edges_in_a_zone_say_what_would_let_them_through(win):
     _load_with_a_margin(w)
     w.set_no_cutout(False)
     b = w.work_bounds()
-    w.autorun_page.add_nogo(b[0] + 40, b[1] + 3, b[0] + 50, b[1] + 7)
+    _put_zone(w.autorun_page, b[0] + 40, b[1] + 3, b[0] + 50, b[1] + 7)
     c = _nogo_check(w)
     assert [x.level for x in c] == ["fail"]
     assert "Leave the board in the sheet" in c[0].detail
@@ -332,7 +340,7 @@ def test_the_touches_move_in_when_the_margin_grows(win):
 def test_a_touch_under_a_new_zone_moves_off_it_on_the_bed(win):
     page = _open_run_it(win)
     x, y = win.stage._probe[0]
-    page.add_nogo(x - 3, y - 3, x + 3, y + 3)
+    _put_zone(page, x - 3, y - 3, x + 3, y + 3)
     moved = win.stage._probe
     assert len(moved) == 12 and moved[0] != (x, y)
     mx, my = moved[0]
@@ -465,3 +473,32 @@ def test_the_checks_take_a_clamp_as_the_disc_it_is(win, qt_app):
     page._nogo = [(b[2] + 60.0, b[3] + 60.0, 26.0)]   # nowhere near the work
     far = win._nogo_checks()
     assert [c.level for c in far] == ["ok"]
+
+
+def test_a_clamp_or_zone_is_not_marked_on_the_board(win):
+    """A clamp put on the board (2026-11-20) only turned the check red, and
+    the run then refused to start. It is not marked, and the reason said."""
+    w = win
+    _load_with_a_margin(w)
+    page = w.autorun_page
+    said = []
+    w.say = lambda level, text: said.append((level, text))
+    b = w.work_bounds()
+    before = list(page.nogo())
+    page.add_nogo(b[0] + 6, b[1] + 6, b[0] + 10, b[1] + 10)
+    assert page.nogo() == before
+    assert said and said[-1][0] == "warn" and "not marked" in said[-1][1]
+    # A clamp that lands on the board (its lip over the copper, as when the
+    # stock is clamped across the board's own edge).
+    from gerber2rml.engine import nogo
+    cx, cy = b[0] + 8, b[1] + 8                 # over the corner's hole
+    w_mp = pytest.MonkeyPatch()
+    w_mp.setattr(nogo, "clamp_at", lambda *a, **k: [(cx, cy, 26.0)])
+    try:
+        page.add_clamp(cx, cy)
+    finally:
+        w_mp.undo()
+    assert page.nogo() == before
+    assert "Clamp not marked" in said[-1][1]
+    page.add_nogo(b[0] + 30, b[1] - 6, b[0] + 40, b[1] + 1.0)   # the margin
+    assert len(page.nogo()) == len(before) + 1

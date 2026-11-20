@@ -141,6 +141,8 @@ def tool_id(job, *, trace=False):
     """
     if trace and getattr(job, "tool_type", "flat") == "vbit":
         return ("vbit", round(job.included_angle, 2), round(job.tip_diameter, 3))
+    if trace and getattr(job, "tool_type", "flat") == "ball":
+        return ("ball", round(job.bit_diameter, 3))
     return ("flat", round(job.bit_diameter, 3))
 
 
@@ -151,6 +153,8 @@ def tool_label(tool):
     if tool[0] == "vbit":
         _kind, angle, tip = tool
         return f"{angle:g}° V-bit ({tip:g} mm tip)"
+    if tool[0] == "ball":
+        return f"{tool[1]:.2f} mm ball mill"
     return f"{tool[1]:.2f} mm flat endmill"
 
 
@@ -234,6 +238,10 @@ def _trace_detail(trace):
                 f"{trace.effective_cut_depth():.2f} mm deep")
     passes = ("clears all background copper" if trace.offsets == -1
               else f"{trace.offsets} pass" + ("" if trace.offsets == 1 else "es"))
+    if getattr(trace, "tool_type", "flat") == "ball":
+        return (f"{trace.bit_diameter:.2f} mm ball · cutting "
+                f"{trace.effective_diameter():.2f} mm wide at "
+                f"{trace.cut_depth:.2f} mm deep · {passes}")
     return (f"{trace.bit_diameter:.2f} mm flat · {passes} · "
             f"{trace.cut_depth:.2f} mm deep")
 
@@ -341,6 +349,14 @@ def build(state, *, double_sided=False, registration="dowel", holes=None,
     trace_tool = tool_id(trace, trace=True)
     drill_tool = tool_id(drill)
     cutout_tool = tool_id(cutout)
+    # A ball mill isolates, and the same ball - its diameter - drills and
+    # cuts out (the ball profile). The drill and cut-out jobs carry no tool
+    # type of their own, so one the ball's size IS the ball: counted as a
+    # second bit, it stopped every automatic run with "2 different bits".
+    if trace_tool[0] == "ball":
+        drill_tool = trace_tool if drill_tool[1:] == trace_tool[1:] else drill_tool
+        cutout_tool = (trace_tool if cutout_tool[1:] == trace_tool[1:]
+                       else cutout_tool)
 
     boards = len(getattr(state, "boards", None) or [])
     seq = _Sequence()

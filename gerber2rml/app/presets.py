@@ -34,11 +34,12 @@ BUILTIN_PRESETS = {
                    "plunge_feed": 5.0, "travel_z": 2.0},
     },
     # The fine profile: one 0.8 mm ball mill for the whole job. At 0.08 mm deep it
-    # cuts a channel about 0.44 mm wide at the copper top, so the traces are told
-    # 0.44 to keep pads their drawn size. Gaps under 0.44 get one middle cut, which
+    # cuts a channel about 0.44 mm wide at the copper top (TraceJob.ball_width
+    # works that out from the ball's own 0.8), which keeps pads their drawn size. Gaps under 0.44 get one middle cut, which
     # trims those pads. Measured on the mill, 4 Nov 2026: docs/bit-capabilities.md.
     "SRM-20 0.8 mm ball mill: fine SMD traces + 0.8/1.0 drill + cutout": {
-        "trace":  {"bit_diameter": 0.44, "cut_depth": 0.08, "offsets": 1,
+        "trace":  {"tool_type": "ball", "bit_diameter": 0.8,
+                   "cut_depth": 0.08, "offsets": 1,
                    "stepover": 0.5, "xy_feed": 3.0, "plunge_feed": 0.5,
                    "travel_z": 2.0, "cut_pinches": True},
         "drill":  {"bit_diameter": 0.8, "cut_depth": 0.6, "total_depth": 2.0,
@@ -131,3 +132,16 @@ def save_user_preset(name, state):
     data[name] = {"trace": asdict(state.trace), "drill": asdict(state.drill),
                   "cutout": asdict(state.cutout)}
     path.write_text(json.dumps(data, indent=2))
+
+
+def trace_width(trace):
+    """The channel a preset's trace job cuts (mm), whatever its tool: a
+    ball's or a V-bit's is not its ``bit_diameter``. None without one."""
+    from gerber2rml.config import TraceJob
+    from dataclasses import fields
+    names = {f.name for f in fields(TraceJob)}
+    try:
+        return TraceJob(**{k: v for k, v in trace.items()
+                           if k in names}).effective_diameter()
+    except (TypeError, ValueError):
+        return trace.get("bit_diameter")

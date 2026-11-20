@@ -2286,11 +2286,33 @@ class AutoRunPage(inspector.Page):
         if remember is not None:
             remember(merge)
 
+    def _on_the_work(self, zones, what):
+        """Would ``zones`` sit on the board's work - copper the bit cuts
+        along, a hole? Then they are not marked, and the operator is told
+        why: a clamp put on the board (it happened, 2026-11-20) only
+        turned the run's own check red after the fact, and the run then
+        refused to start. True when refused."""
+        hits = getattr(self.ctl, "nogo_hits", None)
+        if hits is None:
+            return False
+        hard, _soft = hits(zones, first=len(self._nogo) + 1)
+        if not hard:
+            return False
+        self.ctl.say("warn", "%s not marked: %s. %s" % (
+            what, "; ".join(hard),
+            "A clamp holds the stock beside the board, not on it: click a "
+            "bed hole off the board's copper and holes." if what == "Clamp"
+            else "A zone is for what stands above the copper beside the "
+                 "board; the bit cannot keep out of the board's own work."))
+        return True
+
     def add_nogo(self, x0, y0, x1, y1):
         from gerber2rml.engine.nogo import normal
         z = normal((x0, y0, x1, y1))
         if z[2] - z[0] < 0.5 or z[3] - z[1] < 0.5:
             return                  # a click, not a drag: no zone of nothing
+        if self._on_the_work([z], "Zone"):
+            return
         self._remember()
         self._nogo.append(z)
         self._save_nogo()
@@ -2308,8 +2330,11 @@ class AutoRunPage(inspector.Page):
         # bracket screw may use: a clamp goes in the outer ring too.
         g = spoilboard.measured_grid()
         holes = [g.centre(i, j) for j in range(g.ny) for i in range(g.nx)]
+        new = clamp_at(x, y, stock, holes)
+        if self._on_the_work(new, "Clamp"):
+            return
         self._remember()
-        self._nogo.extend(clamp_at(x, y, stock, holes))
+        self._nogo.extend(new)
         self._save_nogo()
 
     def _clear_nogo(self):

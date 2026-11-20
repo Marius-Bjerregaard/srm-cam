@@ -1300,6 +1300,7 @@ class StepPage(Page):
             tool = QComboBox()
             tool.addItem("Flat endmill", "flat")
             tool.addItem("V-bit engraver", "vbit")
+            tool.addItem("Ball mill", "ball")
             tool.setToolTip(
                 "Flat endmill: the cut is as wide as the bit, whatever the "
                 "depth." + chr(10) +
@@ -1453,7 +1454,7 @@ class StepPage(Page):
 
     def _set_tool_type(self, step, job, kind):
         """Swap the tool, and the fields with it."""
-        job.tool_type = "vbit" if kind == "vbit" else "flat"
+        job.tool_type = kind if kind in ("vbit", "ball") else "flat"
         self.ctl.action_params_changed()
         self._rebuild_params(step)
 
