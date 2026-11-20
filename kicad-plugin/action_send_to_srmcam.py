@@ -112,6 +112,9 @@ def choose_rules(board, info):
     finally:
         wx.EndBusyCursor()
     pcbnew.Refresh()
+    # Read back: what the board now says is what KiCad will use.
+    names = [z["name"] for z in current.get("zones", [])]
+    missed = methods.not_kept(rules.read_current(board), ops, names)
     remembered = ""
     if board_file:
         try:
@@ -121,16 +124,30 @@ def choose_rules(board, info):
         except OSError:
             pass
     notes = methods.rule_file_notes(rules_text, values)
+    from srm20area import board_setup
+    opens = board_setup.find_menu_item() is not None
     wx.MessageBox(
-        "%s:\n\n    %s%s\n\nThe pours are refilled. Tracks are where they "
-        "were: run Inspect > Design Rules Checker and move what it marks. "
-        "Save to keep the changes; close without saving to undo them.%s"
+        "%s:\n\n    %s%s%s\n\n%s\n\nThe pours are refilled. Tracks are "
+        "where they were: run Inspect > Design Rules Checker and move what it "
+        "marks. Save to keep the changes; close without saving to undo them.%s"
         % (methods.method(method_id)["name"],
            "\n    ".join(changed) or "nothing needed changing",
+           ("\n\nKiCad did NOT keep:\n    " + "\n    ".join(missed))
+           if missed else "",
            ("\n\nThe custom rules file still decides some of this:\n    "
             + "\n    ".join(notes)) if notes else "",
+           # KiCad compiles its rules when Board Setup closes with OK: until
+           # then new tracks keep the old width (2026-11-20).
+           ("KiCad uses these rules from when Board Setup is closed with OK: "
+            "it opens now - press OK there." if opens else
+            "KiCad uses these rules only after File > Board Setup... is "
+            "closed with OK (or the board is opened again): do that now, or "
+            "new tracks keep the old width."),
            remembered),
-        "Design rules for SRM-CAM", wx.OK | wx.ICON_INFORMATION)
+        "Design rules for SRM-CAM",
+        wx.OK | (wx.ICON_WARNING if missed else wx.ICON_INFORMATION))
+    if opens:
+        board_setup.open_later()
     return True
 
 
