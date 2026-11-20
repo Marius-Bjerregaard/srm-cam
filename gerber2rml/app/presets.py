@@ -113,16 +113,25 @@ def apply_preset(state, preset):
     sets it, one that does not gets the default, and a field this version
     does not know is dropped rather than refused.
     """
+    state.trace, state.drill, state.cutout = jobs_of(preset)
+
+
+def jobs_of(preset):
+    """``(TraceJob, DrillJob, CutoutJob)`` a preset stands for: each from its
+    defaults, and a ball mill written the old way made a ball
+    (config.legacy_ball)."""
     from dataclasses import fields
-    from gerber2rml.config import TraceJob, DrillJob, CutoutJob
+    from gerber2rml.config import (TraceJob, DrillJob, CutoutJob,
+                                   legacy_ball)
 
     def build(cls, block):
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in (block or {}).items() if k in known})
 
-    state.trace = build(TraceJob, preset.get("trace"))
-    state.drill = build(DrillJob, preset.get("drill"))
-    state.cutout = build(CutoutJob, preset.get("cutout"))
+    trace = build(TraceJob, preset.get("trace"))
+    drill = build(DrillJob, preset.get("drill"))
+    legacy_ball(trace, drill)
+    return trace, drill, build(CutoutJob, preset.get("cutout"))
 
 
 def save_user_preset(name, state):
@@ -133,15 +142,3 @@ def save_user_preset(name, state):
                   "cutout": asdict(state.cutout)}
     path.write_text(json.dumps(data, indent=2))
 
-
-def trace_width(trace):
-    """The channel a preset's trace job cuts (mm), whatever its tool: a
-    ball's or a V-bit's is not its ``bit_diameter``. None without one."""
-    from gerber2rml.config import TraceJob
-    from dataclasses import fields
-    names = {f.name for f in fields(TraceJob)}
-    try:
-        return TraceJob(**{k: v for k, v in trace.items()
-                           if k in names}).effective_diameter()
-    except (TypeError, ValueError):
-        return trace.get("bit_diameter")

@@ -195,6 +195,24 @@ class BoardConfig:
     thickness: float = 1.6       # mm
 
 
+def legacy_ball(trace, drill):
+    """Turn the ball mill as it used to be written into what it is.
+
+    Until 0.22.1.3 the ball profile called its trace bit "0.44 mm flat" -
+    the channel a 0.8 mm ball cuts, not a bit anyone owns - beside a 0.8 mm
+    drill. Counted as bits, that is two, and every automatic run refused
+    it. Saved setups, saved profiles and a lab's site file still say it that
+    way: here it becomes ``tool_type`` "ball" at the drill's diameter (the
+    same ball drills). True when ``trace`` was changed."""
+    if (getattr(trace, "tool_type", "flat") == "flat"
+            and abs(trace.bit_diameter - 0.44) < 0.006
+            and drill.bit_diameter >= 0.6):
+        trace.tool_type = "ball"
+        trace.bit_diameter = drill.bit_diameter
+        return True
+    return False
+
+
 def drill_first(trace, drill):
     """Whether the drill runs before the isolation traces.
 
