@@ -144,18 +144,37 @@ def builtin_reference():
         return None
 
 
-def load_reference():
-    """This PC's own measurement, else the one built in."""
+def _saved_reference():
+    """``(ref, broken)``: this PC's own measurement, or None; ``broken`` when
+    one is saved but cannot be read."""
     import json
+    raw = _settings().value(REFERENCE_KEY, "") or ""
+    if not raw:
+        return None, False
     try:
-        data = json.loads(_settings().value(REFERENCE_KEY, "") or "null")
+        ref = lf.FocusMap.from_dict(json.loads(raw))
     except (TypeError, ValueError):
-        data = None
-    return lf.FocusMap.from_dict(data) if data else builtin_reference()
+        ref = None
+    if ref is None or not ref.points:
+        return None, True
+    return ref, False
+
+
+def load_reference():
+    """This PC's own measurement, else the one built in - a saved one that
+    cannot be read too. It came back None, and every map ran uncorrected:
+    up to 1.3 mm of the machine's own slope taken for the board's."""
+    ref, _broken = _saved_reference()
+    return ref if ref is not None else builtin_reference()
 
 
 def reference_is_builtin():
-    return not (_settings().value(REFERENCE_KEY, "") or "")
+    return _saved_reference()[0] is None
+
+
+def reference_broken():
+    """This PC's saved correction is there but cannot be read."""
+    return _saved_reference()[1]
 
 
 def save_reference(ref):
@@ -176,8 +195,10 @@ def reference_status():
     xs = [p[0] for p in ref.points]
     ys = [p[1] for p in ref.points]
     if reference_is_builtin():
-        return (f"Built in: the lab F1 Ultra's, measured on its bare bed at "
-                f"{len(ref.points)} points; up to {ref.spread:.2f} mm taken "
+        lost = ("This PC's saved correction could not be read, so the built-in "
+                "one is used. " if reference_broken() else "")
+        return (lost + f"Built in: the lab F1 Ultra's, measured on its bare bed "
+                f"at {len(ref.points)} points; up to {ref.spread:.2f} mm taken "
                 f"off. Measure again only for another laser.")
     return (f"Measured at {len(ref.points)} points, X {min(xs):g}-{max(xs):g}, "
             f"Y {min(ys):g}-{max(ys):g} mm; up to {ref.spread:.2f} mm taken "
