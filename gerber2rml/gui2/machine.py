@@ -917,6 +917,9 @@ class MachineBar(QWidget):
         self._touching = False
         self._held = False
         self._connecting_until = 0.0
+        self._user_off = False          # Disconnect pressed: no auto-connect
+        self._auto_failed = set()       # ports an auto-connect failed on
+        self._auto_trying = None        # the port being auto-connected
         self.refresh_ports()
         # The ports are looked for again every couple of seconds while
         # nothing is linked: an Arduino plugged in, or a mill switched on,
@@ -926,6 +929,11 @@ class MachineBar(QWidget):
         self._scan_timer.setInterval(RESCAN_MS)
         self._scan_timer.timeout.connect(self._auto_rescan)
         self._scan_timer.start()
+        # An Arduino already plugged in when the program starts: linked as
+        # soon as the window is up, as if Connect had been pressed.
+        QTimer.singleShot(0, lambda: self._maybe_auto_connect(
+            [(self.port_combo.itemData(i), "")
+             for i in range(self.port_combo.count())], startup=True))
 
         # Page Up / Page Down nudge Z, as the two buttons' tooltips promise.
         # On the window rather than on a focused control: you are looking at
@@ -993,15 +1001,84 @@ class MachineBar(QWidget):
             return
         self._refresh_ports(ports, why)
         new = [d for d in now if d not in had and not simmachine.is_sim(d)]
+        if self._maybe_auto_connect(ports):
+            return
         if new:
             self.message.emit("info", "Found %s. Press Connect to link to "
                                       "the machine." % ", ".join(new))
 
+    # -- connecting by itself ------------------------------------------------
+    AUTO_KEY = "machine/auto_connect"
+
+    def auto_connect_on(self):
+        """Is "connect by itself" on (Machine menu)? Off under the test
+        runner unless a test turns it on: the suite must never open the real
+        Arduino on the computer it runs on."""
+        import os
+        if "PYTEST_CURRENT_TEST" in os.environ and not getattr(
+                self, "_auto_in_tests", False):
+            return False
+        from gerber2rml.gui2 import workspace
+        return str(workspace.setting(self.AUTO_KEY, "1")) != "0"
+
+    def set_auto_connect(self, on):
+        from gerber2rml.gui2 import workspace
+        workspace.set_setting(self.AUTO_KEY, "1" if on else "0")
+        if on:
+            self._user_off = False
+            self._auto_failed.clear()
+
+    @staticmethod
+    def _arduinos(ports):
+        """The listed ports that look like an Arduino: a known USB-serial
+        chip (spi_probe.BOARD_VIDS). Never an unknown device, never the
+        simulator."""
+        return [d for d, chip in ports
+                if d and not simmachine.is_sim(d)
+                and chip != "unknown device"]
+
+    def _maybe_auto_connect(self, ports, startup=False):
+        """Connect to the Arduino by itself, when there is exactly one, the
+        bar is free, and nobody said not to. True when it started one.
+
+        Exactly one: with two boards plugged in, which is the mill's is a
+        question for the person. Not after Disconnect was pressed - until
+        the board is unplugged, or Connect is pressed. Not again on a port
+        where it failed (until the board comes back), or it would try every
+        two seconds."""
+        import time
+        if not self.auto_connect_on() or self.sim_only:
+            return False
+        if startup:
+            ports = [(d, chip) for d, chip in list_ports(self.sim_only)[0]]
+        found = self._arduinos(ports)
+        # Unplugged: what was said about it no longer holds.
+        self._auto_failed &= set(found)
+        if not found:
+            self._user_off = False
+        if (len(found) != 1 or self._user_off or self._held
+                or self.link.is_connected()
+                or time.monotonic() < self._connecting_until
+                or found[0] in self._auto_failed):
+            return False
+        port = found[0]
+        i = self.port_combo.findData(port)
+        if i < 0:
+            return False
+        self.port_combo.setCurrentIndex(i)
+        self._auto_trying = port
+        self.message.emit("info", "Found the Arduino on %s - connecting." %
+                          port)
+        self._do_toggle_connect()
+        return True
+
     # -- actions -----------------------------------------------------------
     def _do_toggle_connect(self):
         if self.link.is_connected():
+            self._user_off = True       # not straight back on by itself
             self.link.disconnect_from("disconnected")
         else:
+            self._user_off = False
             port = self.current_port()
             if not port:
                 return
@@ -1085,6 +1162,7 @@ class MachineBar(QWidget):
 
     # -- link events -------------------------------------------------------
     def _on_linked(self, info):
+        self._auto_trying = None
         # One word on the chip; the port and the firmware version are in the
         # tooltip and the log line. The chip's width is STOP's margin.
         self.chip.set("Linked", "live")
@@ -1250,6 +1328,10 @@ class MachineBar(QWidget):
                         "the SPI lead is in.")
 
     def _on_failed(self, name, msg):
+        if name == "connect" and self._auto_trying:
+            # Not tried again on this port until it is plugged in anew.
+            self._auto_failed.add(self._auto_trying)
+            self._auto_trying = None
         if name == "connect":
             self.chip.set("Link failed", "fail")
             self.connect_btn.setEnabled(True)
