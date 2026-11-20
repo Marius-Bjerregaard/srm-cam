@@ -146,6 +146,15 @@ def tool_id(job, *, trace=False):
     return ("flat", round(job.bit_diameter, 3))
 
 
+def _as_ball(tool, trace_tool):
+    """``tool`` - a drill or cut-out's - as the ball mill that isolates, when
+    it is the ball's size: the ball profile drills and cuts out with that
+    same ball, and those jobs carry no tool type to say so."""
+    if trace_tool and trace_tool[0] == "ball" and tool[1:] == trace_tool[1:]:
+        return trace_tool
+    return tool
+
+
 def tool_label(tool):
     """The tool, in the words someone standing at the machine would use."""
     if tool is None:
@@ -353,10 +362,8 @@ def build(state, *, double_sided=False, registration="dowel", holes=None,
     # cuts out (the ball profile). The drill and cut-out jobs carry no tool
     # type of their own, so one the ball's size IS the ball: counted as a
     # second bit, it stopped every automatic run with "2 different bits".
-    if trace_tool[0] == "ball":
-        drill_tool = trace_tool if drill_tool[1:] == trace_tool[1:] else drill_tool
-        cutout_tool = (trace_tool if cutout_tool[1:] == trace_tool[1:]
-                       else cutout_tool)
+    drill_tool = _as_ball(drill_tool, trace_tool)
+    cutout_tool = _as_ball(cutout_tool, trace_tool)
 
     boards = len(getattr(state, "boards", None) or [])
     seq = _Sequence()
@@ -403,7 +410,7 @@ def build(state, *, double_sided=False, registration="dowel", holes=None,
                 seq.run(f"drill_run{i}" if i else "drill_run",
                         "Drill" if len(dfiles) == 1 else f"Drill {dia:.2f} mm holes",
                         ordinal=d_no if i == 0 else None, op="drill", file=fn,
-                        tool=("flat", round(dia, 3)), bit=dia,
+                        tool=_as_ball(("flat", round(dia, 3)), trace_tool), bit=dia,
                         detail=_drill_detail(drill, dfiles) if i == 0
                                else f"{dia:.2f} mm bit",
                         note=("The lab drills first when one bit does both: "
@@ -478,7 +485,7 @@ def build(state, *, double_sided=False, registration="dowel", holes=None,
                     "Drill the board" if len(dfiles) == 1
                     else f"Drill {dia:.2f} mm holes",
                     ordinal=2 if i == 0 else None, op="drill", file=fn,
-                    tool=("flat", round(dia, 3)), bit=dia,
+                    tool=_as_ball(("flat", round(dia, 3)), trace_tool), bit=dia,
                     detail=_drill_detail(drill, dfiles) if i == 0
                            else f"{dia:.2f} mm bit")
 
