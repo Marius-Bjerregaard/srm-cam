@@ -92,7 +92,27 @@ request to MadsRudolph/srm-cam is approved. Compiled for the Uno (49 % flash,
 | STOP during `J` | Travel sent anyway, then `J x y` | `E J ABORT` (and lifted) |
 | STOP during `Y` | `Y ok` | `E Y ABORT` |
 | A descent's last step | Could pass the floor by up to one step | Lands on the floor |
-| Spindle deadman after a long `M`/`N` | Tripped as the move returned, the host having waited on the board | Fed again when each command ends |
+| Spindle deadman after a long `M`/`N` | Tripped as the move returned, the host having waited on the board | Fed again when each command ends, and by every byte that arrives mid-move |
+| The first touch after `D` | Stepped 150 µm at a time to the floor (nothing known, so "coarse above the copper" was all the way down) - a still bit pressed up to 0.15 mm into the copper | Fine steps (25 µm) all the way, as the header always said; also after copper is found above the approach plane |
+| `K` mid-move | Eaten like any other byte | Cancels the job (`K ok`) and stops the sequence, like `%` |
+| A pause held past 5 minutes | Aborted, but left the machine suspended - so the lift after it was held too | The hold is released first |
+| `C`, `W` origin read | One read; `W` wrote its X/Y back with `setOrigin` | Two reads must agree; `E C UNSTABLE` / `E W UNSTABLE` otherwise, origin unchanged |
+| `F` | `F 0` accepted (corruption near 50 µs), `F 70000` wrapped to 4464 | Clamped to 200-16000 µs |
+| A letter the firmware does not know | No reply (the host waited for its timeout) | `E <c> UNKNOWN` |
+
+Host side, with these: `firmware_version` drops stale input and waits for a
+`V` line, so a leftover reply can no longer be taken for "an old sketch"
+(which switched the stop-on-touch descent off).
+
+Still open, for the machine and Mads - not changed here:
+
+- `waitForMotorStop` returns "done" when `isReady()` is false, and decides a
+  move is over on one status read without the moving bit. What the ready pin
+  means on the SRM-20 needs measuring before that is tightened.
+- `U`, `M` and `N` have no depth limit of their own; `U` relies on its
+  stop-on-touch, whose reaction time depends on the frame delay (`F`).
+- The PAUSE bit is still out of the status guard (its meaning unproven).
+- Probing is not refused while a VPanel-started spindle turns.
 
 ## Firmware v3 (2026-08) — the "retire VPanel" command set
 

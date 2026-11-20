@@ -210,6 +210,21 @@ bool readPos(long &x, long &y, long &z) {
   return false;
 }
 
+// The work origin, read until two reads agree - the same rule as readPos. A
+// single read can be garbage, and 'W' writes what it read back with
+// setOrigin: one bad read moved the work origin's X/Y.
+bool readOrigin(long &x, long &y, long &z) {
+  long ax, ay, az, bx, by, bz;
+  srm20.getOrigin(ax, ay, az);
+  for (int i = 0; i < 8; i++) {
+    delay(30);
+    srm20.getOrigin(bx, by, bz);
+    if (ax == bx && ay == by && az == bz) { x = bx; y = by; z = bz; return true; }
+    ax = bx; ay = by; az = bz;
+  }
+  return false;
+}
+
 // Debounced contact read: stepper EMI can flash the probe line LOW for a
 // moment. Real contact holds — require 3 consecutive LOW reads 1 ms apart.
 bool probeTouched() {
@@ -280,6 +295,7 @@ void abortLift() {
 bool checkAbort() {
   while (Serial.available()) {
     char c = Serial.read();
+    lastCmdMs = millis();       // the host is talking: feed the spindle deadman
     if (c == '!') {
       gAbort = true;
       gLiftPending = true;      // retract at the exit, not from in here
@@ -295,6 +311,13 @@ bool checkAbort() {
       srm20.resumeJob();
       gPauseRequested = false;
       Serial.println(F("^ ok"));
+    } else if (c == 'K') {                       // cancelJob (VPanel Stop)
+      // Documented as job control with ~ ^ %, but it used to be eaten here
+      // mid-move like any other byte: the Stop that matters most did nothing.
+      srm20.cancelJob();
+      gPauseRequested = false;
+      gAbort = true;
+      Serial.println(F("K ok"));
     }
   }
   if (gAbort) spindleOff();       // v3: an abort also kills the spindle
@@ -379,6 +402,11 @@ bool waitForMotorStop() {
         // reporting PAUSE right now), until '^' resumes or the cap expires.
         if (!pause0) pause0 = millis();
         if (millis() - pause0 > PAUSE_MAX_MS) {
+          // Release the hold before giving up on it: still suspended, the
+          // machine would not run the lift the caller does next, and the
+          // flag would hold that lift for another five minutes.
+          srm20.resumeJob();
+          gPauseRequested = false;
           gAbort = true; spindleOff(); haltMotion();
           Serial.println(F("E ~ PAUSETIMEOUT"));
           return false;
@@ -518,7 +546,12 @@ int descendUntilTouch(long mx, long my, long &z, long step, long floorZ) {
 // contract as descendUntilTouch.
 int descendFast(long mx, long my, long &z, long floorZ, long expectZ,
                 long fineStep) {
-  long handover = (haveRef ? expectZ + COARSE_KEEP_UM : floorZ);
+  // No surface known yet (the first touch after a 'D'): the copper could be
+  // anywhere below, so there is no "above any copper" to step coarsely
+  // through - fine steps from the start. This used to be floorZ, which made
+  // the first touch of every run the COARSE one: 150 um steps, pressing a
+  // still bit up to 0.15 mm into the copper before it read contact.
+  long handover = (haveRef ? expectZ + COARSE_KEEP_UM : z);
   if (handover < floorZ) handover = floorZ;
   while (z > handover) {
     if (checkAbort()) return -1;
@@ -583,8 +616,12 @@ int probeAt(long mx, long my, long &touchZ) {
   }
   long z = startZ;
   // The grid goes anywhere on the board, so the only safe expectation is the
-  // highest copper seen so far.
-  int r = descendFast(mx, my, z, floorZ, maxSurfaceZ, PROBE_STEP_UM);
+  // highest copper seen so far - unless the copper here has just been found
+  // ABOVE the approach plane, i.e. above that "highest": then nothing is
+  // known about where it is, and every step down from safe Z is a fine one.
+  int r = (startZ == safeZ && haveRef)
+      ? descendUntilTouch(mx, my, z, PROBE_STEP_UM, floorZ)
+      : descendFast(mx, my, z, floorZ, maxSurfaceZ, PROBE_STEP_UM);
   if (r == -1) { liftSafe(mx, my); return -1; }
   if (r == 0)  { liftSafe(mx, my); return refLimited ? -2 : 0; }
   long cx, cy, cz;
@@ -727,7 +764,12 @@ void handleLine(char *s) {
       return;
     }
     long ox, oy, oz;
-    srm20.getOrigin(ox, oy, oz);
+    if (!readOrigin(ox, oy, oz)) {
+      srm20.jumpTo(tx, ty, tz + 2000, MOVE_SPEED);  // off the copper, unchanged
+      waitForMotorStop();
+      Serial.println(F("E W UNSTABLE"));
+      return;
+    }
     srm20.setOrigin(ox, oy, tz);             // origin Z = the copper surface
     delay(150);
     long nox, noy, noz;
@@ -821,7 +863,15 @@ void handleLine(char *s) {
 #endif
   } else if (s[0] == 'F') {        // v3: SPI per-byte framing delay (us)
 #ifdef SRM20SPIREMOTE_LOCAL_PATCH
-    if (s[1] != 0) srm20.setFrameDelayUs((unsigned int)atol(s + 1));
+    if (s[1] != 0) {
+      // 200 us at the least: transfers were measured to corrupt near 50 us,
+      // and nothing checks a jumpTo's bytes. Read as a long, then clamped,
+      // so 70000 no longer wraps to 4464.
+      long us = atol(s + 1);
+      if (us < 200) us = 200;
+      if (us > 16000) us = 16000;
+      srm20.setFrameDelayUs((unsigned int)us);
+    }
     Serial.print(F("F ")); Serial.println(srm20.frameDelayUs());
 #else
     Serial.println(F("E F NOPATCH"));
@@ -891,7 +941,13 @@ void handleLine(char *s) {
     // origin (all 'M' moves are origin-relative) and clear any stale abort
     clearHold();
     sawCmdErr = false;
-    srm20.getOrigin(strOX, strOY, strOZ);
+    // Every 'M' is relative to this, its Z included: a bad read here would
+    // put the whole stream at the wrong depth.
+    if (!readOrigin(strOX, strOY, strOZ)) {
+      haveStreamOrigin = false;
+      Serial.println(F("E C UNSTABLE"));
+      return;
+    }
     haveStreamOrigin = true;
     Serial.print(F("C ")); Serial.print(strOX); Serial.print(' ');
     Serial.print(strOY); Serial.print(' '); Serial.println(strOZ);
@@ -979,6 +1035,10 @@ void handleLine(char *s) {
   } else if (s[0] == '!') {                  // ABORT: stop, spindle off, lift
     gAbort = true;
     abortLift();
+  } else {
+    // A letter this firmware does not know is said so, not met with silence:
+    // a host built for another firmware finds out at once, not by timeout.
+    Serial.print(F("E ")); Serial.print(s[0]); Serial.println(F(" UNKNOWN"));
   }
 }
 
