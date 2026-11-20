@@ -27,17 +27,12 @@ def render(toolpaths: list[list[Move]], xy_feed: float, plunge_feed: float,
     dry-run outline, which is watched from close up). ``rpm`` sets the speed
     with ``!RC`` before the spindle starts; None leaves the machine's own.
 
-    No program starts with a diagonal. The first `Z x,y,z` drives all three
-    axes at once from wherever the bit happens to be, and right after Z has
-    been zeroed on the copper that is ON the copper: the spinning bit dragged
-    across the board on its way to the first cut (2026-11 review). So every
-    program first lifts straight up to the highest Z it uses: `!PZ` sets
-    that as the pen-up height and a bare `PU` raises the tool to it where it
-    stands, as the G-code backend's `G28 Z` does. A program whose highest Z
-    is not above the surface gets no lift, since there "up" would be down.
-
-    `safe_start` (the automatic run) also travels to the first point at that
-    height (`PU x,y`), as it always has.
+    `safe_start` (the automatic run) never starts with a diagonal. The
+    first `Z x,y,z` drives all three axes at once from wherever the bit
+    happens to be, so a bit left low drags across the stock on its way. With
+    it, the program first climbs to the highest Z it uses (`!PZ` sets that
+    as the pen-up height, and `PU` lifts before it travels). Off by default
+    until it is proven on the machine: exported files are unchanged.
 
     ``header`` is accepted and IGNORED. The G-code backend writes the
     per-operation notes there as ``( ... )`` comments; RML-1 has no comment
@@ -48,16 +43,11 @@ def render(toolpaths: list[list[Move]], xy_feed: float, plunge_feed: float,
     speed = f"!RC{int(rpm)};" if spindle and rpm else ""
     out = ["^IN;" + speed + ("!MC1;" if spindle else "!MC0;")]   # init + spindle
     moves = [m for tp in toolpaths for m in tp]
-    mode = None                  # "cut" | "rapid"
-    top = max(m.z for m in moves) if moves else 0.0
     if moves and safe_start:
+        top = max(m.z for m in moves)
         out.append(f"VS{rapid_feed};!VZ{rapid_feed};")
         out.append(f"!PZ0,{_u(top)};PU{_u(moves[0].x)},{_u(moves[0].y)};")
-        mode = "rapid"
-    elif moves and _u(top) > 0:
-        out.append(f"VS{rapid_feed};!VZ{rapid_feed};")
-        out.append(f"!PZ0,{_u(top)};PU;")
-        mode = "rapid"
+    mode = None                  # "cut" | "rapid"
     for tp in toolpaths:
         for m in tp:
             want = "rapid" if m.rapid else "cut"
