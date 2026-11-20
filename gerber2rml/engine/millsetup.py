@@ -364,17 +364,9 @@ LINUX = _is_linux()
 USB_HINT = (
     "Reading the mill's settings needs direct USB access: the pyusb package "
     "and libusb. From source, `pip install pyusb` and `brew install libusb` "
-    "(or your distribution's libusb-1.0); the packaged app carries both. See "
-    "docs/vpanel-settings.md.")
-
-# Linux lets a vendor request past the usblp driver without claiming
-# anything, but /dev/bus/usb is root's unless a udev rule says otherwise.
-UDEV_RULE = ('SUBSYSTEM=="usb", ATTR{idVendor}=="0b75", '
-             'ATTR{idProduct}=="039f", MODE="0666"')
-UDEV_HINT = (
-    "On Linux this needs permission to the mill's USB device: put the line "
-    + UDEV_RULE + " in /etc/udev/rules.d/60-srm20.rules, run `sudo udevadm "
-    "control --reload` and plug the mill in again.")
+    "(macOS) - Linux has libusb already, and needs Machine \u25b8 Set up USB "
+    "access\u2026 once; "
+    "the packaged app carries both. See docs/vpanel-settings.md.")
 
 
 def _libusb_backend():
@@ -441,7 +433,9 @@ def _open_libusb():
         raise SetupError("the mill is on USB but does not answer its "
                          "settings channel. Another program may hold it, or "
                          "this system does not let SRM-CAM talk to it."
-                         + (" " + UDEV_HINT if LINUX else ""))
+                         + (" On Linux use Machine \u25b8 Set up USB access\u2026 "
+                            "once, then plug the mill in again." if LINUX
+                            else ""))
     return dev
 
 

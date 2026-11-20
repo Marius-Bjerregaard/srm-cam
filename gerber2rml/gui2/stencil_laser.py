@@ -50,6 +50,10 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
 
 from gerber2rml.engine import xtool
 from gerber2rml.gui2 import background, theme, widgets
+from gerber2rml.gui2 import laser_focus_ui as _lfu
+from gerber2rml.gui2 import laser_autocal as _autocal
+from gerber2rml.gui2 import laser_fieldtest_ui as _ftu
+from gerber2rml.gui2 import laserlog as _laserlog
 from gerber2rml.gui2.undo import PlacementUndo, install as install_undo
 
 _SETTINGS = ("SRM-CAM", "stencil-laser")
@@ -377,6 +381,9 @@ class _BedView(QGraphicsView):
         self._last_band = QRectF()
         self._pan = None
         self.pick_reference = False
+        # While the laser runs: still zoom, pan and fit to look round the
+        # bed, but nothing that changes the job.
+        self.locked = False
 
     def fit(self):
         self._fitted = True
@@ -404,6 +411,9 @@ class _BedView(QGraphicsView):
         self.fit()
 
     def mousePressEvent(self, e):
+        if self.locked and e.button() != Qt.MiddleButton:
+            e.accept()
+            return
         if self.pick_reference and e.button() == Qt.LeftButton:
             self.reference_clicked.emit(self.mapToScene(e.position().toPoint()))
             e.accept()
@@ -426,6 +436,9 @@ class _BedView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def keyPressEvent(self, e):
+        if self.locked:
+            e.ignore()
+            return
         step = 0.1
         if e.modifiers() & Qt.ShiftModifier:
             step = 1.0
@@ -442,6 +455,8 @@ class _BedView(QGraphicsView):
         super().keyPressEvent(e)
 
     def contextMenuEvent(self, e):
+        if self.locked:
+            return
         self.context.emit(self.mapToScene(e.pos()), e.globalPos())
 
     def set_select_mode(self, on):
@@ -459,6 +474,9 @@ class _BedView(QGraphicsView):
         if self._pan is not None and e.button() == Qt.MiddleButton:
             self._pan = None
             self.unsetCursor()
+            return
+        if self.locked:
+            e.accept()
             return
         band = self._last_band
         self._last_band = QRectF()
@@ -1047,6 +1065,52 @@ class StencilLaserDialog(QDialog):
         focus_more.body.addWidget(
             _row((widgets.Field("By hand", self.thickness), 1), self.set_focus_btn))
         s.add(focus_more)
+        # The focus map's correction for the machine's own error
+        # (gui2/laser_focus_ui.py), measured once on a flat sheet.
+        ref_more = widgets.Disclosure("Focus map correction", key="laser-focus-ref")
+        self.focus_ref_note = widgets.hint(_lfu.reference_status())
+        ref_more.body.addWidget(self.focus_ref_note)
+        self.focus_ref_btn = widgets.button(
+            "Measure on a flat sheet", on=lambda: _lfu.calibrate(self),
+            tip="Fresh copper-clad lying flat on the bed, a job loaded as big "
+                "as the sheet and covering the middle of the bed, Autofocus "
+                "first. Every later focus map has what the dot reads here "
+                "taken off.")
+        self.focus_ref_forget = widgets.button(
+            "Forget", kind="ghost", on=lambda: _lfu.forget_reference(self))
+        ref_more.body.addWidget(_row(self.focus_ref_btn, self.focus_ref_forget))
+        s.add(ref_more)
+        # How many points the focus map measures, and how far in from the
+        # board's edge. Drawn on the bed as they are changed.
+        map_more = widgets.Disclosure("Focus map points", key="laser-focus-map")
+        spacing, inset = _lfu.map_settings()
+        self.map_spacing = _spin(spacing, 10.0, 100.0, 10.0, 0, suffix=" mm")
+        self.map_inset = _spin(inset, 2.0, 40.0, 1.0, 1, suffix=" mm")
+        map_more.body.addWidget(widgets.Field(
+            "Points every", self.map_spacing,
+            help="Closer gives more points: a better map of a bowed board, "
+                 "and a longer measurement."))
+        map_more.body.addWidget(widgets.Field(
+            "In from the edge", self.map_inset,
+            help="How far in from the board's outline the outer points sit. "
+                 "Every point also keeps clear of the holes and the cut-out."))
+        self.map_plan_note = widgets.hint("")
+        map_more.body.addWidget(self.map_plan_note)
+        self.map_spacing.valueChanged.connect(self._map_settings_changed)
+        self.map_inset.valueChanged.connect(self._map_settings_changed)
+        map_more._btn.clicked.connect(
+            lambda: self._show_map_plan(map_more._expanded))
+        self.map_more = map_more
+        s.add(map_more)
+        # Focus or the field? One etch on a spare sheet tells which leaves a
+        # board's edges unfinished (engine/laser_fieldtest.py).
+        self.field_test_btn = widgets.button(
+            "Field test…", kind="ghost", on=lambda: _ftu.load(self),
+            tip="Loads a 150 x 90 mm test in place of the job: coupons over "
+                "the whole sheet at focus, and ladders above and below it, "
+                "cut with this recipe. It shows whether unfinished edges are "
+                "focus or the laser's field.")
+        s.add(self.field_test_btn)
         pv.addWidget(s)
 
         s = widgets.Section("Camera")
@@ -1107,6 +1171,10 @@ class StencilLaserDialog(QDialog):
         self.burst = _ispin(r.passes_per_burst, 1, 50)
         self.rest = _spin(r.rest_s, 0, 120, 1, 0)
         self.zones = _ispin(r.zones, 1, 12)
+        # The field is weaker at its edges (xtool.EDGE_PASSES): more passes
+        # on the trenches further than this from the middle of the bed.
+        self.edge_passes = _ispin(xtool.EDGE_PASSES, 0, 100)
+        self.edge_radius = _spin(xtool.EDGE_RADIUS_MM, 10, 160, 5, 0)
         self.spot_drills = QCheckBox("Etch drill hole centres inside pads")
         self.spot_drills.setChecked(True)
         # A mark to drill by, so only worth etching while the holes are not
@@ -1130,6 +1198,13 @@ class StencilLaserDialog(QDialog):
         self.burst_field = widgets.Field("Per burst", self.burst, unit="passes")
         self.rest_field = widgets.Field("Rest", self.rest, unit="s")
         self.zones_field = widgets.Field("Zones", self.zones)
+        self.edge_passes_field = widgets.Field(
+            "Edge passes", self.edge_passes, unit="more",
+            help="The laser is weaker towards the edges of its field. These "
+                 "passes go only on the trenches further out than below, "
+                 "after the others. The field test measures where.")
+        self.edge_radius_field = widgets.Field(
+            "Beyond", self.edge_radius, unit="mm from the bed's middle")
 
         for field_w, wdg in (
             (self.power_field, self.power),
@@ -1142,6 +1217,8 @@ class StencilLaserDialog(QDialog):
             (self.burst_field, self.burst),
             (self.rest_field, self.rest),
             (self.zones_field, self.zones),
+            (self.edge_passes_field, self.edge_passes),
+            (self.edge_radius_field, self.edge_radius),
         ):
             self.recipe_more.body.addWidget(field_w)
             if wdg in (self.offsets, self.trace_kerf, self.density):
@@ -1214,13 +1291,20 @@ class StencilLaserDialog(QDialog):
         self.trace_btn = widgets.button(
             "Show where", on=self.trace,
             tip="The blue diode round the outline, faint enough not to mark steel")
+        # The whole set-up of a traces job, one press (gui2/laser_autocal.py).
+        self.autocal_btn = widgets.button(
+            "Calibrate", kind="primary", on=lambda: _autocal.start(self),
+            tip="Finds the board on the bed, autofocuses, corrects the camera "
+                "and locks onto the drilled holes, then maps the focus - and "
+                "says whether it is ready to cut. Cut is still yours to press.")
         self.cut_btn = widgets.button("Cut", kind="primary", on=self.cut)
-        self.cut_btn.setMinimumWidth(150)
+        self.cut_btn.setMinimumWidth(130)
         self.stop_btn = widgets.button("STOP", kind="stop", on=self.stop)
         self.stop_btn.setMinimumWidth(112)
         readouts = _group(self.cursor_read, self.sel_read, self.time_read,
                           gap=theme.GAP_M)
-        runs = _group(self.photo_after, self.trace_btn, self.cut_btn,
+        runs = _group(self.photo_after, self.trace_btn, self.autocal_btn,
+                      self.cut_btn,
                       self.stop_btn, gap=theme.GAP_M)
         foot = _Reflow(readouts, mid, runs, move_first=True, stretch=1, room=240,
                        joint=widgets.vrule(),
@@ -1317,6 +1401,25 @@ class StencilLaserDialog(QDialog):
                     lbl.setPos(x, y)
                     self.scene.addItem(lbl)
 
+    def _map_settings_changed(self, *_):
+        _lfu.set_map_settings(self.map_spacing.value(), self.map_inset.value())
+        self._show_map_plan(True)
+
+    def _show_map_plan(self, on=True):
+        """The points the next focus map will measure, on the bed - unless a
+        measured map is up, which keeps its own."""
+        if getattr(self, "_focus_map", None) is not None:
+            return
+        if not on:
+            self.show_focus_points([])
+            self.map_plan_note.setText("")
+            return
+        pts, moved = _lfu.plan(self)
+        self.show_focus_points([(x, y, None) for x, y in pts])
+        self.map_plan_note.setText(
+            f"{len(pts)} points." + _lfu._moved_words(moved)
+            if pts else "Nothing loaded.")
+
     def show_focus_points(self, points):
         """The focus map on the bed: each measured point, and how far it was
         from focus (mm, + above)."""
@@ -1326,6 +1429,13 @@ class StencilLaserDialog(QDialog):
         for x, y, dz in points:
             path = QPainterPath()
             path.addEllipse(QPointF(x, y), 1.2, 1.2)
+            if dz is None:              # planned, not measured yet
+                marker = self.scene.addPath(path, _pen(theme.PROBE, 1.2))
+                marker.setZValue(26)
+                marker.setAcceptedMouseButtons(Qt.NoButton)
+                marker.setToolTip("The focus map will measure here")
+                self._focus_marks.append(marker)
+                continue
             colour = theme.CAUTION if abs(dz) > 0.15 else theme.VERIFIED
             marker = self.scene.addPath(path, _pen(colour, 1.6))
             label = self.scene.addSimpleText(f"{dz:+.2f}")
@@ -1470,6 +1580,8 @@ class StencilLaserDialog(QDialog):
         self.burst_field.setVisible(is_stencil)
         self.rest_field.setVisible(is_stencil or (is_traces and strat == "concentric"))
         self.zones_field.setVisible(is_stencil)
+        for f in (self.edge_passes_field, self.edge_radius_field):
+            f.setVisible(is_traces and strat == "concentric")
         self.spot_drills.setVisible(is_traces and bool(self.base_art.drills))
         self._sync_spot_drills()
         self.cross.setVisible(self.kind in ("mask", "silk") or is_hatch)
@@ -2001,9 +2113,23 @@ class StencilLaserDialog(QDialog):
             self.redo_btn.setEnabled(self.undo.can_redo())
 
     def focus_point(self):
+        """Where Autofocus measures: the cross, on the factory's 10 mm grid -
+        and never in a hole or on the cut-out, where the dot reads the hole's
+        depth as the surface. A cross that lands there goes to the nearest
+        grid point clear of them."""
         cx, cy = self.centre()
         dx, dy = self._focus_offset or (0.0, 0.0)
-        return xtool.snap_to_grid((cx + dx, cy + dy))
+        at = xtool.snap_to_grid((cx + dx, cy + dy))
+        try:
+            from gerber2rml.engine import laser_focus as lf
+            safe = _lfu.cross_safe(self)
+            if safe is not None and not safe.is_empty:
+                from shapely.geometry import Point
+                if not safe.contains(Point(*at)):
+                    at = lf.clear_point(cx + dx, cy + dy, safe) or at
+        except Exception:                   # noqa: BLE001 - keep the cross
+            pass
+        return at
 
     def _place_focus_mark(self):
         self._focus_mark.setPos(*self.focus_point())
@@ -2343,6 +2469,9 @@ class StencilLaserDialog(QDialog):
             self.trace_kerf.setValue(d.get("kerf", xtool.DEFAULT_TRACE_KERF))
             self.density.setValue(d["lines_per_cm"])
             self.rest.setValue(d.get("rest_s", 0.0))
+            self.edge_passes.setValue(int(d.get("edge_passes", xtool.EDGE_PASSES)))
+            self.edge_radius.setValue(float(d.get("edge_radius",
+                                                  xtool.EDGE_RADIUS_MM)))
             self._spot_auto = True
             try:
                 self.spot_drills.setChecked(bool(d.get("spot_drills", True)))
@@ -2452,7 +2581,9 @@ class StencilLaserDialog(QDialog):
             if r.strategy == "concentric":
                 what = (f"Concentric · {r.offsets} ring{'' if r.offsets == 1 else 's'} "
                         f"({r.isolation_mm:.2f} mm gap) · {r.passes} depth passes · "
-                        f"{r.power:g} % @ {r.speed:g} mm/s")
+                        f"{r.power:g} % @ {r.speed:g} mm/s"
+                        + (f" · +{r.edge_passes} beyond {r.edge_radius:g} mm"
+                           if r.edge_passes else ""))
             else:
                 mode = "Moat hatch" if r.strategy == "moat" else "Full rubout"
                 what = (f"{mode} · {r.power:g} % · {r.speed:g} mm/s · {r.passes} passes · "
@@ -2483,6 +2614,21 @@ class StencilLaserDialog(QDialog):
             pass
         d = presets.get(name) or presets[next(iter(TRACES_PRESETS))]
         return int(d.get("offsets", xtool.DEFAULT_TRACE_OFFSETS))
+
+    def _tell_host_done(self):
+        """The whole job ran: its row on the main window's rail is done
+        (and so in the project)."""
+        host = self._host
+        plan = getattr(host, "plan", None)
+        key = f"laser_{self.kind}"
+        if plan is not None and plan.by_key(key) is not None \
+                and hasattr(host, "traveller"):
+            if self.kind == "traces" and getattr(self, "_trace_side", None) == "top":
+                # The second face of a two-sided board: its own tick in a
+                # project (gui2/projectpage.py); the rail has one row.
+                from gerber2rml.gui2.projectpage import TOP_TRACES
+                key = TOP_TRACES
+            host.traveller.set_done(key, True)
 
     def _tell_host_rings(self):
         """The recipe is the one place the ring count is set: the main window
@@ -2544,7 +2690,9 @@ class StencilLaserDialog(QDialog):
                 spot_drills=self.spot_drills.isChecked(),
                 cross_hatch=self.cross.isChecked(),
                 one_way=self.one_way.isChecked(),
-                mark_outline=self.mark.isChecked())
+                mark_outline=self.mark.isChecked(),
+                edge_passes=self.edge_passes.value(),
+                edge_radius=self.edge_radius.value())
         if self.kind != "stencil":
             return xtool.FillRecipe(power=self.power.value(), speed=self.speed.value(),
                                     frequency=self.freq.value(),
@@ -2974,6 +3122,8 @@ class StencilLaserDialog(QDialog):
                "marks go beside it or on copper the job removes anyway."))
         for w in (self.proof_hint, self.proof_btn):
             w.setVisible(on)
+        if hasattr(self, "autocal_btn"):
+            self.autocal_btn.setVisible(on)
         self.proof_more.setVisible(on and self._pro())
         if not on:
             self.proof_note.setVisible(False)
@@ -3181,7 +3331,9 @@ class StencilLaserDialog(QDialog):
         at = at or self.focus_point()
 
         def work(_p):
-            z = self.laser.autofocus(self._calibration(), at)
+            from gerber2rml.gui2 import laser_focus_ui as _lfu
+            z = self.laser.autofocus(self._calibration(), at,
+                                     bias=_lfu.bias_at(at))
             return z, self._photo()
 
         def done(result):
@@ -3258,9 +3410,13 @@ class StencilLaserDialog(QDialog):
                 a = None
             return z, self._photo(_PX_PER_MM, raw), a
 
+        whole = not self.selected
+
         def done(res):
             z, rgb, a = res
             self._last_cut_paths = holes
+            if whole:
+                self._tell_host_done()
             if rgb is not None:
                 self.show_bed(rgb)
             n = sum(job.zones)
@@ -3308,11 +3464,23 @@ class StencilLaserDialog(QDialog):
             from gerber2rml.gui2 import laser_focus_ui as _lfu
             recipe = self._run_recipe()
             if self.kind == "traces":
-                zones = _lfu.zones_for(self, sorted(picked))
+                # Banded by where the paths lie, not by each region's middle:
+                # the isolation round the edge is one region centred on the
+                # board, and the edge is what the map is for.
                 origin = self.origin()
+                only = self._traces_only()
+                zones = []
+                for dz, boxes in _lf.band_boxes(fmap, _lfu.job_bounds(self)):
+                    try:
+                        xtool.traces_job(self.art, origin, recipe, only=only,
+                                         boxes=boxes, write=False)
+                    except ValueError:      # nothing of this job in that band
+                        continue
+                    zones.append((dz, boxes))
 
-                def build(idx):
-                    return xtool.traces_job(self.art, origin, recipe, only=idx)
+                def build(boxes):
+                    return xtool.traces_job(self.art, origin, recipe, only=only,
+                                            boxes=sorted(boxes))
             else:
                 shapes = self._shapes()
                 _, outline = xtool.stencil_paths(self.art, self.origin())
@@ -3323,11 +3491,30 @@ class StencilLaserDialog(QDialog):
                     return xtool.fill_job([shapes[i] for i in sorted(idx)],
                                           outline, recipe)
 
+        # The field test: each ladder height its own band, every coupon cut
+        # (no auto-skip: a coupon's moat isolates nothing by design).
+        field = self.kind == "traces" and _ftu.active(self)
+        if field:
+            origin, recipe = self.origin(), self._run_recipe()
+            zones = _ftu.zones(self, set(self.selected) or None)
+            every = sorted(set().union(*[i for _dz, i in zones]))
+            job = xtool.traces_job(self.art, origin, recipe, only=every)
+            self._job = job
+            picked = set(every)
+
+            def build(idx):
+                return xtool.traces_job(self.art, origin, recipe,
+                                        only=sorted(idx))
+
         def work(progress):
             z = self.laser.z()
+            run_map = fmap
+            if field:
+                from gerber2rml.engine import laser_focus as _lf
+                run_map = _lf.FocusMap([], z, [])     # heights from here
             if zones is not None and len(zones) > 1:
                 from gerber2rml.gui2 import laser_focus_ui as _lfu
-                z = _lfu.run_zoned(self.laser, fmap, zones, build,
+                z = _lfu.run_zoned(self.laser, run_map, zones, build,
                                    progress=progress,
                                    timeout_for=lambda j: j.seconds * 2 + 120)
             else:
@@ -3346,16 +3533,30 @@ class StencilLaserDialog(QDialog):
                 self.laser.wait(job.seconds * 2 + 120, progress=progress)
             return z, (self._photo_after_job(before) if take_photo else None)
 
+        whole = not self.selected and not field
+
         def done(res):
             z, rgb = res
             if rgb is not None:
                 self.show_bed(rgb)
+            if whole:
+                self._tell_host_done()
             n = len(picked)
             return (f"Done at Z {z:.2f}: {n} {self._noun(n)}, "
                     f"{job.passes} passes. Switch to Outlines to check them on the "
                     f"photo; select any that need more and run those again.")
         what = (f"{len(self.selected)} selected" if self.selected
                 else f"{len(picked)} {self._noun(len(picked))}")
+        _laserlog.write(
+            "etch", job=self.name_lbl.text(), kind=self.kind,
+            field_test=field, origin=self.origin(),
+            turns=self.turns, fine=self.fine,
+            recipe=self.recipe_lbl.text() if hasattr(self, "recipe_lbl") else None,
+            preset=self.preset.currentText(), passes=job.passes,
+            seconds=round(job.seconds), pieces=len(picked),
+            focus_map_z=getattr(fmap, "z", None),
+            focus_map=_laserlog.points(fmap),
+            bands=[[round(dz, 3), len(b)] for dz, b in (zones or [])])
         self._start(work, f"{self.k['busy']}: {what}, {job.passes} passes…", done)
 
     def stop(self):
@@ -3414,11 +3615,16 @@ class StencilLaserDialog(QDialog):
                           if "answer" in msg else "warn")
         self._paint()
         self._say(msg, warn=warn)
+        _laserlog.write("problem" if warn else "done", message=msg,
+                        job=self.name_lbl.text(), kind=self.kind)
+        _autocal.after_step(self, msg, warn)
 
     def _busy(self, on):
         for b in (self.photo_btn, self.focus_btn, self.focus_map_btn, self.align_btn, self.set_focus_btn,
+                  self.focus_ref_btn, self.focus_ref_forget,
                   self.learn_btn, self.reset_off_btn,
-                  self.trace_btn, self.cut_btn, self.rot_l, self.rot_r,
+                  self.trace_btn, self.cut_btn, self.autocal_btn,
+                  self.rot_l, self.rot_r,
                   self.mode, self.job_switch, self.strategy,
                   self.rework_btn, self.rework_clear_btn, self.rework_passes,
                   self.all_btn, self.none_btn, self.x, self.y,
@@ -3439,7 +3645,9 @@ class StencilLaserDialog(QDialog):
         if self.item is not None:
             self.item.setFlag(QGraphicsItem.ItemIsMovable,
                               not on and not self.view.select_mode and not self.view.pick_reference)
-        self.view.setEnabled(not on)
+        # Not disabled: the bed can still be zoomed and panned while the
+        # laser runs; only what would change the job is locked.
+        self.view.locked = on
 
     def _say(self, text, warn=False):
         self.status.setText(text)

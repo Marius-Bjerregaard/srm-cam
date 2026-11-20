@@ -472,7 +472,7 @@ def test_on_windows_no_mill_says_what_to_check(monkeypatch):
         millsetup.open_mill()
 
 
-def test_on_linux_a_mill_that_will_not_answer_points_at_udev(monkeypatch):
+def test_on_linux_a_mill_that_will_not_answer_points_at_usb_access(monkeypatch):
     import types
     monkeypatch.setattr(millsetup, "WINDOWS", False)
     monkeypatch.setattr(millsetup, "LINUX", True)
@@ -487,5 +487,5 @@ def test_on_linux_a_mill_that_will_not_answer_points_at_udev(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "usb", usb)
     monkeypatch.setitem(__import__("sys").modules, "usb.core", core)
     monkeypatch.setattr(millsetup, "_libusb_backend", lambda: object())
-    with pytest.raises(SetupError, match="udev"):
+    with pytest.raises(SetupError, match="Set up USB access"):
         millsetup.open_mill()

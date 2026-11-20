@@ -134,8 +134,8 @@ def test_a_panel_move_puts_back_only_the_board_that_moved(qt_app):
         w.stage.placement_changed.emit(0.0, 20.0)
         assert [(m.place_x, m.place_y) for m in w.state.boards] != before
         w.action_undo()
-        assert [(m.place_x, m.place_y) for m in w.state.boards] == \
-            pytest.approx(before)
+        assert [c for m in w.state.boards for c in (m.place_x, m.place_y)] \
+            == pytest.approx([c for xy in before for c in xy])
     finally:
         w.close()
 

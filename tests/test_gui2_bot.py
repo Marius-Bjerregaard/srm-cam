@@ -620,8 +620,9 @@ def test_how_it_is_made_lands_and_brings_its_tool_with_it(qt_app,
 def test_a_laser_board_is_set_up_as_the_mill_runs_it_and_put_back(
         qt_app, monkeypatch):
     """Laser copper turns a two-sided board into a one-sided job for the
-    mill and takes the levelling off. All of that is the app's own doing,
-    from the one answer; and all of it is undone by Cancel."""
+    mill; the levelling stays on, for the drill and the cut-out (upstream
+    8034564). All of that is the app's own doing, from the one answer; and
+    all of it is undone by Cancel."""
     w = _window(monkeypatch)
     try:
         _sim(qt_app, w)
@@ -632,8 +633,7 @@ def test_a_laser_board_is_set_up_as_the_mill_runs_it_and_put_back(
         def at_summary(sheet):
             assert w.method_id() == fab.LASER and w.laser_method()
             assert not w._double                        # one side, on the mill
-            assert not page.level_chk.isChecked()       # nothing to level for
-            assert not any("touches the copper" in f for f in sheet.facts)
+            assert page.level_chk.isChecked()   # the holes must go through
             return "cancel"
         hands = Hands(answers={"method": _pick(fab.LASER),
                                "sheet": _size(150, 124)},
