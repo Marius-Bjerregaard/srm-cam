@@ -6,6 +6,12 @@ from dataclasses import dataclass
 DEFAULT_STOCK_MM = (160.0, 100.0)
 
 
+# A 0.8 mm ball mill at 0.08 mm deep cut a 0.44 mm channel on the mill (4 Nov
+# 2026); its geometric chord there is 0.48 mm. Every ball's chord is scaled by
+# this, so the measured case comes out exact (TraceJob.ball_width).
+BALL_MEASURED_RATIO = 0.44 / (2.0 * math.sqrt(2.0 * 0.4 * 0.08 - 0.08 * 0.08))
+
+
 @dataclass
 class TraceJob:
     bit_diameter: float = 0.4    # mm (1/64") — flat endmill cut width
@@ -26,7 +32,7 @@ class TraceJob:
     # A V-bit's cut width grows with depth, so for tight SMD traces we drive it
     # "width-first": the operator sets target_width and the depth is back-solved.
     # tool_type == "flat" keeps the original flat-endmill behaviour untouched.
-    tool_type: str = "flat"      # "flat" | "vbit"
+    tool_type: str = "flat"      # "flat" | "vbit" | "ball"
     tip_diameter: float = 0.1    # mm — flat at the very tip of the V (T)
     included_angle: float = 30.0  # deg — full included angle of the V (theta)
     target_width: float = 0.2    # mm — desired effective cut width for a V-bit (W)
@@ -46,6 +52,20 @@ class TraceJob:
             return 0.0
         return max(0.0, (width - self.tip_diameter) / (2.0 * t))
 
+    # -- ball mill: a round end, so its channel is narrower than the bit --
+    def ball_width(self, depth=None):
+        """The channel a ball mill of ``bit_diameter`` cuts at ``depth`` (mm).
+
+        The chord of the ball at that depth, 2*sqrt(2*R*h - h*h), times what
+        the mill makes of it: a 0.8 mm ball at 0.08 mm deep was MEASURED at
+        0.44 mm (4 Nov 2026, docs/bit-capabilities.md) where the geometry says
+        0.48, so the chord is scaled by that ratio. Other diameters are the
+        same rule - worked out, until someone measures them."""
+        r = self.bit_diameter / 2.0
+        h = max(0.0, min(self.cut_depth if depth is None else depth, r))
+        chord = 2.0 * math.sqrt(max(0.0, 2.0 * r * h - h * h))
+        return min(self.bit_diameter, chord * BALL_MEASURED_RATIO)
+
     def effective_cut_depth(self):
         """Depth the cut should plunge to. Flat: the configured ``cut_depth``.
         V-bit: the depth that yields ``target_width`` (width-first)."""
@@ -59,6 +79,8 @@ class TraceJob:
         achievable ``target_width`` once depth is clamped to >= 0."""
         if self.tool_type == "vbit":
             return self.width_at_depth(self.effective_cut_depth())
+        if self.tool_type == "ball":
+            return self.ball_width()
         return self.bit_diameter
 
     def width_sensitivity(self):
@@ -66,6 +88,11 @@ class TraceJob:
         For a flat endmill this is 0 (width is depth-independent). This is the
         amplification factor from a surface-height error to a trace-width error,
         which is why a V-bit must run over a dense bed-leveling mesh."""
+        if self.tool_type == "ball":
+            # d/dh of the chord: (R - h) / sqrt(2Rh - h^2), twice, scaled.
+            r, h = self.bit_diameter / 2.0, min(self.cut_depth, self.bit_diameter / 2.0)
+            root = math.sqrt(max(1e-9, 2.0 * r * h - h * h))
+            return 2.0 * (r - h) / root * BALL_MEASURED_RATIO
         if self.tool_type != "vbit":
             return 0.0
         return 2.0 * math.tan(math.radians(self.included_angle) / 2.0)
@@ -123,7 +150,7 @@ LIMITS = {
     "included_angle": (5.0, 120.0), "target_width": (0.01, 5.0),
     "peck_retract": (0.0, 5.0), "tabs": (0, 20), "tab_width": (0.0, 10.0),
 }
-CHOICES = {"tool_type": ("flat", "vbit")}
+CHOICES = {"tool_type": ("flat", "vbit", "ball")}
 
 
 def checked_job(job, values):

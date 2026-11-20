@@ -1368,7 +1368,7 @@ class MainWindow(QMainWindow):
         """The first tool profile that is this method's, applied."""
         table = presets_mod.load_presets()
         for name, preset in table.items():
-            bit = (preset.get("trace") or {}).get("bit_diameter")
+            bit = presets_mod.trace_width(preset.get("trace") or {})
             if fab.from_profile(bit) == mid:
                 presets_mod.apply_preset(self.state, preset)
                 self._apply_auto_depth()
@@ -3350,25 +3350,15 @@ class MainWindow(QMainWindow):
                 board.outline.boundary.buffer(band * 1.5))
         return edges
 
-    def _nogo_checks(self):
-        """Is any of the work in a no-go zone?
-
-        The run refuses such a job when it starts, from its real toolpaths
-        (engine/autorun.py, ``_check_nogo``). That is the last word, and it
-        comes late: after the board has been placed, the clamps put on and
-        Start pressed. This says it while the board can still be dragged.
-
-        Measured from the geometry, so that it can be redrawn with every
-        drag: a cut runs along the EDGE of copper, so it is the copper's
-        edges that count - a pour may lie under a clamp untouched - plus
-        every hole and reference hole. Both layers, each where the design
-        has it. The clearance is the run's own.
-        """
-        page = getattr(self, "autorun_page", None)
-        zones = page.nogo() if page is not None else []
+    def nogo_hits(self, zones, first=1):
+        """``(hard, soft)``: for each of ``zones`` (as the bed has them) the
+        work it lies on, as "clamp 1 (at X .., Y ..): bottom copper, 1 hole"
+        lines. ``hard`` stops the run; ``soft`` is isolation a board left in
+        the sheet can do without. ``(None, None)`` with nothing to measure.
+        ``first`` is the number the first zone is called by."""
         board = self.state.board
         if not zones or board is None or self.work_bounds() is None:
-            return []
+            return None, None
         from shapely.geometry import Point, box
         from gerber2rml.engine.autorun import NOGO_CLEAR_MM
         r = self.state.trace.effective_diameter() / 2.0
@@ -3377,7 +3367,7 @@ class MainWindow(QMainWindow):
                 else board.copper).bounds
         dx, dy = wb[0] - base[0], wb[1] - base[1]
         hard, soft = [], []
-        for n, z in enumerate(zones, 1):
+        for n, z in enumerate(zones, first):
             # In the board's own frame, grown to where the cutter's EDGE
             # may not come: the tool's radius is in the cut, not the zone.
             g = NOGO_CLEAR_MM + r
@@ -3417,6 +3407,30 @@ class MainWindow(QMainWindow):
                 soft.append("%s: %s" % (where, ", ".join(edges)))
             if what:
                 hard.append("%s: %s" % (where, ", ".join(what)))
+        return hard, soft
+
+    def _nogo_checks(self):
+        """Is any of the work in a no-go zone?
+
+        The run refuses such a job when it starts, from its real toolpaths
+        (engine/autorun.py, ``_check_nogo``). That is the last word, and it
+        comes late: after the board has been placed, the clamps put on and
+        Start pressed. This says it while the board can still be dragged.
+
+        Measured from the geometry, so that it can be redrawn with every
+        drag: a cut runs along the EDGE of copper, so it is the copper's
+        edges that count - a pour may lie under a clamp untouched - plus
+        every hole and reference hole. Both layers, each where the design
+        has it. The clearance is the run's own.
+        """
+        page = getattr(self, "autorun_page", None)
+        zones = page.nogo() if page is not None else []
+        if not zones:
+            return []
+        from gerber2rml.engine.autorun import NOGO_CLEAR_MM
+        hard, soft = self.nogo_hits(zones)
+        if hard is None:
+            return []
         out = []
         if hard:
             out.append(diag.Check(
