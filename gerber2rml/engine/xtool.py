@@ -30,6 +30,37 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 HOST = "201.234.3.1"
+# The laser hands this computer an address on its own USB network and sits at
+# .1 of it. Which network differs from laser to laser: the lab's F1 Ultra is
+# 201.234.3.x, another answered on 201.234.4.x (2026-11-20) - and with HOST
+# fixed, that one was "no answer" although it was plugged in and up.
+_SUBNETS = (3, 4, 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15)
+
+
+def _local_ip_towards(addr):
+    """The address this computer would send from to reach ``addr``, or None.
+    A UDP socket is only pointed at it: nothing is sent."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((addr, 9))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def find_host(local_ip=_local_ip_towards):
+    """The laser's address, from the network it gave this computer: the .1
+    of whichever 201.234.N.x this computer has an address on. None when it
+    has none - the laser's USB network is not up here."""
+    for n in _SUBNETS:
+        host = "201.234.%d.1" % n
+        mine = local_ip(host)
+        if mine and mine != host and mine.startswith("201.234.%d." % n):
+            return host
+    return None
 HTTP_PORT = 8080
 BED_MM = 234.0
 FOCUS_OFFSET = 8.0          # focus Z = XCS material thickness + 8 (xTool Studio)
@@ -385,9 +416,25 @@ class Stopped(LaserError):
 class F1Ultra:
     """The laser over its USB network link. Every call is one short HTTP request."""
 
-    def __init__(self, host=HOST, port=HTTP_PORT, timeout=10):
-        self.host, self.port, self.timeout = host, port, timeout
+    def __init__(self, host=None, port=HTTP_PORT, timeout=10):
+        self._host, self.port, self.timeout = host, port, timeout
         self._lit = False           # the fill light on, as far as we know
+
+    @property
+    def host(self):
+        """The laser's address: the one given, else found from the USB
+        network it is on right now (:func:`find_host`), else the lab's."""
+        return self._host or find_host() or HOST
+
+    def _no_answer(self, e):
+        if self._host is None and find_host() is None:
+            return LaserError(
+                "This computer has no network to the laser: it is on USB as "
+                "a network adapter, and none with a 201.234.x.x address is "
+                "up. Is it switched on and plugged into this computer by "
+                "USB? If it is, unplug its USB lead and plug it in again.")
+        return LaserError(f"No answer from the laser at {self.host} ({e}). Is "
+                          f"it switched on and plugged into this PC by USB?")
 
     def _req(self, method, path, body=None, ctype="application/json", timeout=None):
         if isinstance(body, (dict, list)):
@@ -400,8 +447,7 @@ class F1Ultra:
             r = c.getresponse()
             text = r.read().decode("utf-8", "replace")
         except OSError as e:
-            raise LaserError(f"No answer from the laser at {self.host} ({e}). Is it "
-                             f"switched on and plugged into this PC by USB?") from e
+            raise self._no_answer(e) from e
         finally:
             c.close()
         if r.status != 200:
@@ -480,7 +526,7 @@ class F1Ultra:
             r = c.getresponse()
             out = r.read()
         except OSError as e:
-            raise LaserError(f"No answer from the laser at {self.host} ({e}).") from e
+            raise self._no_answer(e) from e
         finally:
             c.close()
         if r.status != 200:
