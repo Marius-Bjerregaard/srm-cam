@@ -1575,6 +1575,48 @@ class AutoRunPage(inspector.Page):
             self.list_lay.addWidget(lab)
 
     # -- how far, and how long still ---------------------------------------
+    def _clear_old_jobs(self, printer):
+        """Windows: jobs left in the SRM-20's spooler - a VPanel job, or a
+        run's that waited while the mill was off - would cut before this
+        run's frame check, at whatever origin is set. The Mac has always
+        asked (macmill.preflight); Windows sent behind them. True to go on."""
+        from gerber2rml.engine import rmlspool
+        from gerber2rml.gui2 import dialogs
+        try:
+            left = printer.pending()
+        except rmlspool.SpoolError as e:
+            dialogs.report_error(self.window(), "The SRM-20's print queue "
+                                 "could not be read", e,
+                                 "Check the printer in Windows' Printers & "
+                                 "scanners.")
+            return False
+        if not left:
+            return True
+        d = dialogs.Sheet(self.window(), "Old jobs are waiting for the mill",
+                          level="warn", width=540)
+        d.say(f"{left} job(s) are still in the SRM-20's print queue - from "
+              f"VPanel, or an earlier run. They would cut before this run. "
+              f"Clear them?")
+        d.act("Cancel the run", on=d.reject)
+        d.act("Clear them", kind="primary", on=d.accept, default=True)
+        if not d.exec():
+            return False
+        try:
+            ok = printer.purge()
+        except rmlspool.SpoolError as e:
+            ok, why = False, e
+        else:
+            why = rmlspool.SpoolError("jobs still queued")
+        if not ok:
+            dialogs.report_error(self.window(), "The old jobs could not be "
+                                 "cleared", why,
+                                 "Someone else's jobs need an administrator "
+                                 "to remove: open the SRM-20 in Windows' "
+                                 "Printers & scanners, then Open print queue, "
+                                 "and cancel them there.")
+            return False
+        return True
+
     def _estimates(self, src):
         """``[(key, label, seconds)]`` for the run about to start.
 
@@ -1841,6 +1883,8 @@ class AutoRunPage(inspector.Page):
             printer = rmlspool.SpoolPrinter(name)
             if rmlspool.MACOS and not macmill.preflight(self.window(),
                                                         printer):
+                return
+            if rmlspool.WINDOWS and not self._clear_old_jobs(printer):
                 return
             # The mill's own settings, which used to need VPanel: the
             # command set is put right and said in the log; a run that would

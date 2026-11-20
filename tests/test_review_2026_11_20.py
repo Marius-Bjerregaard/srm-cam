@@ -243,3 +243,122 @@ def test_both_kinds_of_project_file_open_from_either_menu(
         assert w.project_ctl.project is not None
     finally:
         w.close()
+
+
+def test_a_roland_cutter_is_not_taken_for_the_mill(tmp_path):
+    """On Linux any Roland device (vendor 0b75) was the mill: a GS-24 vinyl
+    cutter on lp0 got the NC job."""
+    import sys
+    import pytest
+    if sys.platform == "win32":
+        pytest.skip("POSIX nodes")
+    from gerber2rml.engine import rmlspool
+    cls = tmp_path / "usbmisc"
+    cls.mkdir()
+    for name, pid, model in (("lp0", "0f00", "GS-24"),
+                             ("lp1", "039f", "SRM-20")):
+        usb = tmp_path / "devices" / name
+        intf = usb / "intf"
+        intf.mkdir(parents=True)
+        (usb / "idVendor").write_text("0b75\n")
+        (usb / "idProduct").write_text(pid + "\n")
+        (usb / "product").write_text(model + "\n")
+        (intf / "ieee1284_id").write_text("MFG:Roland;MDL:%s;\n" % model)
+        (cls / name).mkdir()
+        (cls / name / "device").symlink_to(intf)
+    nodes = rmlspool.usblp_nodes(sys_root=cls, dev_dir="/dev/usb")
+    assert [n for n, _ in nodes] == ["/dev/usb/lp1"]
+
+
+def test_a_second_connect_does_not_leave_the_port_locked(monkeypatch):
+    """Two Connects queued at once: the second opened the port again, failed
+    on the first's lock, and set the link to None with the port still
+    held - every later Connect failed until the app was restarted."""
+    import time
+    from gerber2rml.engine import spi_probe
+    from gerber2rml.gui2 import machine
+    held = set()
+
+    class FakeSer:
+        def __init__(self, port):
+            if port in held:
+                raise OSError("could not exclusively lock port")
+            held.add(port)
+            self.port, self.closed = port, False
+
+        def write(self, d):
+            return len(d)
+
+        def readline(self):
+            return b""
+
+        def flush(self):
+            pass
+
+        def reset_input_buffer(self):
+            pass
+
+        def close(self):
+            if not self.closed:
+                held.discard(self.port)
+                self.closed = True
+
+    def fake_open(port, **kw):
+        time.sleep(0.2)
+        return FakeSer(port)
+    monkeypatch.setattr(spi_probe, "open_link", fake_open)
+    monkeypatch.setattr(spi_probe, "firmware_version",
+                        lambda ser, timeout=1.5: (5, {"touchstop"}))
+    link = machine.MachineLink()
+    link.connect_to("/dev/ttyACM0")
+    link.connect_to("/dev/ttyACM0")
+    t = time.time()
+    while time.time() - t < 3 and (link._q.qsize() or link._busy
+                                   or not link.is_connected()):
+        _app.processEvents()
+        time.sleep(0.02)
+    assert link.is_connected()
+    assert held == {"/dev/ttyACM0"}
+    link.disconnect_from("done")
+    assert held == set()
+
+
+def test_an_arduino_that_stops_answering_is_called_lost(monkeypatch):
+    from gerber2rml.engine import spi_probe
+    from gerber2rml.gui2.machine import MachineLink
+    monkeypatch.setattr(spi_probe, "query_position", lambda *a, **k: None)
+    monkeypatch.setattr(spi_probe, "machine_status", lambda *a, **k: None)
+    link = MachineLink()
+    lost = []
+    link.lost.connect(lost.append)
+    for _ in range(link.SILENT_POLLS - 1):
+        link._do_poll(None)
+    assert not lost
+    link._do_poll(None)
+    assert len(lost) == 1 and "stopped answering" in lost[0]
+
+
+def test_windows_asks_about_jobs_left_in_the_spooler(monkeypatch, tmp_path):
+    """The Mac asked before a run; Windows sent behind an old VPanel job,
+    which cut first."""
+    from gerber2rml.gui2 import dialogs
+
+    class P:
+        purged = 0
+
+        def pending(self):
+            return 0 if self.purged else 2
+
+        def purge(self):
+            self.purged += 1
+            return True
+    w = _window(monkeypatch, tmp_path)
+    try:
+        monkeypatch.setattr(dialogs.Sheet, "exec", lambda self: 0)
+        p = P()
+        assert not w.autorun_page._clear_old_jobs(p) and not p.purged
+        monkeypatch.setattr(dialogs.Sheet, "exec", lambda self: 1)
+        assert w.autorun_page._clear_old_jobs(p) and p.purged == 1
+        assert w.autorun_page._clear_old_jobs(p)     # nothing left: no ask
+    finally:
+        w.close()

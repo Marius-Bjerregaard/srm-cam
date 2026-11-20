@@ -75,8 +75,45 @@ def _ask(parent, headline, text, go, level="warn"):
     return bool(d.exec())
 
 
-def preflight(parent, open_mill=None, say=None,
-              ask_unreadable=True):
+def _release(dev):
+    """Let go of the mill's settings channel. Neither the run's check nor the
+    sheet ever did: the usbprint handle (Windows) or libusb's (macOS, Linux)
+    stayed open for as long as the window, and where the driver allows one
+    open at a time the print spooler could not reach the mill after it."""
+    try:
+        if hasattr(dev, "close"):
+            dev.close()
+        else:
+            import usb.util
+            usb.util.dispose_resources(dev)
+    except Exception:                       # noqa: BLE001 - best effort
+        pass
+
+
+def _closing(open_mill):
+    """``(opener, opened)``: an opener that remembers what it opened."""
+    opened = []
+
+    def opener():
+        dev = open_mill()
+        opened.append(dev)
+        return dev
+    return opener, opened
+
+
+def preflight(parent, open_mill=None, say=None, ask_unreadable=True):
+    """:func:`_preflight`, with the channel closed afterwards."""
+    opener, opened = _closing(millsetup.open_mill if open_mill is None
+                              else open_mill)
+    try:
+        return _preflight(parent, opener, say, ask_unreadable)
+    finally:
+        for dev in opened:
+            _release(dev)
+
+
+def _preflight(parent, open_mill=None, say=None,
+               ask_unreadable=True):
     """Check the mill's own settings before a run sends anything, and put
     right what can be. True to go ahead.
 
@@ -132,6 +169,17 @@ def preflight(parent, open_mill=None, say=None,
 
 
 def settings_sheet(parent, open_mill=None):
+    """:func:`_settings_sheet`, with the channel closed when it is shut."""
+    opener, opened = _closing(millsetup.open_mill if open_mill is None
+                              else open_mill)
+    try:
+        return _settings_sheet(parent, opener)
+    finally:
+        for dev in opened:
+            _release(dev)
+
+
+def _settings_sheet(parent, open_mill=None):
     """Show the mill's settings and offer the two changes. Returns the last
     reading (:func:`read_all`), or None when the mill could not be reached."""
     open_mill = millsetup.open_mill if open_mill is None else open_mill
