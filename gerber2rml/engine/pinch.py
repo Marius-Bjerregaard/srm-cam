@@ -72,9 +72,10 @@ def _run_out(near, far, cleared, blocked, d_max, step=0.05, overlap=0.15):
     (``cleared``), which is where it can stop: past that point there is
     nothing left to cut.
 
-    It stops early if it would reach a THIRD island (``blocked``). Eating the
-    two pads that own the gap is the deal; slicing an unrelated trace on the
-    way past is not, so the run-out gives up rather than cross one.
+    It stops early if it would enter copper (``blocked``): slicing an
+    unrelated trace on the way past is not the deal, and neither is running
+    on through the neck of one of the gap's own pads, so the run-out gives up
+    rather than cross either (see :func:`pinch_centrelines`).
     """
     dx, dy = near[0] - far[0], near[1] - far[1]
     n = math.hypot(dx, dy)
@@ -244,9 +245,16 @@ def pinch_centrelines(copper, job, width=None, exact=False):
     cleared = copper.buffer(r).boundary.buffer(r)
     islands = _polygons(copper)
     lines = []
+    # Every island blocks the run-outs, the pair's own two included. The
+    # line here used to leave those two out with ``p is not a``, but shapely 2
+    # hands out a new object on every ``.geoms`` access, so it never matched
+    # and they have always blocked. Leaving them out for real (2026-11 review)
+    # lets a run-out carry on through a pad's narrow neck and cut a net in two
+    # (test_the_mosfet_board_comes_out_with_no_shorts_at_all), while no gap
+    # on examples/torture_60x30 is left joined either way. So this is now
+    # what the code says, not what it happened to do.
+    blocked = unary_union(islands) if islands else None
     for a, b, gap in pairs:
-        others = [p for p in islands if p is not a and p is not b]
-        blocked = unary_union(others) if others else None
         # Longest first: a channel's end is often found a second time off the
         # neighbouring edge as a stub a few samples long, pointing into the pad
         # rather than along the gap. Cutting that again buys nothing and its
