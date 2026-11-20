@@ -9,5 +9,5 @@ Board mirrored for bottom-up milling: True.
 Estimated run time (excludes tool changes, spin-up and pauses):
    golden_rml_drill.rml: ~2m 17s
    golden_rml_traces.rml: ~14m 49s
-   golden_rml_cutout.rml: ~5m 31s
-   TOTAL: ~22m 37s
+   golden_rml_cutout.rml: ~5m 37s
+   TOTAL: ~22m 43s

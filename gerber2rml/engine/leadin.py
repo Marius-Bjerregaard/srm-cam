@@ -17,6 +17,8 @@ the height map. It only touches paths that have a lateral cut to ramp along:
 The ramp is resampled by arc length, so a single long first edge is still entered
 gradually. Closed paths (isolation rings, the outline) are re-cut over the ramped
 lead-in at full depth at the end, so the gentle entry doesn't leave it shallow.
+Open paths (gap cuts, the cut-out's pieces between tabs) go back over the ramp
+at full depth and then run their whole length at it, for the same reason.
 """
 import math
 from gerber2rml.toolpath import Move
@@ -97,16 +99,31 @@ def _ramp_one(tp, ramp_len, clearance):
         px, py = point_at(ramp_d * f)
         out.append(Move(px, py, clearance + (cut_z - clearance) * f))
 
-    # 2) continue along the rest of the body at full depth (vertices past ramp_d)
-    for k in range(1, len(pts)):
-        if cum[k] > ramp_d + EPS:
-            out.append(Move(pts[k][0], pts[k][1], cut_z))
-
-    # 3) re-cut the ramped lead-in at full depth (closed paths return to the start)
     if closed:
+        # 2) continue along the rest of the body at full depth (vertices past ramp_d)
+        for k in range(1, len(pts)):
+            if cum[k] > ramp_d + EPS:
+                out.append(Move(pts[k][0], pts[k][1], cut_z))
+        # 3) re-cut the ramped lead-in at full depth (back at the start)
         for s_i in range(1, n + 1):
             px, py = point_at(ramp_d * s_i / n)
             out.append(Move(px, py, cut_z))
+    else:
+        # An open path does not come back to its start, so a re-cut at the
+        # end would be in the wrong place: until 2026-11 its first ramp_d was
+        # left shallow, and a path shorter than the ramp (a gap cut between
+        # two pads, a piece of cut-out between two tabs) reached full depth
+        # only at its very end. Gap cuts ran above the copper for half their
+        # length; tabs came out a ramp wider than set and short pieces were
+        # not cut through (2026-11 review). So: back along the ramp to the
+        # start at full depth, then the whole path forward at it, ending
+        # where the path ends for the retract that follows.
+        for k in range(len(pts) - 1, 0, -1):
+            if cum[k] < ramp_d - EPS:
+                out.append(Move(pts[k][0], pts[k][1], cut_z))
+        out.append(Move(x0, y0, cut_z))
+        for k in range(1, len(pts)):
+            out.append(Move(pts[k][0], pts[k][1], cut_z))
 
     out.extend(tp[j:])                             # original retract / trailing rapids
     return out

@@ -90,3 +90,70 @@ def test_fast_approach_leaves_peck_reentries_alone():
     peck = [Move(0, 0, 0.2, rapid=True), Move(0, 0, -1.0),
             Move(0, 0, -0.8, rapid=True), Move(0, 0, -1.9)]
     assert fast_approach([peck])[0] == peck
+
+
+def _line(x1, travel=2.0, y=0.0):
+    """An open cut from (0, y) to (x1, y): a gap cut, or a piece of cut-out
+    between two tabs."""
+    return [Move(0, y, travel, rapid=True), Move(0, y, CZ), Move(x1, y, CZ),
+            Move(x1, y, travel, rapid=True)]
+
+
+def _full_depth_cover(tp, z=CZ):
+    """The stretches of x the path cuts at full depth, merged."""
+    spans = sorted((min(a.x, b.x), max(a.x, b.x)) for a, b in zip(tp, tp[1:])
+                   if not b.rapid and abs(a.z - z) < 1e-9
+                   and abs(b.z - z) < 1e-9)
+    merged = []
+    for lo, hi in spans:
+        if merged and lo <= merged[-1][1] + 1e-9:
+            merged[-1][1] = max(merged[-1][1], hi)
+        else:
+            merged.append([lo, hi])
+    return merged
+
+
+def test_an_open_cut_shorter_than_the_ramp_is_cut_full_depth_end_to_end():
+    """A 0.5 mm gap cut with the 1 mm ramp: it used to ramp from end to end,
+    reaching full depth only at its last point (2026-11 review)."""
+    out = apply_lead_in([_line(0.5)])[0]
+    assert _full_depth_cover(out) == [[0.0, 0.5]]
+    assert min(m.z for m in out) >= CZ - 1e-9
+    last_cut = [m for m in out if not m.rapid][-1]
+    assert (last_cut.x, last_cut.y) == (0.5, 0.0)   # retract where it ends
+
+
+def test_an_open_cut_is_full_depth_over_its_ramp_too():
+    out = apply_lead_in([_line(5.0)])[0]
+    assert _full_depth_cover(out) == [[0.0, 5.0]]
+    # ...and it still enters on a ramp, not a plunge to depth
+    cuts = [m for m in out if not m.rapid]
+    assert cuts[0].z > 0 and cuts[1].z > CZ
+
+
+def test_cut_out_pieces_between_tabs_are_cut_through_but_tabs_are_not():
+    """The cut-out's last pass: every piece between two tabs is cut to the
+    full depth all along, and the tabs are left exactly the width set. The
+    ramp at each piece's start used to widen the tab by up to the ramp and
+    leave a piece under 1 mm not cut through."""
+    from shapely.geometry import LineString, box
+    from shapely.ops import unary_union
+    from gerber2rml.config import CutoutJob
+    from gerber2rml.engine.cutout import cut_outline
+    job = CutoutJob(bit_diameter=0.8, cut_depth=0.6, total_depth=1.7, tabs=4,
+                    tab_width=1.5)
+    raw = cut_outline(box(0, 0, 20, 12), job)
+    out = apply_lead_in(raw)
+    zf = -job.total_depth
+    for before, after in zip(raw, out):
+        body = LineString([(m.x, m.y) for m in before if not m.rapid])
+        if abs(min(m.z for m in before) - zf) > 1e-9:
+            continue                                   # not the last pass
+        full = unary_union([LineString([(a.x, a.y), (b.x, b.y)])
+                            for a, b in zip(after, after[1:])
+                            if not b.rapid and abs(a.z - zf) < 1e-9
+                            and abs(b.z - zf) < 1e-9
+                            and (a.x, a.y) != (b.x, b.y)])
+        assert body.difference(full.buffer(1e-6)).length < 1e-6
+        # nothing outside the piece: the tab is not eaten into
+        assert full.difference(body.buffer(1e-6)).length < 1e-6
