@@ -163,6 +163,17 @@ def seek_surface(ser, x_um, y_um, should_abort=None, note=None,
             raise StockNotFound(
                 "no copper under the clicked spot, all the way down. Click on "
                 "the stock, and check the clip is on its copper.")
+        if hint_fresh and hint_um is not None:
+            # The copper's height was measured in this run, with this bit:
+            # the one probe from HINT_ABOVE_UM above it reached a millimetre
+            # past it and found nothing, so there is no copper HERE - a hole
+            # wider than the bit, or past the stock's edge. Stepping on down
+            # drove the bit through the hole into the bed (a flip's first
+            # touch at the stock's middle, 17.5 mm down in the simulator).
+            raise StockNotFound(
+                "no copper at X %.1f, Y %.1f, where the copper was found a "
+                "moment ago - the spot is over a hole, or off the stock. "
+                "Nothing was cut." % (x_um / 1000.0, y_um / 1000.0))
         # The probe found nothing for 6 mm below the datum and came back up
         # to it. Down to 5.5 mm below THAT, wherever the head now is - and
         # not at all if it reads contact or cannot be read.

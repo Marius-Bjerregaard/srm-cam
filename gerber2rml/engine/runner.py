@@ -76,11 +76,31 @@ class JobRunner:
                       (self.origin[0] + end[0] / 100.0,
                        self.origin[1] + end[1] / 100.0))
         self.printer.send(program, name)
+        try:
+            return self._watch(name, end_mm, timeout_s, progress)
+        except RunStopped:
+            raise
+        except BaseException:
+            # Anything else - the Arduino's USB dropping mid-job (a
+            # SerialException from a status read), the spooler failing to
+            # answer pending() - used to leave run() with the job still
+            # spooling: the run was over on the screen while the mill went on
+            # cutting from its queue, and the bar's STOP had no printer to
+            # purge. The job is stopped first, whatever happened.
+            self.stop()
+            raise
+
+    # No status and no position for this long: the link is gone, and a job
+    # nobody can see is not one that is "done".
+    BLIND_S = 30.0
+
+    def _watch(self, name, end_mm, timeout_s, progress):
         t0 = time.monotonic()
         still_since = None
         paused = False
         last_pos, settled_since = None, time.monotonic()
         stalled_since, stall_told = None, False
+        blind_since = None
         while True:
             if self.should_abort():
                 self.stop()
@@ -105,6 +125,20 @@ class JobRunner:
             pos = spi_probe.query_position(self.ser)
             if progress is not None and pos:
                 progress(pos)
+            # A silent Arduino gives no status and no position, and both read
+            # as "finished": not moving, and no position to be away from the
+            # end at. Two seconds of a dead link ended the job, and the run
+            # went on to its next step with the mill still cutting.
+            blind = not st or pos is None
+            if blind:
+                blind_since = blind_since or time.monotonic()
+                if time.monotonic() - blind_since >= self.BLIND_S:
+                    self.stop()
+                    raise RunStopped(
+                        "the Arduino stopped answering, so the job could not "
+                        "be watched - it was stopped. Check its USB lead")
+            else:
+                blind_since = None
             moving = bool(st.get("moving"))
             queued = self.printer.pending()
             if queued and not moving and not paused:
@@ -121,7 +155,8 @@ class JobRunner:
                 stalled_since = None
             at_end = (end_mm is None or pos is None or
                       math.dist(pos[:2], end_mm) < 0.3)
-            if not paused and not moving and not queued and at_end:
+            if (not blind and not paused and not moving and not queued
+                    and at_end):
                 still_since = still_since or time.monotonic()
                 if time.monotonic() - still_since >= self.still_s:
                     return True
