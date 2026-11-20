@@ -34,6 +34,7 @@ After that every move is incremental, and Z is machine Z: the probed
 copper height plus the path's depth (backends/gcode.render_incremental).
 """
 import math
+import re
 import threading
 import time
 
@@ -236,6 +237,13 @@ class JobSource:
 
     def set_top_fit(self, t):
         pass
+
+
+def _undo(t, x, y):
+    """``t.apply`` run backwards: the nominal point ``t`` puts at (x, y)."""
+    c, s = math.cos(t.theta), math.sin(t.theta)
+    u, v = (x - t.tx) / t.scale, (y - t.ty) / t.scale
+    return c * u + s * v, -s * u + c * v
 
 
 class Events:
@@ -656,6 +664,11 @@ class AutoRun:
             if what == "holes":
                 self.ev.note("Drilling the holes again, %.2f mm deeper…"
                              % float(mm))
+                # Which face the board shows now, for the source: the top's
+                # holes come through the flip's fit (t None), the bottom's are
+                # turned here (t). Without it a double-sided board stopped
+                # at the bottom's check got the top's - the fit, then t.
+                self.src.holes_side = "top" if t is None else "bottom"
                 self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
                 continue
             if what != "again":
@@ -818,8 +831,12 @@ class AutoRun:
         return tx, ty
 
     def _find_by_edges(self, click, again):
+        # A sheet that is drilled already - the flipped side, or one put
+        # back to finish (Start at) or to line up again - has holes an edge
+        # walk can stop at and call the edge.
+        drilled = again or self.start_at is not None or self.realign
         return stockfind.find_stock(self.ser, click, self.size,
-                                    holes=again,
+                                    holes=drilled,
                                     hint_mm=(self.pose.z if again else
                                              self.surface_hint),
                                     hint_fresh=again,
@@ -1367,6 +1384,16 @@ class AutoRun:
             zones = self._nogo_boxes() if self.nogo else []
             if work is not None:
                 zones = zones + [work]
+            if self.keepout is not None:
+                # The bracket's tongue, on every side. level_grid only keeps
+                # out of it when the grid is not turned (t is None), and the
+                # bottom's grid always is (t is the found rotation): on a
+                # board filling the bracketed stock the back-right touch
+                # came down on the tongue's plastic, travelling in at a
+                # millimetre above the copper.
+                from shapely.geometry import box as _box
+                zones = zones + [_box(*self.keepout).buffer(
+                    self.bit / 2.0 + 1.0)]
             targets = (level_targets(pts, zones, reach=LEVEL_MOVE_MM)
                        if zones else list(pts))
             open_i = [i for i, tg in enumerate(targets) if tg is not None]
@@ -1413,7 +1440,10 @@ class AutoRun:
                     first = (fx, fy)
                     break
                 except ProbeError as e:
-                    if str(e) == "stopped":
+                    # STOP, whatever the error says: an abort that surfaced
+                    # as "the head did not lift" was taken for "no copper
+                    # here", and the next nudge was touched after the STOP.
+                    if str(e) == "stopped" or self.should_abort():
                         raise
             if first is None:
                 raise RunFailed("no copper at the first surface point %.1f, "
@@ -1445,10 +1475,19 @@ class AutoRun:
                             self._over(px, py)
                     dx = int(round((px - first[0]) * 1000))
                     dy = int(round((py - first[1]) * 1000))
+                    if self.should_abort():
+                        raise RunStopped("stopped")
                     r = stockfind._cmd(self.ser, "P %d %d %d" % (i, dx, dy),
                                        self.should_abort)
                     at = (px, py)
-                    if r and r.startswith("R "):
+                    # This point's reply, and a whole one: a garbled R line
+                    # ended the run with "list index out of range", and a late
+                    # reply to an earlier P (same id after a timeout) was
+                    # taken for this point's height.
+                    parts = r.split() if r else []
+                    if (len(parts) >= 5 and parts[0] == "R"
+                            and parts[1] == str(i)
+                            and re.fullmatch(r"-?\d+", parts[4])):
                         break
                 else:
                     raise RunFailed("the surface probe failed at %.1f, %.1f "
@@ -1474,7 +1513,17 @@ class AutoRun:
             self.z_surf = z0 / 1000.0
             self.ev.note("Surface probed: %.2f mm from flat." % spread)
             self.ev.level(side, rows, nx, ny)
-            return HeightMap.from_points(rows, nx, ny)
+            if not t:
+                return HeightMap.from_points(rows, nx, ny)
+            # Turned (a found angle, a realign fit): the touched points are
+            # no longer on rows of one X and columns of one Y, and
+            # from_points fell back to a plane - a 0.2 mm bow mapped as
+            # 0.03, on every edge-found or re-aligned run. The bilinear map
+            # is built on the grid as laid out, and asked through the turn.
+            flat = HeightMap.from_points(
+                [(nominal[i][0], nominal[i][1], rows[i][2])
+                 for i in range(len(rows))], nx, ny)
+            return HeightMap(lambda x, y, _f=flat, _t=t: _f(*_undo(_t, x, y)))
         return self._guard(key, go)
 
     def _cut_already(self, side, t):
@@ -1615,6 +1664,9 @@ class AutoRun:
         """
         def go():
             holes = self.src.realign_holes()
+            # The board's drilled holes where the placement puts them: the
+            # reference touches beside each hole keep off the others.
+            avoid = self._cut_already("bottom", self.rotation)
             if len(holes) < 2:
                 raise RunFailed(
                     "the board has no holes to line it up with: it takes at "
@@ -1645,7 +1697,8 @@ class AutoRun:
                 try:
                     found = self._locate_wider(guess[0], guess[1], radius,
                                                pose=self.pose,
-                                               clearance_um=clear)
+                                               clearance_um=clear,
+                                               avoid=avoid)
                 except (RunFailed, ProbeError) as e:
                     if self.should_abort():
                         raise
@@ -1692,6 +1745,14 @@ class AutoRun:
             if worst > FIT_WORST_MM:
                 raise RunFailed("the board's holes disagree by %.2f mm - one "
                                 "was misread. Nothing was cut." % worst)
+            if len(got) == 2:
+                # Two points fit any turn and shift exactly: a misread rim
+                # (what the search's "go on past it" is for) would move every
+                # re-drilled hole and nothing here could tell. Said, with
+                # what was found, so it can be judged before the cut.
+                self.ev.note("Lined up on only two holes: two always fit, "
+                             "so the line-up could not check itself. Look at "
+                             "the offsets below before letting it cut.")
             self.rotation = t
             self._report_realign(holes, measured, got, placed, t)
             return t
@@ -1719,7 +1780,7 @@ class AutoRun:
                   "turn": math.degrees(t.theta - placed.theta),
                   "worst": max(fit_r), "mean": sum(fit_r) / len(fit_r),
                   "found": sum(1 for h in rows if h["found"] is not None),
-                  "used": len(fit_r), "holes": rows}
+                  "used": len(fit_r), "holes": rows, "fit": t}
         for h in rows:
             if h["found"] is None:
                 self.ev.note("  hole %d (%.2f mm): not found" % (
@@ -1747,16 +1808,35 @@ class AutoRun:
                          % (search_um / 1000.0, HOLE_SEARCH_UM / 1000.0))
             return self._locate(x_mm, y_mm, HOLE_SEARCH_UM, **kw)
 
+    # Where the copper is touched for a hole's reference height: this far out
+    # from the hole, in four directions, the nearest first.
+    REF_OFFSETS_UM = (2500, 3500, 4500)
+    # A hole whose centre search failed this many times is given up, not
+    # searched for again from every later ring point (tens of minutes).
+    CENTRE_TRIES = 3
+
     def _locate(self, x_mm, y_mm, search_um=None, pose=None,
-                clearance_um=None):
-        """The centre of the hole near (x, y), mm."""
+                clearance_um=None, avoid=None):
+        """The centre of the hole near (x, y), mm.
+
+        ``avoid`` is the board's holes as a shape (machine mm, grown by the
+        bit - :meth:`_cut_already`): the reference touch keeps off them.
+        Without it the touch 2.5 mm out could land on the next hole - header
+        pins are 2.54 mm apart - and a first touch has the firmware's whole
+        6 mm reach: 3 mm below the copper, through the board into the bed."""
+        from shapely.geometry import Point
         search_um = search_um or HOLE_SEARCH_UM
         x0, y0 = int(x_mm * 1000), int(y_mm * 1000)
         ref = int((pose or self.pose_top).z * 1000)
         self._nogo_point(x_mm, y_mm, "a reference hole")
-        for ox, oy in ((2500, 0), (-2500, 0), (0, 2500), (0, -2500)):
+        spots = [(d * sx, d * sy) for d in self.REF_OFFSETS_UM
+                 for sx, sy in ((1, 0), (-1, 0), (0, 1), (0, -1))]
+        for ox, oy in spots:
             if self.nogo and self._in_nogo(x_mm + ox / 1000.0,
                                            y_mm + oy / 1000.0):
+                continue
+            if avoid is not None and avoid.intersects(
+                    Point(x_mm + ox / 1000.0, y_mm + oy / 1000.0)):
                 continue
             self._hop(x_mm + ox / 1000.0, y_mm + oy / 1000.0)
             try:
@@ -1764,7 +1844,7 @@ class AutoRun:
                                        self.should_abort, ref)
                 break
             except ProbeError as e:
-                if str(e) == "stopped":
+                if str(e) == "stopped" or self.should_abort():
                     raise
         else:
             raise RunFailed("no copper around fiducial at %.1f, %.1f"
@@ -1779,13 +1859,19 @@ class AutoRun:
         # the hole's rim, or a burr on it: the search goes on from there
         # rather than giving the hole up (the first of four was lost to
         # exactly that on a flipped board, 2026-11-16).
-        why = None
+        why, tries = None, 0
         for ring in range(0, search_um // step + 1):
             r = ring * step
             n = 1 if r == 0 else max(6, int(round(2 * math.pi * r / step)))
             for k in range(n):
                 a = 2 * math.pi * k / n
                 x, y = x0 + int(r * math.cos(a)), y0 + int(r * math.sin(a))
+                # Every spot of the search is a touch: none in a no-go zone.
+                # Only the hole's centre was checked, and a hole that passes
+                # the run's checks can lie 1.5 mm from a clamp - inside the
+                # 2.5 mm the search walks, at 0.4 mm above the copper.
+                if self.nogo and self._in_nogo(x / 1000.0, y / 1000.0):
+                    continue
                 if hole_test(self.ser, x, y, should_abort=self.should_abort):
                     continue
                 try:
@@ -1794,7 +1880,11 @@ class AutoRun:
                 except ProbeError as e:
                     if self.should_abort() or str(e) in ("stopped", "aborted"):
                         raise
-                    why = e
+                    why, tries = e, tries + 1
+                    if tries >= self.CENTRE_TRIES:
+                        break
+            if tries >= self.CENTRE_TRIES:
+                break
         if why is not None:
             raise RunFailed("a hole was felt near %.1f, %.1f but its centre "
                             "could not be found (%s)" % (x_mm, y_mm, why))

@@ -35,6 +35,7 @@ and below the bed go onto two rows when there is no room for one
 (``_Reflow``), and the side panel wraps its text and only scrolls up and down.
 """
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -708,6 +709,8 @@ class StencilLaserDialog(QDialog):
         self.laser = laser or xtool.F1Ultra()
         self._cal = None
         self._worker = None
+        # Set by STOP, read by the run on its thread between and after bands.
+        self._stop_event = threading.Event()
         self._sums = background.Latest(self)  # the sums that would freeze the page
         self.undo = PlacementUndo()         # where the work sat, for Ctrl+Z
         self._placing = False               # one placement change in progress
@@ -793,6 +796,7 @@ class StencilLaserDialog(QDialog):
                 "bowed is then run in bands, the head refocused for each, so "
                 "the edges come out as clean as the middle. Autofocus first.")
         self._focus_map = None
+        self._focus_map_bounds = None       # where it was measured, bed mm
         self._focus_marks = []
         self.align_btn = widgets.button(
             "Align", on=self.align,
@@ -1653,6 +1657,7 @@ class StencilLaserDialog(QDialog):
 
     def _take_traces_art(self, art):
         """A new traces drawing on the page, the recipe as it is."""
+        self._forget_bed()                  # another face up: its own heights
         self.base_art = self._orient(art)
         self._trace_side = self.base_art.side
         self.copper_side.blockSignals(True)
@@ -1670,6 +1675,8 @@ class StencilLaserDialog(QDialog):
         """A Gerber folder's jobs on the page, as srm-cam-laser opens them."""
         from PySide6.QtWidgets import QFileDialog
         from gerber2rml.gui2.laser_app import first_job, job_builder
+        if self._refuse_while_running():
+            return
         cfg = QSettings(*_SETTINGS)
         picked = QFileDialog.getExistingDirectory(
             self, "Gerber folder for the laser", str(cfg.value("gerber_dir", "")))
@@ -1683,6 +1690,7 @@ class StencilLaserDialog(QDialog):
             return self._say(str(e), warn=True)
         self._jobs = job_builder(folder)
         self._dxf = None
+        self._forget_bed()
         self._trace_side = None             # the face with the most copper
         self._empty = False
         self.name_lbl.setText(folder.name)
@@ -1714,7 +1722,10 @@ class StencilLaserDialog(QDialog):
 
     def load_dxf_art(self, art, path):
         """Show ``art``, read from the DXF at ``path``, as the traces job."""
+        if self._refuse_while_running():
+            return
         self._dxf = Path(path)
+        self._forget_bed()
         self._extra_mirror = self._extra_flip = False
         self._empty = False
         self._sync_empty()
@@ -1732,6 +1743,9 @@ class StencilLaserDialog(QDialog):
                   f"changes it.")
 
     def switch_kind(self, kind, force=False):
+        if self._refuse_while_running():
+            self.job_switch.set_current(self.kind)
+            return False
         if kind == self.kind and not force:
             self.refresh_from_host()        # the same job, with today's settings
             return
@@ -1791,15 +1805,25 @@ class StencilLaserDialog(QDialog):
         if not self._spot_auto:
             self._spot_by_hand = True
 
+    def _forget_bed(self):
+        """What was found on the bed for one board or face, not for the next:
+        its focus map (its heights; only show_job cleared it, so a face or a
+        board opened here was banded by the last one's) and its rework boxes
+        (spots that did not cut through on that copper)."""
+        if getattr(self, "_focus_map", None) is not None:
+            _lfu.clear(self)
+        if getattr(self, "rework_boxes", None):
+            self.rework_boxes = []
+            self._draw_rework()
+
     def show_job(self, art, name, jobs=None, dxf=None):
         """A new job on the page as it stands: the main window's board after
-        it changed, or a DXF. Where the work sits on the bed is kept."""
+        it changed, or a DXF. Where the work sits on the bed is kept. False,
+        and nothing changed, while the laser runs."""
+        if self._refuse_while_running():
+            return False
         art = as_laser_art(art)
         self._spot_by_hand = False          # another board: its own holes
-        if getattr(self, "_focus_map", None) is not None:
-            # Another board on the bed: its heights are not this one's.
-            from gerber2rml.gui2 import laser_focus_ui as _lfu
-            _lfu.clear(self)
         self._sums.cancel("rings")
         self._jobs = jobs
         self._dxf = Path(dxf) if dxf else None
@@ -1809,10 +1833,15 @@ class StencilLaserDialog(QDialog):
         self._sync_empty()
         self.name_lbl.setText(name)
         self.undo.clear()
+        self._forget_bed()
         self._apply_kind(art.kind, art)
+        return True
 
     def _apply_kind(self, kind, new_art):
         changed = kind != self.kind
+        if getattr(self, "_focus_map", None) is not None:
+            # Another job: the map is measured again for it, not carried.
+            _lfu.clear(self)
         self.kind = kind
         self.k = KINDS[kind]
         self._made_with = self._host_setting(kind)
@@ -2090,7 +2119,7 @@ class StencilLaserDialog(QDialog):
     def undo_place(self):
         """Ctrl+Z: the last change on the bed taken back - a move, a turn, a
         rework box, a skipped trench, an alignment point, the mirror."""
-        if not self.view.isEnabled():
+        if self._locked():
             return                          # the laser is running
         snap = self.undo.undo(self._state())
         if snap is None:
@@ -2099,7 +2128,7 @@ class StencilLaserDialog(QDialog):
         self._say("Undone.")
 
     def redo_place(self):
-        if not self.view.isEnabled():
+        if self._locked():
             return
         snap = self.undo.redo(self._state())
         if snap is None:
@@ -2109,8 +2138,9 @@ class StencilLaserDialog(QDialog):
 
     def _sync_undo_buttons(self):
         if hasattr(self, "undo_btn"):
-            self.undo_btn.setEnabled(self.undo.can_undo())
-            self.redo_btn.setEnabled(self.undo.can_redo())
+            free = not self._locked()
+            self.undo_btn.setEnabled(free and self.undo.can_undo())
+            self.redo_btn.setEnabled(free and self.undo.can_redo())
 
     def focus_point(self):
         """Where Autofocus measures: the cross, on the factory's 10 mm grid -
@@ -2253,8 +2283,7 @@ class StencilLaserDialog(QDialog):
 
         def work(progress):
             z = self.laser.z()
-            self.laser.run(job.text)
-            self.laser.wait(job.seconds * 2 + 120, progress=progress)
+            self._run_text(job.text, job.seconds * 2 + 120, progress)
             return z, (self._photo_after_job(before) if take_photo else None)
 
         def done(res):
@@ -2615,19 +2644,26 @@ class StencilLaserDialog(QDialog):
         d = presets.get(name) or presets[next(iter(TRACES_PRESETS))]
         return int(d.get("offsets", xtool.DEFAULT_TRACE_OFFSETS))
 
-    def _tell_host_done(self):
+    def _done_key(self):
+        """The rail row the job on the page ticks when it has all run: taken
+        when the run starts. Read when it finished, a face or kind changed
+        meanwhile ticked the other one."""
+        if self.kind == "traces" and getattr(self, "_trace_side", None) == "top":
+            # The second face of a two-sided board: its own tick in a
+            # project (gui2/projectpage.py); the rail has one row.
+            from gerber2rml.gui2.projectpage import TOP_TRACES
+            return f"laser_{self.kind}", TOP_TRACES
+        return f"laser_{self.kind}", f"laser_{self.kind}"
+
+    def _tell_host_done(self, key=None):
         """The whole job ran: its row on the main window's rail is done
-        (and so in the project)."""
+        (and so in the project). ``key``: :meth:`_done_key` from the run's
+        start."""
         host = self._host
         plan = getattr(host, "plan", None)
-        key = f"laser_{self.kind}"
-        if plan is not None and plan.by_key(key) is not None \
+        row, key = key or StencilLaserDialog._done_key(self)
+        if plan is not None and plan.by_key(row) is not None \
                 and hasattr(host, "traveller"):
-            if self.kind == "traces" and getattr(self, "_trace_side", None) == "top":
-                # The second face of a two-sided board: its own tick in a
-                # project (gui2/projectpage.py); the rail has one row.
-                from gerber2rml.gui2.projectpage import TOP_TRACES
-                key = TOP_TRACES
             host.traveller.set_done(key, True)
 
     def _tell_host_rings(self):
@@ -3372,8 +3408,7 @@ class StencilLaserDialog(QDialog):
         self._remember()
 
         def work(_p):
-            self.laser.run(text)
-            self.laser.wait(180)
+            self._run_text(text, 180)
         self._start(work, "Tracing the outline in blue…",
                     lambda _r: "Traced. Move the stencil if it was off.")
 
@@ -3399,8 +3434,7 @@ class StencilLaserDialog(QDialog):
 
         def work(progress):
             z = self.laser.z()
-            self.laser.run(job.text)
-            self.laser.wait(job.seconds * 2 + 120, progress=progress)
+            self._run_text(job.text, job.seconds * 2 + 120, progress)
             if not take_photo:
                 return z, None, None
             raw = self._raw_photo(like=before)
@@ -3411,12 +3445,13 @@ class StencilLaserDialog(QDialog):
             return z, self._photo(_PX_PER_MM, raw), a
 
         whole = not self.selected
+        done_key = self._done_key()
 
         def done(res):
             z, rgb, a = res
             self._last_cut_paths = holes
             if whole:
-                self._tell_host_done()
+                self._tell_host_done(done_key)
             if rgb is not None:
                 self.show_bed(rgb)
             n = sum(job.zones)
@@ -3432,24 +3467,45 @@ class StencilLaserDialog(QDialog):
 
     def _fill(self):
         """A traces, solder mask, or silkscreen job."""
+        from gerber2rml.engine import laser_focus as _lf
         if self._empty:
             return self._say("Nothing loaded to etch: open a Gerber folder or a "
                              "DXF first.", warn=True)
+        # The field test: each ladder height its own band, every coupon cut
+        # (no auto-skip: a coupon's moat isolates nothing by design).
+        field = self.kind == "traces" and _ftu.active(self)
+        fmap = None if field else getattr(self, "_focus_map", None)
+        if fmap is not None and fmap.points:
+            problem = _lfu.map_problem(self)
+            if problem:
+                return self._say(problem, warn=True)
+        # The job as it is now, for every band: the builders below read these,
+        # never the page. Read per band, a Mirror pressed during band 1 etched
+        # band 2 mirrored (review, 2026-11-20).
+        art, origin, recipe = self.art, self.origin(), self._run_recipe()
+        only = shapes = outline = None
+        zones = build = None
         try:
-            if self.kind == "traces":
+            if field:
+                zones = _ftu.zones(self, set(self.selected) or None)
+                every = sorted(set().union(*[i for _dz, i in zones]))
+                job = xtool.traces_job(art, origin, recipe, only=every)
+                picked = set(every)
+            elif self.kind == "traces":
                 only = self._traces_only()
-                job = xtool.traces_job(
-                    self.art, self.origin(), self._run_recipe(), only=only)
+                job = xtool.traces_job(art, origin, recipe, only=only)
             else:
-                _, outline = xtool.stencil_paths(self.art, self.origin())
-                job = xtool.fill_job(self._shapes(), outline, self._run_recipe())
+                _, outline = xtool.stencil_paths(art, origin)
+                shapes = self._shapes()
+                job = xtool.fill_job(shapes, outline, recipe)
         except ValueError as e:
             return self._say(str(e), warn=True)
         self._remember()
         self._job = job
-        picked = self.selected or set(range(len(self.art.apertures)))
-        if self.kind == "traces":
-            picked = set(picked) - self._skipped_now()
+        if not field:
+            picked = self.selected or set(range(len(art.apertures)))
+            if self.kind == "traces":
+                picked = set(picked) - self._skipped_now()
         self._zone_holes = [picked]
         self.bar.setRange(0, max(1, int(job.seconds)))
         self.bar.setValue(0)
@@ -3457,90 +3513,74 @@ class StencilLaserDialog(QDialog):
         take_photo = self.photo_after.isChecked()
         before = self._raw_rgb
 
-        fmap = getattr(self, "_focus_map", None)
-        zones = None
-        if fmap is not None and fmap.points:
-            from gerber2rml.engine import laser_focus as _lf
-            from gerber2rml.gui2 import laser_focus_ui as _lfu
-            recipe = self._run_recipe()
+        if not field and fmap is not None and fmap.points:
             if self.kind == "traces":
                 # Banded by where the paths lie, not by each region's middle:
                 # the isolation round the edge is one region centred on the
                 # board, and the edge is what the map is for.
-                origin = self.origin()
-                only = self._traces_only()
                 zones = []
                 for dz, boxes in _lf.band_boxes(fmap, _lfu.job_bounds(self)):
                     try:
-                        xtool.traces_job(self.art, origin, recipe, only=only,
-                                         boxes=boxes, write=False)
+                        xtool.traces_job(art, origin, recipe, only=only,
+                                         boxes=boxes, rework=False, write=False)
                     except ValueError:      # nothing of this job in that band
                         continue
                     zones.append((dz, boxes))
-
-                def build(boxes):
-                    return xtool.traces_job(self.art, origin, recipe, only=only,
-                                            boxes=sorted(boxes))
             else:
-                shapes = self._shapes()
-                _, outline = xtool.stencil_paths(self.art, self.origin())
                 zones = _lf.zone_indices(
                     [(p.centroid.x, p.centroid.y) for p in shapes], fmap)
+        # Each band is the first etch of its part of the job, but the outline
+        # is one ring round all of them: scored once, by the last band.
+        last = sorted(zones[-1][1]) if zones else None
 
-                def build(idx):
-                    return xtool.fill_job([shapes[i] for i in sorted(idx)],
-                                          outline, recipe)
+        def band_recipe(idx):
+            return recipe if sorted(idx) == last else replace(
+                recipe, mark_outline=False)
 
-        # The field test: each ladder height its own band, every coupon cut
-        # (no auto-skip: a coupon's moat isolates nothing by design).
-        field = self.kind == "traces" and _ftu.active(self)
         if field:
-            origin, recipe = self.origin(), self._run_recipe()
-            zones = _ftu.zones(self, set(self.selected) or None)
-            every = sorted(set().union(*[i for _dz, i in zones]))
-            job = xtool.traces_job(self.art, origin, recipe, only=every)
-            self._job = job
-            picked = set(every)
-
             def build(idx):
-                return xtool.traces_job(self.art, origin, recipe,
+                return xtool.traces_job(art, origin, band_recipe(idx),
                                         only=sorted(idx))
+        elif zones and self.kind == "traces":
+            def build(boxes):
+                # Not a rework: a band keeps its edge-of-field passes.
+                return xtool.traces_job(art, origin, band_recipe(boxes),
+                                        only=only, boxes=sorted(boxes),
+                                        rework=False)
+        elif zones:
+            def build(idx):
+                return xtool.fill_job([shapes[i] for i in sorted(idx)],
+                                      outline, band_recipe(idx))
+
+        stop = self._stop_event.is_set
 
         def work(progress):
             z = self.laser.z()
             run_map = fmap
             if field:
-                from gerber2rml.engine import laser_focus as _lf
                 run_map = _lf.FocusMap([], z, [])     # heights from here
-            if zones is not None and len(zones) > 1:
-                from gerber2rml.gui2 import laser_focus_ui as _lfu
+            if zones:
+                # One band too: at the map's height and the band's, from the
+                # map that was checked - the page's own map was used here
+                # before, and a band within 0.02 mm left the head wherever
+                # it was.
                 z = _lfu.run_zoned(self.laser, run_map, zones, build,
                                    progress=progress,
-                                   timeout_for=lambda j: j.seconds * 2 + 120)
+                                   timeout_for=lambda j: j.seconds * 2 + 120,
+                                   should_stop=stop)
             else:
-                if zones is not None and fmap is not None:
-                    # One band: the whole job at its middle height.
-                    dz = zones[0][0] if zones else 0.0
-                    if abs(dz) > 0.02:
-                        self.laser._json("POST", "/device/modeSwitch",
-                                         {"state": "P_AUTOFOCUS"})
-                        try:
-                            z = self.laser._goto_z(fmap.z + dz)
-                        finally:
-                            self.laser._json("POST", "/device/modeSwitch",
-                                             {"state": "P_IDLE"})
-                self.laser.run(job.text)
-                self.laser.wait(job.seconds * 2 + 120, progress=progress)
+                self._run_text(job.text, job.seconds * 2 + 120, progress)
             return z, (self._photo_after_job(before) if take_photo else None)
 
         whole = not self.selected and not field
+        done_key = self._done_key()
 
         def done(res):
             z, rgb = res
             if rgb is not None:
                 self.show_bed(rgb)
             if whole:
-                self._tell_host_done()
+                self._tell_host_done(done_key)
             n = len(picked)
             return (f"Done at Z {z:.2f}: {n} {self._noun(n)}, "
                     f"{job.passes} passes. Switch to Outlines to check them on the "
@@ -3559,8 +3599,20 @@ class StencilLaserDialog(QDialog):
             bands=[[round(dz, 3), len(b)] for dz, b in (zones or [])])
         self._start(work, f"{self.k['busy']}: {what}, {job.passes} passes…", done)
 
+    def _run_text(self, text, timeout, progress=None):
+        """One job on the laser to its end. STOP raises; a failure on the
+        way leaves the laser stopped and seen idle before the page unlocks
+        (laser_focus_ui.run_guarded)."""
+        laser = self.laser
+        _lfu.run_guarded(laser, lambda: _lfu.run_one(
+            laser, text, timeout, progress=progress,
+            should_stop=self._stop_event.is_set))
+
     def stop(self):
-        """Stop the laser, whatever it is doing: what STOP does."""
+        """Stop the laser, whatever it is doing: what STOP does. The run is
+        told too: a banded job saw the laser idle after the stop, took it for
+        the band done, and sent the next one (review, 2026-11-20)."""
+        self._stop_event.set()
         try:
             self.laser.stop()
             self._say("Stopped.", warn=True)
@@ -3597,13 +3649,22 @@ class StencilLaserDialog(QDialog):
 
     def _start(self, fn, text, done=None):
         self._say(text)
+        self._stop_event.clear()
         self._busy(True)
         self._worker = _Worker(fn, self)
         self._worker.progress.connect(self._progress)
-        self._worker.finished_ok.connect(
-            lambda r: self._done((done(r) if done else None) or "Done.", False))
+        self._worker.finished_ok.connect(lambda r: self._finished(done, r))
         self._worker.failed.connect(lambda m: self._done(m, True))
         self._worker.start()
+
+    def _finished(self, done, result):
+        """The worker's answer through ``done``. A ``done`` that raised left
+        the page locked for good: it is a failure, said as one."""
+        try:
+            msg = (done(result) if done else None) or "Done."
+        except Exception as e:              # noqa: BLE001 - shown to the operator
+            return self._done(f"The run finished, but showing it failed: {e}", True)
+        self._done(msg, False)
 
     def _done(self, msg, warn):
         self._busy(False)
@@ -3619,7 +3680,14 @@ class StencilLaserDialog(QDialog):
                         job=self.name_lbl.text(), kind=self.kind)
         _autocal.after_step(self, msg, warn)
 
+    def _locked(self):
+        """A run, photo or measurement is on: from its start to its answer
+        shown. Not the thread's own state, which may still say running for
+        a moment after the answer arrived."""
+        return getattr(self, "_busy_on", False)
+
     def _busy(self, on):
+        self._busy_on = bool(on)
         for b in (self.photo_btn, self.focus_btn, self.focus_map_btn, self.align_btn, self.set_focus_btn,
                   self.focus_ref_btn, self.focus_ref_forget,
                   self.learn_btn, self.reset_off_btn,
@@ -3634,7 +3702,13 @@ class StencilLaserDialog(QDialog):
                   self.auto_reference_list, self.auto_all_btn, self.auto_none_btn, self.auto_contrast,
                   self.offset_x, self.offset_y, self.calibrate_btn,
                   self.proof_btn, self.proof_where, self.proof_passes,
-                  self.rework_focus_btn):
+                  self.rework_focus_btn,
+                  # What builds the job again: a banded run read the page's
+                  # job per band, and a Mirror mid-run etched band 2 mirrored.
+                  self.mirror_box, self.flip_box, self.undo_btn, self.redo_btn,
+                  self.offsets, self.trace_kerf, self.density, self.spot_drills,
+                  self.skip_auto, self.field_test_btn, self.gerber_btn,
+                  self.dxf_btn, self.empty_cal_btn):
             b.setEnabled(not on)
         if not on:
             # The rework buttons need boxes to work on.
@@ -3642,6 +3716,7 @@ class StencilLaserDialog(QDialog):
             for b in (self.rework_btn, self.rework_clear_btn,
                       self.rework_focus_btn):
                 b.setEnabled(n)
+            self._sync_undo_buttons()
         if self.item is not None:
             self.item.setFlag(QGraphicsItem.ItemIsMovable,
                               not on and not self.view.select_mode and not self.view.pick_reference)
@@ -3664,7 +3739,20 @@ class StencilLaserDialog(QDialog):
     def reject(self):
         if self.embedded:
             return          # Escape on a page of the main window closes nothing
+        if self._locked() or self._worker_running():
+            # Escape hid the window with the laser running and STOP in it.
+            self._say("The laser is still running: press STOP first.", warn=True)
+            return
         super().reject()
+
+    def _refuse_while_running(self):
+        """True, and says so, while a run is on: a new job, face or kind on
+        the page mid-run changed what the next band was built from."""
+        if not self._locked():
+            return False
+        self._say("The laser is running: wait for it, or press STOP, before "
+                  "changing the job.", warn=True)
+        return True
 
     def closeEvent(self, e):
         if self._worker is not None and self._worker.isRunning():

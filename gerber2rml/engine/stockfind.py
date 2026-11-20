@@ -58,6 +58,7 @@ BIT_SPREAD_UM = 10000        # how far that is from usual, either way (Mads:
 STALE_ABOVE_UM = BIT_SPREAD_UM + 2000   # a first drop stops this far above
                              # the lab's copper: 2 mm short of it with the
                              # longest bit there is
+POS_AGREE_UM = 300           # a Q read this close to D's validated height
 HINT_ABOVE_UM = 5000         # a remembered surface: drop fast to this far above it,
                              # inside the probe's 6 mm reach, so one probe finds it
 
@@ -163,6 +164,17 @@ def seek_surface(ser, x_um, y_um, should_abort=None, note=None,
             raise StockNotFound(
                 "no copper under the clicked spot, all the way down. Click on "
                 "the stock, and check the clip is on its copper.")
+        if hint_fresh and hint_um is not None:
+            # The copper's height was measured in this run, with this bit:
+            # the one probe from HINT_ABOVE_UM above it reached a millimetre
+            # past it and found nothing, so there is no copper HERE - a hole
+            # wider than the bit, or past the stock's edge. Stepping on down
+            # drove the bit through the hole into the bed (a flip's first
+            # touch at the stock's middle, 17.5 mm down in the simulator).
+            raise StockNotFound(
+                "no copper at X %.1f, Y %.1f, where the copper was found a "
+                "moment ago - the spot is over a hole, or off the stock. "
+                "Nothing was cut." % (x_um / 1000.0, y_um / 1000.0))
         # The probe found nothing for 6 mm below the datum and came back up
         # to it. Down to 5.5 mm below THAT, wherever the head now is - and
         # not at all if it reads contact or cannot be read.
@@ -174,6 +186,16 @@ def seek_surface(ser, x_um, y_um, should_abort=None, note=None,
             raise StockNotFound(
                 "the probe reads contact where it found none a moment ago. "
                 "Check the clip and the bit, then start again.")
+        # The step is relative to where Q says the head is - a single read,
+        # unlike D's, which two reads must agree on. The miss lifted the head
+        # back to the datum, so Q has to agree with D's height; one read a
+        # millimetre high made a step past the 6 mm proven empty, and the
+        # all-zero read after a reset a step of tens of millimetres, rapid.
+        if abs(pos[2] * 1000 - z) > POS_AGREE_UM:
+            raise ProbeError(
+                "the head's position read (Z %.2f mm) disagrees with where it "
+                "should be (Z %.2f mm), so it was not taken any lower"
+                % (pos[2], z / 1000.0))
         if spi_probe.timed_move(
                 ser, dz_um=int(z - DROP_STEP_UM - pos[2] * 1000),
                 should_abort=should_abort) is None:

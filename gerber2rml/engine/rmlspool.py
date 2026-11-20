@@ -152,6 +152,7 @@ class SpoolPrinter:
             job = _ws.StartDocPrinterW(h, 1, ctypes.byref(doc))
             if not job:
                 raise _err("StartDocPrinter")
+            whole = False
             try:
                 if not _ws.StartPagePrinter(h):
                     raise _err("StartPagePrinter")
@@ -161,8 +162,16 @@ class SpoolPrinter:
                 if not ok or written.value != len(data):
                     raise _err("WritePrinter (%d of %d bytes)"
                                % (written.value, len(data)))
+                whole = True
             finally:
-                _ws.EndDocPrinter(h)
+                # EndDocPrinter hands the job to the mill - also the part of
+                # a write that failed half-way, which then cut as a program
+                # with its end missing. Only a whole job is ended; the rest
+                # is thrown away.
+                if whole:
+                    _ws.EndDocPrinter(h)
+                else:
+                    _ws.AbortPrinter(h)
             return int(job)
         finally:
             _ws.ClosePrinter(h)
@@ -221,7 +230,16 @@ def _cups(argv, run=None, input=None, timeout=15):
     """Run one CUPS tool. Returns stdout; raises SpoolError with stderr."""
     run = subprocess.run if run is None else run
     try:
-        r = run(argv, input=input, capture_output=True, timeout=timeout)
+        # No terminal: started from one, a refused lpadmin asked for a
+        # password THERE ("Password for ... on localhost?") while the window
+        # sat frozen, and a timeout could leave the terminal without echo.
+        # A refusal has to come back as a refusal, for the dialog to ask.
+        kw = {}
+        if run is subprocess.run:
+            kw["start_new_session"] = True
+            if input is None:
+                kw["stdin"] = subprocess.DEVNULL
+        r = run(argv, input=input, capture_output=True, timeout=timeout, **kw)
     except (OSError, subprocess.SubprocessError) as e:
         raise SpoolError(f"{argv[0]} failed: {e}") from e
     out = r.stdout.decode("utf-8", "replace") if isinstance(
@@ -462,9 +480,11 @@ def usblp_nodes(sys_root=USBMISC_ROOT, dev_dir=USB_DEV_DIR):
     """``[(device, description)]`` for every SRM-20 the kernel has a printer
     node for, read from sysfs. Nothing is opened.
 
-    Matched by the SRM-20's name or Roland's USB vendor id - never by being
-    the only printer there: ``lp0`` may well be somebody's laser printer, and
-    what is sent is NC code.
+    Matched by the SRM-20's name, or by Roland's vendor id AND the SRM-20's
+    product id - never by being the only printer there: ``lp0`` may well be
+    somebody's laser printer, and what is sent is NC code. Nor by the
+    vendor alone: a fab lab's Roland vinyl cutter (or an MDX mill, with a
+    spindle) is Roland too, and the first node found got the job.
     """
     found = []
     try:
@@ -478,8 +498,9 @@ def usblp_nodes(sys_root=USBMISC_ROOT, dev_dir=USB_DEV_DIR):
         text = " ".join(t for t in (_sys_read(f) for f in (
             intf / "ieee1284_id", usb / "manufacturer", usb / "product")) if t)
         vendor = _sys_read(usb / "idVendor").lower()
-        if vendor == plat.ROLAND_USB_VID or "srm-20" in text.lower() \
-                or "srm20" in text.lower():
+        product = _sys_read(usb / "idProduct").lower()
+        if (vendor == plat.ROLAND_USB_VID and product == plat.SRM20_USB_PID) \
+                or "srm-20" in text.lower() or "srm20" in text.lower():
             found.append((f"{dev_dir}/{name}", text))
     return found
 

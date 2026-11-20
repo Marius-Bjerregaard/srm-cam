@@ -1105,7 +1105,9 @@ class MainWindow(QMainWindow):
         self.trail_clear_act = self._act(v, "Clear the trail",
                                          self.action_clear_trail)
         v.addSeparator()
-        self._act(v, "Watch this step in 3D…", self.action_sim3d, "Ctrl+3")
+        # Shift: Ctrl+3 is The project, and a key on two actions runs neither.
+        self._act(v, "Watch this step in 3D…", self.action_sim3d,
+                  "Ctrl+Shift+3")
         v.addSeparator()
         pm = self.photo_menu
         self._act(pm, "Lay a photo of the board on the bed…",
@@ -2168,6 +2170,10 @@ class MainWindow(QMainWindow):
         step = self.plan.by_key(key)
         if step is None:
             return
+        if ((step.kind == "laser" or (key == "rework" and self.laser_method()
+                                      and self.state.board))
+                and self._laser_busy()):
+            return
         if key == "rework" and self.laser_method() and self.state.board:
             # A laser board's copper was etched, not milled: its spots are
             # fixed where they were made, with the laser's rework boxes.
@@ -2371,7 +2377,10 @@ class MainWindow(QMainWindow):
                      else drill_holes(todo, dj))
             return paths, None, st.drill.bit_diameter
         if step.op == "cutout":
-            return (cut_outline(lay.outline, self.cutting_cutout()),
+            # After the flip, like the export and the autonomous run: the
+            # top-frame outline, through the measured fit.
+            return (self._fit_paths(cut_outline(lay.top_outline,
+                                                self.cutting_cutout())),
                     None, st.cutout.bit_diameter)
         tj = self.cutting_trace()
         if step.op == "top_traces":
@@ -3687,7 +3696,24 @@ class MainWindow(QMainWindow):
             self.traveller.clear_finding()
 
     # ------------------------------------------------------------- actions
+    def run_holds_board(self, what):
+        """Is a run going? Then the board, its placement and its setup stay
+        as they are, and the operator is told. The run reads each step's
+        toolpaths from this window when the step starts: a drag on the bed
+        while it waited at the check, a Ctrl+Z, Load setup or a project's
+        next board swapped the geometry under the steps still to cut - a
+        recut at the dragged-to offset. Only a board from KiCad was refused
+        before (open_from_outside)."""
+        page = getattr(self, "autorun_page", None)
+        if page is None or getattr(page, "_thread", None) is None:
+            return False
+        self.say("warn", "A run is going, so %s waits until it is done (or "
+                         "STOP it first)." % what)
+        return True
+
     def action_open(self):
+        if self.run_holds_board("opening a board"):
+            return
         d = QFileDialog.getExistingDirectory(
             self, "Choose the folder KiCad plotted into",
             workspace.remembered_dir("gerber"))
@@ -3699,6 +3725,8 @@ class MainWindow(QMainWindow):
         its copper and how it is made from its tracks, and put it on the
         sheet. The dialog, a board handed over from KiCad and Bot's first
         question all come here."""
+        if self.run_holds_board("opening a board"):
+            return
         self.load_folder(folder)
         self._detect_sides()
         self._detect_method()
@@ -3878,6 +3906,11 @@ class MainWindow(QMainWindow):
         # The last board's method is not this one's: the tool says, until
         # the board does (_detect_method, on an open).
         if self._method == fab.LASER:
+            # The laser's memory of "it was double-sided" is the LAST
+            # board's: handed to this one, a one-sided board (Load setup of
+            # a one-sided setup after a double-sided laser board) came back
+            # double-sided - reference holes and a flip it does not have.
+            self._double_before_laser = None
             self._sync_laser_method(fab.LASER, fab.from_profile(
                 self.state.trace.effective_diameter()))
         self._method, self._method_source = None, "profile"
@@ -4033,6 +4066,8 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------- several boards
     def action_add_board(self):
+        if self.run_holds_board("adding a board"):
+            return
         if self.state.board is None:
             self.action_open()
             return
@@ -4360,9 +4395,13 @@ class MainWindow(QMainWindow):
             # longer fits the sheet; skip it.
 
     def action_undo(self):
+        if self.run_holds_board("undo"):
+            return
         self._step_placement(True)
 
     def action_redo(self):
+        if self.run_holds_board("redo"):
+            return
         self._step_placement(False)
 
     def _sync_undo(self):
@@ -4392,6 +4431,9 @@ class MainWindow(QMainWindow):
         self._after_params()
 
     def action_place(self, x, y):
+        if self.run_holds_board("moving the board"):
+            self.inspector.setup.sync()     # the boxes back to where it is
+            return
         # A held spin arrow or a row of typed digits is one step.
         self.remember("place")
         self.state.set_placement(x, y)
@@ -4960,6 +5002,9 @@ class MainWindow(QMainWindow):
                        f"sheet now sits {w:.0f} x {h:.0f} mm from there.")
 
     def action_rotate(self, deg):
+        if self.run_holds_board("turning the board"):
+            self.inspector.setup.sync()
+            return
         self.remember()
         self.state.set_rotation(deg)
         self._paths_cache = {}
@@ -6215,7 +6260,20 @@ class MainWindow(QMainWindow):
             return arts[0]
         raise ValueError(f"Unknown laser job kind: {kind}")
 
+    def _laser_busy(self):
+        """True, and says so, while the laser page runs a job. A rail row
+        clicked mid-run put another job or face on the page, and a banded
+        run built its next band from it (review, 2026-11-20)."""
+        page = self.laser_view
+        if page is None or not page.is_running():
+            return False
+        self.say("warn", "The laser is running: wait for it, or press STOP, "
+                         "before opening another laser job.")
+        return True
+
     def _open_laser_kind(self, kind):
+        if self._laser_busy():
+            return
         st = self.state
         if st.board is None:
             self.say("warn", "Load a Gerber folder first.")
@@ -6449,8 +6507,10 @@ class MainWindow(QMainWindow):
 
     def write_setup(self, path):
         """Write this job's setup to ``path`` (.srmcam). Raises OSError."""
-        data = self._setup_data(path)
+        # The folder first: _setup_data copies the photo into it, and the
+        # first save into a new project's folder lost the copy.
         Path(path).parent.mkdir(parents=True, exist_ok=True)
+        data = self._setup_data(path)
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def _setup_data(self, path):
@@ -6533,19 +6593,26 @@ class MainWindow(QMainWindow):
     PROJECT_SETUP = "setup.srmcam"
     PROJECT_FILE_MAX = 64 * 1024 * 1024      # bytes; nothing in a job is
 
+    ARCHIVE_SUFFIX = ".srmzip"
+
     def action_export_project(self):
         if self.state.board is None:
             self.say("warn", "Open a board first - there is nothing to "
                              "export yet.")
             return
+        # .srmzip, not .srmproj: that is the Project page's file (JSON
+        # beside a folder of setups, gerber2rml/project.py), and with both
+        # on one extension each open refused the other's files - "not a
+        # project this app wrote", of a project this app wrote.
         path, _ = QFileDialog.getSaveFileName(
             self, "Export the whole project",
             workspace.remembered_dir("project", "sessions")
-            + f"/{self.state.name}.srmproj", "SRM-CAM project (*.srmproj)")
+            + f"/{self.state.name}{self.ARCHIVE_SUFFIX}",
+            f"SRM-CAM project archive (*{self.ARCHIVE_SUFFIX})")
         if not path:
             return
-        if not path.lower().endswith(".srmproj"):
-            path += ".srmproj"
+        if not path.lower().endswith(self.ARCHIVE_SUFFIX):
+            path += self.ARCHIVE_SUFFIX
         if self.export_project(path):
             workspace.remember_dir("project", path)
 
@@ -6597,18 +6664,36 @@ class MainWindow(QMainWindow):
         return True
 
     def action_import_project(self):
+        if self.run_holds_board("opening a project"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Open a project",
             workspace.remembered_dir("project", "sessions"),
-            "SRM-CAM project (*.srmproj);;All files (*)")
+            f"SRM-CAM project (*{self.ARCHIVE_SUFFIX} *.srmproj);;"
+            "All files (*)")
         if path:
             self.import_project(path)
 
     def import_project(self, path):
         """Unpack a project into the workspace and open it. True when it
         opened. The files stay there: the job reads its Gerbers from them
-        from then on, wherever the project file itself goes."""
+        from then on, wherever the project file itself goes.
+
+        A Project page's ``.srmproj`` (JSON, not a zip) is opened there
+        instead; archives exported before they had their own extension are
+        ``.srmproj`` zips, and still open here."""
         import zipfile
+        if not zipfile.is_zipfile(path) and str(path).endswith(".srmproj"):
+            try:
+                self.project_ctl.leave_current()
+                self.project_ctl.open(path)
+            except (OSError, ValueError) as e:
+                self.report_error("That project could not be opened", e,
+                                  "Projects end in .srmproj.")
+                return False
+            self.show_mode("project")
+            workspace.remember_dir("project", str(path))
+            return True
         path = Path(path)
         base = workspace.workspace_root() / "projects"
         dest = base / (clean_name(path.stem) or "project")
@@ -6639,8 +6724,8 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, zipfile.BadZipFile) as e:
             self.report_error(
                 "That is not a project this app wrote", e,
-                "Project files end in .srmproj and are written by File ▸ "
-                "Export the whole project.")
+                "Project archives end in %s and are written by File ▸ "
+                "Export the whole project." % self.ARCHIVE_SUFFIX)
             return False
         self.load_setup(dest / self.PROJECT_SETUP)
         st = self.state
@@ -6663,6 +6748,8 @@ class MainWindow(QMainWindow):
         return True
 
     def action_load_setup(self):
+        if self.run_holds_board("loading a setup"):
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "Load a setup",
             workspace.remembered_dir("session", "sessions"),
@@ -6997,6 +7084,11 @@ class MainWindow(QMainWindow):
 
     def _on_drag(self, dx, dy):
         """The drag landed. This is the one expensive moment, and it is once."""
+        if self.run_holds_board("moving the board"):
+            # The stage drew the board where the drag left it: back.
+            self.inspector.setup.sync()
+            self._refresh_preview_now()
+            return
         # Dragged somewhere is where it should go: centring would undo it.
         self.autorun_page.board_dragged()
         self.remember()
