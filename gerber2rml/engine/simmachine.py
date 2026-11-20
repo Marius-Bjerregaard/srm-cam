@@ -495,9 +495,11 @@ def run_rml(m, text):
         elif cmd.startswith("VS"):
             feed = float(cmd[2:])
         elif cmd.startswith("PU"):
-            x, y = (int(v) for v in cmd[2:].split(","))
             if not m.move_to(m.pos[0], m.pos[1], min(0, oz + up * 10), feed):
                 return False
+            if cmd == "PU":
+                continue                  # a bare PU only lifts, where it is
+            x, y = (int(v) for v in cmd[2:].split(","))
             if not m.move_to(ox + x * 10, oy + y * 10, min(0, oz + up * 10), feed):
                 return False
         elif cmd.startswith("Z"):
