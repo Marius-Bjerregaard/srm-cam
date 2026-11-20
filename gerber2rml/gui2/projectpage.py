@@ -134,6 +134,8 @@ class ProjectController:
             return False
         if board is self.current:
             return True
+        if self.win.run_holds_board("switching boards"):
+            return False
         self.leave_current()
         self._loading = True
         try:
@@ -394,8 +396,14 @@ class ProjectPage(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open a project",
             workspace.remembered_dir("project", "projects"),
-            f"SRM-CAM project (*{pj.SUFFIX});;All files (*)")
+            f"SRM-CAM project (*{pj.SUFFIX} *.srmzip);;All files (*)")
         if not path:
+            return
+        import zipfile
+        if zipfile.is_zipfile(path):
+            # A project archive (File ▸ Export the whole project): the
+            # window unpacks those.
+            self.ctl.win.import_project(path)
             return
         workspace.remember_dir("project", path)
         self.ctl.leave_current()

@@ -166,3 +166,80 @@ def test_a_turned_surface_grid_keeps_its_bow(monkeypatch):
         u, v = ar._undo(t, *t.apply(*p))
         assert math.isclose(u, p[0], abs_tol=1e-9)
         assert math.isclose(v, p[1], abs_tol=1e-9)
+
+
+def _window(monkeypatch, tmp_path):
+    from gerber2rml import platform as plat
+    from gerber2rml.engine import bracket as br
+    from gerber2rml.gui2 import workspace
+    from gerber2rml.gui2.window import MainWindow
+    monkeypatch.setattr(plat, "documents_dir", lambda *a, **k: tmp_path)
+    workspace.set_setting("autorun/nogo", "")
+    w = MainWindow()
+    w.resize(1400, 900)
+    w.show()
+    w.autorun_page.set_bracket(br.DEFAULT)
+    return w
+
+
+FIXT = os.path.join(os.path.dirname(__file__), "fixtures", "mosfet_test")
+
+
+def test_a_one_sided_setup_loads_one_sided_after_a_laser_board(
+        monkeypatch, tmp_path):
+    """Double-sided, then laser, then Load setup of a one-sided setup: the
+    laser's "it was double-sided" belonged to the last board and ticked
+    double-sided on the new one."""
+    from gerber2rml.engine import method as fab
+    w = _window(monkeypatch, tmp_path)
+    try:
+        w.load_folder(FIXT)
+        w.action_double_sided(False)
+        single = tmp_path / "single.srmcam"
+        w.write_setup(single)
+        w.action_double_sided(True)
+        w.action_method(fab.LASER)
+        assert not w._double                 # the laser board is one-sided
+        w.load_setup(single)
+        assert not w._double
+        assert not w.inspector.setup.double.isChecked()
+    finally:
+        w.close()
+
+
+def test_the_board_stays_put_while_a_run_is_going(monkeypatch, tmp_path):
+    """A drag, an undo or Load setup mid-run swapped the geometry under the
+    steps still to cut."""
+    w = _window(monkeypatch, tmp_path)
+    try:
+        w.load_folder(FIXT)
+        w.state.set_placement(40.0, 30.0)
+        w.autorun_page._thread = object()    # a run is going
+        w.action_place(60.0, 50.0)
+        w._on_drag(5.0, 5.0)
+        w.action_rotate(90)
+        assert (w.state.place_x, w.state.place_y) == (40.0, 30.0)
+        assert w.state.rotate == 0
+    finally:
+        w.autorun_page._thread = None
+        w.close()
+
+
+def test_both_kinds_of_project_file_open_from_either_menu(
+        monkeypatch, tmp_path):
+    """The archive (File > Export the whole project) and the Project page's
+    file both ended in .srmproj, and each open refused the other's."""
+    from gerber2rml import project as pj
+    w = _window(monkeypatch, tmp_path)
+    try:
+        w.load_folder(FIXT)
+        arc = tmp_path / ("job" + w.ARCHIVE_SUFFIX)
+        assert w.export_project(str(arc))
+        assert w.import_project(str(arc))
+        page = tmp_path / ("p" + pj.SUFFIX)
+        w.project_ctl.new(str(page))
+        w.project_ctl.leave_current()
+        assert w.import_project(str(page))       # routed to the Project page
+        assert w.project_ctl.project is not None
+    finally:
+        w.close()
