@@ -33,7 +33,7 @@ class Placed:
     gerber_dir: Path
     name: str
     base: Board           # as loaded: mirrored or not, corner at the margin, unturned
-    rotate: int = 0       # degrees CCW: 0, 90, 180 or 270
+    rotate: float = 0     # degrees CCW: 0/90/180/270, or any, turned by hand
     place_x: float = 0.0  # shift from the loaded position, machine mm
     place_y: float = 0.0
     _cache: tuple = field(default=None, repr=False, compare=False)

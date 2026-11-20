@@ -113,6 +113,7 @@ class Stage(QWidget):
 
     placement_changed = Signal(float, float)     # drag finished: total (dx, dy) mm
     placement_dragging = Signal(float, float)    # live during a drag, cheap
+    turned = Signal(float, bool)                 # turned by hand: (deg CCW, fine)
     jog_requested = Signal(float, float)         # clicked a target while armed
     jog_step_requested = Signal(float, float)    # arrow key while armed: (dx, dy) mm
     screw_picked = Signal(float, float)          # clicked a spoilboard hole
@@ -217,6 +218,13 @@ class Stage(QWidget):
         self._pan_from = None
         self._pan_start = None
         self._dragging = False
+        # Turning by hand: the round handle above the board. Snapped to a
+        # quarter turn; with Control held, free (TURN_FINE_DEG at a time).
+        self._turning = False
+        self._turn_centre = None        # (x, y) mm the board turns about
+        self._turn_from = 0.0           # the pointer's angle at the press
+        self._turn_delta = 0.0          # degrees CCW so far, snapped
+        self._turn_fine = False
         # (dx, dy) -> (dx, dy): pulls a board drag into a place it should
         # snap to (the bracket's corner, gui2/autorun.py), or None.
         self._place_snap = None
@@ -815,6 +823,15 @@ class Stage(QWidget):
             return
         if self._bracket_press(p):
             return
+        if self._on_turn_handle(e.position()):
+            self._turning = True
+            self._turn_centre = self._turn_handle()[1]
+            self._turn_from = self._turn_angle(p)
+            self._turn_delta = 0.0
+            self._turn_fine = self._fine_held(e)
+            self.setCursor(QCursor(Qt.ClosedHandCursor))
+            self.update()
+            return
         if self._members:
             # A panel: the press picks the board under the cursor, and only
             # that board moves. A press between boards does nothing rather
@@ -837,6 +854,81 @@ class Stage(QWidget):
             self._drag_from = p
             self._begin_move("drag")
             self.setCursor(QCursor(Qt.SizeAllCursor))
+
+    # -- turning by hand ----------------------------------------------------
+    TURN_HANDLE_PX = 26       # how far above the board the handle sits
+    TURN_HIT_PX = 10          # how near the pointer must be to take it
+    TURN_FINE_DEG = 0.5       # a free turn moves in these steps
+
+    def _turn_handle(self):
+        """``(handle, centre)`` in device px / mm for the board, or None: a
+        single board placed by hand ("place"), not while a drag has it."""
+        if (self.mode != "place" or len(self._members) > 1 or self._dragging
+                or not self.has_board()):
+            return None
+        b = self._drag_bounds()
+        if not b:
+            return None
+        x0, y0, x1, y1 = b
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        a, c = self.to_px(cx, y0), self.to_px(cx, y1)
+        top = a if a.y() < c.y() else c
+        return QPointF(top.x(), top.y() - self.TURN_HANDLE_PX), (cx, cy)
+
+    def _on_turn_handle(self, pos):
+        h = self._turn_handle()
+        return h is not None and (pos - h[0]).manhattanLength() \
+            <= self.TURN_HIT_PX * 1.4
+
+    def _turn_angle(self, p):
+        cx, cy = self._turn_centre
+        return math.degrees(math.atan2(p.y() - cy, p.x() - cx))
+
+    @staticmethod
+    def _fine_held(e):
+        """Control - which Qt calls Meta on a Mac, where its "Control" is
+        the Command key. Either is taken."""
+        return bool(e.modifiers() & (Qt.ControlModifier | Qt.MetaModifier))
+
+    def _paint_turn(self, p):
+        """The handle; while turning, the board's outline turned, with the
+        angle beside it - drawn, not computed: the toolpaths are rebuilt once,
+        when the mouse comes up."""
+        pen = QPen(QColor(theme.PRIMARY), 0)
+        pen.setCosmetic(True)
+        pen.setWidthF(1.5)
+        if self._turning and self._turn_centre is not None:
+            b = self._drag_bounds()
+            if not b:
+                return
+            x0, y0, x1, y1 = b
+            cx, cy = self._turn_centre
+            a = math.radians(self._turn_delta)
+            ca, sa = math.cos(a), math.sin(a)
+            pts = [self.to_px(cx + (x - cx) * ca - (y - cy) * sa,
+                              cy + (x - cx) * sa + (y - cy) * ca)
+                   for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
+            pen.setStyle(Qt.DashLine)
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            for i in range(4):
+                p.drawLine(pts[i], pts[(i + 1) % 4])
+            p.setFont(theme.font("micro", mono=True))
+            p.setPen(QColor(theme.PRIMARY))
+            p.drawText(self.to_px(cx, cy) + QPointF(8, -8),
+                       "%+.1f°%s" % (self._turn_delta,
+                                     "" if self._turn_fine
+                                     else "   hold Control: free"))
+            return
+        h = self._turn_handle()
+        if h is None:
+            return
+        handle = h[0]
+        p.setPen(pen)
+        p.setBrush(QColor(theme.PANEL))
+        p.drawEllipse(handle, 6.0, 6.0)
+        p.drawArc(QRectF(handle.x() - 3.5, handle.y() - 3.5, 7, 7),
+                  30 * 16, 270 * 16)
 
     # -- the keyboard ------------------------------------------------------
     NUDGE_MM = 0.1            # one arrow tap; Shift makes it 1 mm, Ctrl 0.01
@@ -964,6 +1056,14 @@ class Stage(QWidget):
         if self._bracket_from is not None:
             self._bracket_move(p)
             return
+        if self._turning:
+            raw = self._turn_angle(p) - self._turn_from
+            raw = (raw + 180.0) % 360.0 - 180.0
+            self._turn_fine = self._fine_held(e)
+            step = self.TURN_FINE_DEG if self._turn_fine else 90.0
+            self._turn_delta = round(raw / step) * step
+            self.update()
+            return
         if self._dragging:
             # A drag does NOT move the geometry — it moves where the geometry
             # is drawn, and nothing is regenerated until the mouse comes up.
@@ -987,6 +1087,12 @@ class Stage(QWidget):
         if self._pin_hover(p) or self._bracket_hover(p):
             return
         if self.mode == "place":
+            if self._on_turn_handle(e.position()):
+                self.setCursor(QCursor(Qt.PointingHandCursor))
+                self.setToolTip("Drag round to turn the board a quarter turn "
+                                "at a time. Hold Control to turn it freely.")
+                return
+            self.setToolTip("")
             over = (self._member_at(p) is not None if self._members
                     else self._over_work(p))
             self.setCursor(QCursor(Qt.OpenHandCursor if over
@@ -1038,6 +1144,15 @@ class Stage(QWidget):
             return
         if self._bracket_from is not None:
             self._bracket_release()
+            return
+        if self._turning:
+            self._turning = False
+            delta, fine = self._turn_delta, self._turn_fine
+            self._turn_delta = 0.0
+            self.setCursor(QCursor(Qt.OpenHandCursor))
+            self.update()
+            if delta:
+                self.turned.emit(delta % 360.0, fine)
             return
         if self._dragging:
             self._dragging = False
@@ -1310,6 +1425,7 @@ class Stage(QWidget):
         self._paint_shorts(p)
         self._paint_measure(p)
         self._paint_tags(p)
+        self._paint_turn(p)
         self._paint_tool(p)
         self._paint_rulers(p)
         self._paint_frame_badge(p)

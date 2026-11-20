@@ -660,6 +660,7 @@ class MainWindow(QMainWindow):
 
         self.stage = Stage()
         self.stage.placement_changed.connect(self._on_drag)
+        self.stage.turned.connect(self._on_turn_drag)
         self.stage.placement_dragging.connect(self._on_dragging)
         self.stage.jog_requested.connect(self._on_jog_click)
         self.stage.jog_step_requested.connect(self._on_jog_step)
@@ -5020,15 +5021,38 @@ class MainWindow(QMainWindow):
         self.say("ok", f"Copper corner set to X {x:.2f}, Y {y:.2f} — the "
                        f"sheet now sits {w:.0f} x {h:.0f} mm from there.")
 
-    def action_rotate(self, deg):
+    def action_rotate(self, deg, fine=False, keep_centre=False):
+        """Turn the board to ``deg``. ``fine``: any angle, not a quarter
+        turn. ``keep_centre``: it turns about its own middle, where it is -
+        as when it is turned with the mouse - instead of going back to its
+        front-left corner."""
         if self.run_holds_board("turning the board"):
             self.inspector.setup.sync()
             return
         self.remember()
-        self.state.set_rotation(deg)
+        before = self.work_bounds() if keep_centre else None
+        self.state.set_rotation(deg, fine=fine)
+        if before is not None:
+            after = self.work_bounds()
+            if after is not None:
+                self.state.move_all((before[0] + before[2] - after[0] - after[2])
+                                    / 2.0,
+                                    (before[1] + before[3] - after[1] - after[3])
+                                    / 2.0)
         self._paths_cache = {}
         self._after_params()
-        QTimer.singleShot(0, self.stage.fit_work)
+        if not keep_centre:
+            QTimer.singleShot(0, self.stage.fit_work)
+
+    def _on_turn_drag(self, delta, fine):
+        """The board turned with the mouse on the bed (stage.py): by
+        ``delta`` degrees CCW, a quarter turn at a time or, with Control
+        held, freely."""
+        if not delta:
+            return
+        new = (self.state.rotate + delta) % 360
+        self.action_rotate(new, fine=fine or bool(new % 90),
+                           keep_centre=True)
 
     def action_turn(self, delta):
         """A quarter turn more, either way, from where it is now."""
@@ -6941,7 +6965,8 @@ class MainWindow(QMainWindow):
             self._restore_photo(data.get("photo"), foreign, Path(path))
         if placed:
             px, py = data.get("place", [0, 0])
-            st.set_rotation(data.get("rotate", 0))
+            r = float(data.get("rotate", 0) or 0)
+            st.set_rotation(r, fine=bool(r % 90))
             st.set_placement(px, py)
             self.autorun_page.board_placed()
         self._paths_cache = {}
@@ -7030,7 +7055,9 @@ class MainWindow(QMainWindow):
             try:
                 px, py = b.get("place", [m.place_x, m.place_y])
                 m.place_x, m.place_y = float(px), float(py)
-                m.rotate = int(b.get("rotate", 0)) % 360
+                m.rotate = float(b.get("rotate", 0)) % 360
+                if m.rotate == int(m.rotate):
+                    m.rotate = int(m.rotate)
             except (TypeError, ValueError):
                 foreign.append(f"where {bname} sits")
             if b.get("name"):
