@@ -40,6 +40,9 @@ class Laser:
         self.state = "P_IDLE"
         self.head = 10.0
 
+    def gcode(self, line):
+        self.log.append(("gcode", line))
+
     def _json(self, method, path, body=None, **_k):
         self.log.append(("mode", body["state"]))
 

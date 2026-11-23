@@ -1229,6 +1229,8 @@ class MainWindow(QMainWindow):
                                   "show the build area, set the design rules "
                                   "for how the board is made, and send it "
                                   "here.")
+        self.discord_act = self._act(h, "Join the Discord…",
+                                     self.action_join_discord)
         self._act(h, "Give feedback…",
                   lambda: QDesktopServices.openUrl(QUrl(FEEDBACK_URL)))
         h.addSeparator()
@@ -6274,9 +6276,12 @@ class MainWindow(QMainWindow):
                 raise xtool.TracesError(notes[0] if notes else "No copper on this board.")
             return arts[0]
         if kind == "mask":
-            mirror = bool(st.mirror) or self._double
-            art = soldermask.build_mask(m.gerber_dir, shrink=self._mask_shrink,
-                                        mirror=mirror)
+            # Either face: the top one (F.Mask) as drawn, turned over on the
+            # bed like its copper; the bottom one mirrored like the mill's.
+            side = side or "bottom"
+            mirror = (bool(st.mirror) or self._double) if side == "bottom" else False
+            art = soldermask.build_mask(m.gerber_dir, side=side,
+                                        shrink=self._mask_shrink, mirror=mirror)
             try:
                 feats = xtool.drill_features(m.gerber_dir, mirror,
                                              self._raw_outline(m.gerber_dir))
@@ -6285,7 +6290,7 @@ class MainWindow(QMainWindow):
             return xtool.LaserArt(
                 kind="mask", apertures=art.openings, outline=art.outline,
                 mirrored=art.mirrored, notes=art.warnings(), features=feats,
-                note=f"shrunk {art.shrink:g} mm a side")
+                side=side, note=f"shrunk {art.shrink:g} mm a side")
         if kind == "silk":
             art = silkscreen.build_silk(m.gerber_dir)
             try:
@@ -7329,12 +7334,22 @@ class MainWindow(QMainWindow):
         kicadsetup.setup(self)
 
     def maybe_offer_kicad_plugin(self):
-        """Launch-time offer, once per plugin version. Called by app.py."""
-        from gerber2rml.gui2 import kicadsetup
+        """Launch-time offers, one after the other: the Discord invite (once
+        per invite round), then the KiCad buttons (once per plugin version,
+        when KiCad is here). Called by app.py."""
+        from gerber2rml.gui2 import community, kicadsetup
+        try:
+            community.maybe_invite(self)
+        except Exception:                       # noqa: BLE001 - a nicety
+            pass
         try:
             kicadsetup.maybe_offer(self)
         except Exception:                       # noqa: BLE001 - a nicety
             pass
+
+    def action_join_discord(self):
+        from gerber2rml.gui2 import community
+        community.open_discord(self)
 
     # ------------------------------------------------------------ updates
     def action_check_updates(self):

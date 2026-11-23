@@ -214,6 +214,30 @@ def bias_at(at):
     return ref.at(*at)
 
 
+class Stopped(RuntimeError):
+    """STOP was pressed while the dot was measuring."""
+
+
+def _stop_pressed(page):
+    """STOP on the page, by either flag it sets."""
+    ev = getattr(page, "_stop_event", None)
+    return bool(getattr(page, "_stop_requested", False)
+                or (ev is not None and ev.is_set()))
+
+
+def _measure_or_stop(page, points, progress):
+    """The dot over ``points``; STOP on the page ends it between two points
+    (2026-11-22: a focus map pressed by mistake ran on, STOP only stopped
+    jobs). A map cut short is thrown away, never used."""
+    fmap = lf.measure_map(page.laser, page._calibration(), points,
+                          progress=lambda i, n: progress(i),
+                          should_stop=lambda: _stop_pressed(page))
+    if _stop_pressed(page):
+        raise Stopped("Stopped. The focus measurement was not finished, so "
+                      "nothing was changed.")
+    return fmap
+
+
 def calibrate(page):
     """Measure the machine's error over the job's area on a sheet known to be
     flat (fresh copper-clad lying on the bed), the head focused on it."""
@@ -230,10 +254,7 @@ def calibrate(page):
     points.append(centre)
 
     def work(progress):
-        fmap = lf.measure_map(page.laser, page._calibration(), points,
-                              progress=lambda i, n: progress(i),
-                              should_stop=_stop_asked(page))
-        _stopped(page)
+        fmap = _measure_or_stop(page, points, progress)
         # The machine's slope is the spread here: only a reading off the
         # others' surface (debris, a hole) is refused.
         lf.check_map(fmap, max_spread=None)
@@ -276,10 +297,7 @@ def measure(page):
     ref = load_reference()
 
     def work(progress):
-        raw = lf.measure_map(page.laser, page._calibration(), points,
-                             progress=lambda i, n: progress(i),
-                             should_stop=_stop_asked(page))
-        _stopped(page)                      # a part map is not a map
+        raw = _measure_or_stop(page, points, progress)
         # Checked as it will be used: the raw readings carry the machine's
         # own slope, up to 1.3 mm on a flat sheet.
         lf.check_map(lf.corrected(raw, ref))
@@ -345,17 +363,6 @@ def map_problem(page):
                 f"reaches {past:.0f} mm past it. Measure the focus map again "
                 f"where the job lies.")
     return None
-
-
-def _stop_asked(page):
-    ev = getattr(page, "_stop_event", None)
-    return ev.is_set if ev is not None else None
-
-
-def _stopped(page):
-    ev = getattr(page, "_stop_event", None)
-    if ev is not None and ev.is_set():
-        raise xtool.Stopped(STOPPED)
 
 
 def _draw(page):
