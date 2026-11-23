@@ -53,3 +53,13 @@ def test_not_now_is_remembered_until_the_next_round(win, monkeypatch):
     assert not community.should_invite(s)
     monkeypatch.setattr(community, "INVITE_ROUND", community.INVITE_ROUND + 1)
     assert community.should_invite(s)
+
+
+def test_the_invite_says_this_is_a_fork(win, monkeypatch):
+    seen = []
+    monkeypatch.setattr(dialogs.Sheet, "exec",
+                        lambda self: seen.append(self) or 0)
+    from PySide6.QtWidgets import QLabel
+    community.maybe_invite(win, _Settings(), opener=lambda p: None)
+    text = " ".join(l.text() for l in seen[0].findChildren(QLabel))
+    assert "fork" in text and "Marius-Bjerregaard/srm-cam" in text
