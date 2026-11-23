@@ -48,7 +48,7 @@ examples/fullboard_probe_test/
 .dev.vars
 
 # agent worktrees (Claude Code)
-.claude/worktrees/
+.claude/
 scripts/lab_runs/
 
 # SRM-CAM assistant Worker
