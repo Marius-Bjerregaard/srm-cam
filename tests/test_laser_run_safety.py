@@ -63,6 +63,9 @@ class Laser:
             self.gate.wait(20)
         self.state = "P_IDLE"
 
+    def gcode(self, line):              # STOP puts the diode out
+        pass
+
     def stop(self):
         self.log.append(("stop",))
         self.state = "P_IDLE"

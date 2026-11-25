@@ -328,6 +328,10 @@ class WindowSource(ar.JobSource):
                                      % (len(got), got[0][2]))
             else:
                 got = mountfid.pick_any(st.board.holes, box, bit_mm=bit)
+                # Spares: any three of them will do, so one hole that will
+                # not be found (barely wider than the bit, full of chips)
+                # no longer stops the run.
+                got = mountfid.with_spares(got, st.board.holes, box, bit_mm=bit)
                 ds = sorted({round(h[2], 2) for h in got})
                 self.realign_kind = (
                     "%d drill holes (%s mm)" % (len(got), " / ".join(
@@ -607,7 +611,9 @@ class AutoRunPage(inspector.Page):
         stock.add(self.ref_row)
 
         self.level_chk = QCheckBox("Probe the surface first (bed levelling)")
-        self.level_chk.setChecked(True)
+        # Off unless asked for (2026-11-23): the normal run zeroes on the
+        # copper and goes; levelling is a choice for a board that needs it.
+        self.level_chk.setChecked(False)
         self.level_chk.setToolTip(
             "A grid of touches over the board, so every cut follows the "
             "copper's real height. Off: Z zero is the copper at the clicked "
@@ -641,6 +647,7 @@ class AutoRunPage(inspector.Page):
         mh.addStretch(1)
         stock.add(mrow)
         self.level_chk.toggled.connect(mrow.setEnabled)
+        mrow.setEnabled(self.level_chk.isChecked())   # off by default: greyed
         self.level_chk.toggled.connect(lambda _on: self._show_touches())
         self._points_before = None
         self.check_chk = QCheckBox("Stop before the cut-out, so I can check "
@@ -1813,7 +1820,17 @@ class AutoRunPage(inspector.Page):
         if ctl.state.board is None:
             ctl.say("warn", "Load a board first.")
             return
-        slots_only = self.slots_chk.isChecked() and not self.slots_chk.isHidden()
+        if getattr(ctl, "_board_fit", None) is not None and not ctl._double:
+            # The run finds the stock and moves and turns the job onto it:
+            # on top of the measured fit, it would cut beside the board.
+            ctl.say("warn", "This board is fitted to a board made elsewhere, "
+                            "and the run would move it off that fit. Export "
+                            "the files (they follow the fit) and send them in "
+                            "VPanel, "
+                            "or remove the measured pads on Drill a board "
+                            "made elsewhere to run from the design again.")
+            return
+        slots_only =self.slots_chk.isChecked() and not self.slots_chk.isHidden()
         if slots_only and only is None and ctl.plan is not None:
             # The oval holes alone: the drill step, nothing after it.
             drill = next((st for st in ctl.plan.steps

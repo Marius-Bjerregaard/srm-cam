@@ -455,6 +455,27 @@ def test_the_stencil_can_be_outlined_or_hidden(qt_app, monkeypatch, art):
     d.close()
 
 
+def test_r_turns_the_artwork_like_the_buttons(qt_app, monkeypatch, art):
+    """R is Turn right, Shift+R is Turn left, and neither does anything while
+    the buttons are off, as they are during a job."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from gerber2rml.gui2 import stencil_laser as sl
+    monkeypatch.setattr(sl, "_SETTINGS", ("SRM-CAM-tests", "stencil-laser"))
+    d = sl.StencilLaserDialog(art, laser=xtool.F1Ultra("127.0.0.1", 1, timeout=1))
+    start = d.turns
+    QTest.keyClick(d.view, Qt.Key_R)
+    assert d.turns == (start + 1) % 4
+    QTest.keyClick(d.view, Qt.Key_R, Qt.ShiftModifier)
+    QTest.keyClick(d.view, Qt.Key_R, Qt.ShiftModifier)
+    assert d.turns == (start - 1) % 4
+    d.rot_l.setEnabled(False)
+    d.rot_r.setEnabled(False)
+    QTest.keyClick(d.view, Qt.Key_R)
+    assert d.turns == (start - 1) % 4
+    d.close()
+
+
 # ---------------------------------------------------------------- mask and silkscreen
 
 BUCK = Path(__file__).parent / "fixtures" / "mosfet_test"
@@ -494,10 +515,13 @@ def test_drilled_holes_land_in_the_mask_openings():
     assert all(any(o.contains(f.centroid) for o in art.openings) for f in feats)
 
 
-@pytest.mark.parametrize("action,kind,run", [
-    ("action_mask_laser", "mask", "Open the mask"),
-    ("action_silk_laser", "silk", "Mark the silkscreen")])
-def test_mask_and_silkscreen_open_the_laser_page(qt_app, monkeypatch, action, kind, run):
+@pytest.mark.parametrize("action,kind,run,preset,passes", [
+    ("action_mask_laser", "mask", "Open the mask",
+     "RemoveSolderMask · concentric rings", 4),
+    ("action_silk_laser", "silk", "Mark the silkscreen",
+     "Silkscreen on mask · 15 % × 2, rings", 2)])
+def test_mask_and_silkscreen_open_the_laser_page(qt_app, monkeypatch, action, kind,
+                                                 run, preset, passes):
     monkeypatch.setenv("SRM_CAM_MODE", "pro")
     from gerber2rml.gui2 import stencil_laser as sl
     from gerber2rml.gui2.window import MainWindow
@@ -510,12 +534,12 @@ def test_mask_and_silkscreen_open_the_laser_page(qt_app, monkeypatch, action, ki
         assert w.mode() == "laser" and w.modes.currentWidget() is d
         assert d.embedded and not d.isWindow()
         assert d.kind == kind and d.cut_btn.text() == run
-        assert d.preset.currentText() == "RemoveSolderMask (sphawes)"
+        assert d.preset.currentText() == preset
         assert len(d.base_art.features) == 27
         d.x.setValue(40)
         d.y.setValue(40)
         job = xtool.fill_job(d._shapes(), [], d.recipe())
-        assert job.passes == 6 and job.seconds > 0
+        assert job.passes == passes and job.seconds > 0
         d.close()
     finally:
         w.close()
@@ -692,6 +716,34 @@ def test_curtain_drive_top_traces_can_be_selected(qt_app, monkeypatch):
         d.copper_side.setCurrentIndex(d.copper_side.findData("bottom"))
         assert d.art.side == "bottom" and d.art.mirrored
         assert "B.Cu (bottom)" in d.size_lbl.text()
+        d.close()
+    finally:
+        w.close()
+
+
+def test_the_mask_has_a_top_face_too(qt_app, monkeypatch):
+    """A two-sided board gets ink on both faces (the analog synth, 2026-11-22):
+    the face switch opens F.Mask as drawn, B.Mask mirrored."""
+    from gerber2rml.gui2 import stencil_laser as sl
+    from gerber2rml.gui2.window import MainWindow
+    monkeypatch.setattr(sl, "_SETTINGS", ("SRM-CAM-tests", "mask-faces"))
+    w = MainWindow()
+    try:
+        w.load_folder(str(Path(__file__).parent / "fixtures" / "mosfet_test"))
+        w.action_traces_laser()
+        d = w.laser_view
+        d.switch_kind("mask")
+        assert d.kind == "mask" and d.art.side == "bottom" and d.art.mirrored
+        assert d.copper_side_field.isVisibleTo(d)
+        assert "B.Mask (bottom)" in d.size_lbl.text()
+        n = len(d.art.apertures)
+        d.copper_side.setCurrentIndex(d.copper_side.findData("top"))
+        assert d.kind == "mask" and d.art.side == "top" and not d.art.mirrored
+        assert "F.Mask (top)" in d.size_lbl.text()
+        assert len(d.art.apertures) == n > 0
+        # Back on the copper the face stays where it was put.
+        d.switch_kind("traces")
+        assert d.kind == "traces" and d.art.side == "top"
         d.close()
     finally:
         w.close()

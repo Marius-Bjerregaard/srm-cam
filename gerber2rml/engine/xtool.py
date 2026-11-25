@@ -401,6 +401,84 @@ def trace_job(outline, laps=15, power=6.0, speed=100.0):
     return "\r\n".join(lines)
 
 
+# Showing chosen pads with the blue diode, to line a job up by eye when the
+# camera will not (2026-11-22, the analog synth under mask ink): as XCS frames,
+# outlines only, over and over, sent as a frame (the lid may be open; through
+# the closed lid's tint the blue hardly shows). Measured at the machine: in
+# frame mode every segment costs about 1.3 ms whatever its length, and a jump
+# more, so steadiness is the number of corners. Each outline is cut to a few
+# corners (a round pad an octagon) and the outlines are joined by moves at
+# zero power instead of jumps. 5 % round an 80 mm square was plainly visible
+# and 3 % round five 2 mm pads visible with the lid open.
+SHOW_SPEED = 6000.0         # mm/s
+SHOW_SECONDS = 20.0         # long enough to look, then nudge and look again
+SHOW_SEGMENT_S = 1.3e-3     # what a segment really takes in frame mode
+SHOW_CORNERS = 8            # at most, per outline
+SHOW_REF = (5.0, 80.0)      # % and mm of outline seen well at the machine
+SHOW_POWER_RANGE = (3.0, 10.0)
+SHOW_MAX_LINES = 400_000    # the file kept to a size the machine takes
+
+
+def show_power(length):
+    """Blue % for ``length`` mm of outline, as bright as the reference."""
+    lo, hi = SHOW_POWER_RANGE
+    return max(lo, min(hi, SHOW_REF[0] * length / SHOW_REF[1]))
+
+
+def few_corners(poly, corners=SHOW_CORNERS):
+    """``poly``'s outline with at most ``corners`` corners, closed: its own
+    when it has few, else the polygon of that many round its middle that
+    fits its size (a round pad comes out an octagon)."""
+    ring = list(poly.exterior.coords)
+    if len(ring) - 1 <= corners:
+        return ring
+    simple = list(poly.simplify(0.05).exterior.coords)
+    if len(simple) - 1 <= corners:
+        return simple
+    c = poly.centroid
+    x0, y0, x1, y1 = poly.bounds
+    rx, ry = (x1 - x0) / 2, (y1 - y0) / 2
+    pts = [(c.x + rx * math.cos(2 * math.pi * (k + 0.5) / corners),
+            c.y + ry * math.sin(2 * math.pi * (k + 0.5) / corners))
+           for k in range(corners)]
+    return pts + [pts[0]]
+
+
+def show_job(shapes, *, seconds=SHOW_SECONDS, speed=SHOW_SPEED, power=None):
+    """The blue diode round each of ``shapes`` (shapely Polygons, bed mm),
+    nearest next, over and over for about ``seconds``: where the fiber will
+    fire. Returns (gcode, seconds, power %, laps a second). Send it with
+    :meth:`F1Ultra.frame`."""
+    rings = []
+    for s in shapes:
+        for g in getattr(s, "geoms", [s]):
+            if not g.is_empty:
+                rings.append(few_corners(g))
+    if not rings:
+        raise ValueError("Nothing to show: choose some shapes first.")
+    check_on_bed(rings)
+    ordered, at = [], rings[0][0]
+    while rings:
+        k = min(range(len(rings)), key=lambda i: math.dist(at, rings[i][0]))
+        r = rings.pop(k)
+        ordered.append(r)
+        at = r[-1]
+    length = sum(math.dist(a, b) for r in ordered for a, b in zip(r, r[1:]))
+    power = show_power(length) if power is None else power
+    s_val, feed = round(power * 10), round(speed * 60)
+    lap = []
+    for r in ordered:
+        lap.append(f"G1X{r[0][0]:.3f}Y{r[0][1]:.3f}S0F{feed}")      # dark link
+        for i, (x, y) in enumerate(r[1:]):
+            lap.append(f"G1X{x:.3f}Y{y:.3f}" + (f"S{s_val}" if i == 0 else ""))
+    once = len(lap) * SHOW_SEGMENT_S + length / speed
+    laps = max(1, min(int(round(seconds / once)), SHOW_MAX_LINES // len(lap)))
+    first = ordered[0][0]
+    lines = (_head("blue", 30, power / 100)
+             + [f"G0X{first[0]:.3f}Y{first[1]:.3f}"] + lap * laps + _TAIL)
+    return "\r\n".join(lines), once * laps, power, 1 / once
+
+
 # ---------------------------------------------------------------------------
 # The laser
 # ---------------------------------------------------------------------------
@@ -411,6 +489,23 @@ class LaserError(RuntimeError):
 
 class Stopped(LaserError):
     """STOP was pressed: the run ends here, and is not done."""
+
+
+def _no_answer(host, e, plug_hint=True):
+    """The words for a request that never reached the laser."""
+    if getattr(e, "winerror", None) == 10013 or getattr(e, "errno", None) == 13:
+        # WSAEACCES: Windows itself refused the connection before it left the
+        # PC - a firewall rule, a VPN's kill switch or "block local network",
+        # or security software (2026-11-24, a student's laptop).
+        return LaserError(
+            f"Windows blocked SRM-CAM from reaching the laser at {host} ({e}). "
+            f"Something on this PC forbids the connection: usually a VPN "
+            f"(switch it off, or allow local network access in it), or a "
+            f"firewall or antivirus blocking SRM-CAM. Allow SRM-CAM in Windows "
+            f"Security > Firewall > Allow an app, then try again.")
+    return LaserError(f"No answer from the laser at {host} ({e})."
+                      + (" Is it switched on and plugged into this PC by USB?"
+                         if plug_hint else ""))
 
 
 class F1Ultra:
@@ -426,15 +521,16 @@ class F1Ultra:
         network it is on right now (:func:`find_host`), else the lab's."""
         return self._host or find_host() or HOST
 
-    def _no_answer(self, e):
+    def _no_answer(self, e, plug_hint=True):
+        if getattr(e, "winerror", None) == 10013 or getattr(e, "errno", None) == 13:
+            return _no_answer(self.host, e)         # Windows refused it
         if self._host is None and find_host() is None:
             return LaserError(
                 "This computer has no network to the laser: it is on USB as "
                 "a network adapter, and none with a 201.234.x.x address is "
                 "up. Is it switched on and plugged into this computer by "
                 "USB? If it is, unplug its USB lead and plug it in again.")
-        return LaserError(f"No answer from the laser at {self.host} ({e}). Is "
-                          f"it switched on and plugged into this PC by USB?")
+        return _no_answer(self.host, e, plug_hint)
 
     def _req(self, method, path, body=None, ctype="application/json", timeout=None):
         if isinstance(body, (dict, list)):
@@ -489,7 +585,36 @@ class F1Ultra:
         finally:
             self._json("POST", "/device/modeSwitch", {"state": "P_IDLE"})
 
+    # -- the lid ------------------------------------------------------------
+    # 2026-11-23: the lid opened during a test fire and the fiber kept firing.
+    # /peripheral/gap is the lid's sensor ("on" open, "off" shut; read at the
+    # machine). Every job and every blue-dot measure checks it first, and a
+    # job is stopped as soon as it reads open. A frame (blue only, the way
+    # XCS frames) is meant to be watched with the lid open, and is not.
+    def lid_open(self):
+        """True open, False shut, None when the machine does not say."""
+        try:
+            d = json.loads(self._req("GET", "/peripheral/gap", timeout=3))
+            state = (d.get("data") or {}).get("state")
+        except (LaserError, ValueError, AttributeError):
+            return None
+        return {"on": True, "off": False}.get(state)
+
+    def _lid_shut_or_refuse(self, what):
+        if self.lid_open():
+            raise LaserError(f"The lid is open: close it before {what}. The "
+                             f"fiber beam is invisible.")
+
+    def _lid_stop(self):
+        """Everything off, now."""
+        for f in (self.stop, lambda: self.gcode("M3S0"), lambda: self.gcode("M5")):
+            try:
+                f()
+            except LaserError:
+                pass
+
     def run(self, gcode, *, autostart=True):
+        self._lid_shut_or_refuse("the laser runs")
         q = "/processing/upload?gcodeType=processing&fileType=txt"
         self._json("POST", q + ("&autoStart=1" if autostart else ""), gcode,
                    ctype="text/plain", timeout=60)
@@ -498,6 +623,10 @@ class F1Ultra:
         """Until the job is done. ``progress(elapsed_s)`` is called while it runs."""
         t0, started = time.time(), False
         while time.time() - t0 < timeout:
+            if self.lid_open():
+                self._lid_stop()
+                raise LaserError("Stopped: the lid was opened while the laser "
+                                 "was running. Close it and run the job again.")
             m = self.mode()
             if m not in ("P_IDLE", "P_WORK_DONE"):
                 started = True
@@ -508,6 +637,12 @@ class F1Ultra:
                 progress(time.time() - t0)
             time.sleep(poll)
         raise LaserError(f"The job did not finish within {timeout:.0f} s.")
+
+    def frame(self, gcode):
+        """``gcode`` as a frame, the way XCS frames: the blue diode only, and
+        the machine lets the lid open while it runs."""
+        q = "/processing/upload?gcodeType=frame&fileType=txt&autoStart=1"
+        self._json("POST", q, gcode, ctype="text/plain", timeout=60)
 
     def stop(self):
         self._req("POST", "/processing/stop", "")
@@ -526,7 +661,7 @@ class F1Ultra:
             r = c.getresponse()
             out = r.read()
         except OSError as e:
-            raise self._no_answer(e) from e
+            raise self._no_answer(e, plug_hint=False) from e
         finally:
             c.close()
         if r.status != 200:
@@ -593,6 +728,7 @@ class F1Ultra:
             self.lights(False)
             self.gcode(f"G0X{at[0]:g}Y{at[1]:g}F60000")
             time.sleep(0.3)
+            self._lid_shut_or_refuse("the blue dot measures")
             self.gcode("M3S30")             # the blue diode at a glow
             time.sleep(0.5)
             photo = self._raw(self.CAMERA_PORT,
@@ -717,6 +853,25 @@ class LaserArt:
         return list(self.notes or [])
 
 
+# A mask opening that is all hole - a mounting hole's, with no pad round it -
+# only fires the beam down through the board (2026-11-23: the synth's M3
+# holes asked for a 3.0 mm opening inside a 3.2 mm hole).
+HOLE_ONLY_SHARE = 0.85
+
+
+def drop_hole_only(openings, holes, share=HOLE_ONLY_SHARE):
+    """``openings`` without those lying ``share`` or more inside a drilled
+    hole (``holes``: shapely shapes in the same frame). Returns (kept,
+    left out)."""
+    from shapely.ops import unary_union
+    if not holes:
+        return list(openings), 0
+    drilled = unary_union(holes)
+    kept = [o for o in openings
+            if o.area <= 0 or o.intersection(drilled).area < share * o.area]
+    return kept, len(openings) - len(kept)
+
+
 def drill_features(folder, mirror, outline_raw):
     """The board's drilled holes as circles in the artwork frame: mirrored and
     shifted exactly as the mask and silkscreen are (see engine/soldermask.py),
@@ -744,7 +899,12 @@ def drill_features(folder, mirror, outline_raw):
 class FillRecipe:
     """How to fill. ``lines_per_cm`` as XCS calls it (its "density");
     ``cross_hatch`` turns each pass 90 degrees from the last; ``one_way``
-    draws every line the same way, as XCS's uni-directional scan."""
+    draws every line the same way, as XCS's uni-directional scan.
+
+    ``pattern`` "hatch" sweeps lines across the whole job; "concentric" draws
+    rings inside each shape, outside in, one shape after the other, the way
+    the traces are cut: far fewer starts and jumps. Every other pass sets its
+    rings half a step in, so the passes interleave as cross hatching does."""
     power: float = 40.0
     speed: float = 800.0
     frequency: float = 30.0
@@ -754,6 +914,7 @@ class FillRecipe:
     one_way: bool = True
     mark_outline: bool = False
     mark_power: float = 10.0
+    pattern: str = "hatch"
 
     @property
     def interval(self):
@@ -763,6 +924,18 @@ class FillRecipe:
 # sphawes/fiber-laser-pcb-fab settings.json, the presets the lab imports into XCS
 SPHAWES_REMOVE_MASK = FillRecipe(power=40, speed=800, frequency=30, passes=6,
                                  lines_per_cm=300)
+# Rings pad by pad (2026-11-22, the analog synth's boards): 4 passes go
+# through the ink to clean copper, where the hatch took 6.
+CONCENTRIC_REMOVE_MASK = FillRecipe(power=40, speed=800, frequency=30, passes=4,
+                                    lines_per_cm=300, pattern="concentric")
+# Silkscreen marked on cured mask ink: light, to lighten the ink, not to take
+# it off. 2026-11-22 on vcf: one pass readable, two (a hatch, then rings) the
+# contrast wanted. Rings, as the mask: vcf's top in a fraction of the hatch's
+# time. A big filled shape (a capacitor's minus) takes its rings back to back
+# and nearly scorched on the second pass: if it does, lower the power there.
+SILK_ON_MASK = FillRecipe(power=15, speed=1500, frequency=30, passes=2,
+                          lines_per_cm=300, cross_hatch=False, one_way=True,
+                          pattern="concentric")
 SPHAWES_TRACES = FillRecipe(power=100, speed=600, frequency=30, passes=10,
                             lines_per_cm=240)
 
@@ -772,44 +945,109 @@ def hatch(polys, interval, angle_deg=0.0, one_way=True):
     ``angle_deg``, as (start, end) segments in drawing order: line by line
     across the whole job, so the beam sweeps instead of jumping shape to shape.
     ``one_way`` keeps every line in the same direction."""
+    import math as _m
+    import numpy as np
     from shapely.affinity import rotate as _rotate
-    from shapely.geometry import LineString
     from shapely.ops import unary_union
     shape = unary_union([p for p in polys if not p.is_empty])
     if shape.is_empty:
         return []
     c = shape.centroid
     flat = _rotate(shape, -angle_deg, origin=c)          # hatch horizontally
-    x0, y0, x1, y1 = flat.bounds
-    segs = []
-    y = y0 + interval / 2
-    flip = False
-    while y < y1:
-        cut = flat.intersection(LineString([(x0 - 1, y), (x1 + 1, y)]))
-        parts = line_parts(cut)
-        row = []
-        for ln in parts:
-            (ax, ay), (bx, by) = ln.coords[0], ln.coords[-1]
-            if ax > bx:
-                (ax, ay), (bx, by) = (bx, by), (ax, ay)
-            row.append(((ax, ay), (bx, by)))
-        row.sort(key=lambda sg: sg[0][0])
-        if not one_way and flip:
-            row = [(b, a) for a, b in reversed(row)]
-        segs += row
-        flip = not flip
-        y += interval
-    if not segs:
-        return []
-    from shapely.geometry import MultiPoint
-    import math as _m
-    t = _m.radians(angle_deg)
-    cs, sn = _m.cos(t), _m.sin(t)
+    _, y0, _, y1 = flat.bounds
+    first = y0 + interval / 2
+    n = max(0, _m.ceil((y1 - first) / interval))         # the rows below y1
 
-    def back(p):                                     # undo the flattening turn
-        dx, dy = p[0] - c.x, p[1] - c.y
-        return (c.x + dx * cs - dy * sn, c.y + dx * sn + dy * cs)
-    return [(back(a), back(b)) for a, b in segs]
+    # Every row against every edge at once, as a scanline fill does it. Asking
+    # shapely for one row at a time walks the whole shape per row: a silkscreen
+    # of 50 000 points under 7 000 rows took most of a minute, and the window
+    # stood still for it.
+    edges = []
+    for poly in getattr(flat, "geoms", [flat]):
+        for ring in (poly.exterior, *poly.interiors) if hasattr(
+                poly, "exterior") else ():
+            pts = np.asarray(ring.coords)[:, :2]
+            edges.append(np.hstack([pts[:-1], pts[1:]]))
+    if not edges or not n:
+        return []
+    xa, ya, xb, yb = np.vstack(edges).T
+    # An edge is crossed by the rows from its lower end up to, not including,
+    # its upper end, so a corner lying on a row counts once and every row
+    # enters and leaves the shape in pairs. A level edge crosses nothing.
+    k0 = np.clip(np.ceil((np.minimum(ya, yb) - first) / interval), 0, n).astype(int)
+    k1 = np.clip(np.ceil((np.maximum(ya, yb) - first) / interval), 0, n).astype(int)
+    count = k1 - k0
+    edge = np.repeat(np.arange(len(count)), count)
+    if not len(edge):
+        return []
+    row = np.arange(len(edge)) - np.repeat(np.cumsum(count) - count, count) + k0[edge]
+    y = first + row * interval
+    x = xa[edge] + (y - ya[edge]) * (xb[edge] - xa[edge]) / (yb[edge] - ya[edge])
+    order = np.lexsort((x, row))
+    row, x, y = row[order], x[order], y[order]
+    ax, bx, ay, k = x[0::2], x[1::2], y[0::2], row[0::2]
+    keep = (k == row[1::2]) & (bx - ax > 1e-9)
+    ax, bx, ay, k = ax[keep], bx[keep], ay[keep], k[keep]
+    if not one_way:                  # every other row drawn back the other way
+        back_row = k % 2 == 1
+        order = np.lexsort((np.where(back_row, -ax, ax), k))
+        ax, bx, ay, back_row = ax[order], bx[order], ay[order], back_row[order]
+        ax, bx = np.where(back_row, bx, ax), np.where(back_row, ax, bx)
+
+    t = _m.radians(angle_deg)                        # undo the flattening turn
+    cs, sn = _m.cos(t), _m.sin(t)
+    dy = ay - c.y
+    out = np.empty((len(ax), 2, 2))
+    for i, xs in enumerate((ax, bx)):
+        dx = xs - c.x
+        out[:, i, 0] = c.x + dx * cs - dy * sn
+        out[:, i, 1] = c.y + dx * sn + dy * cs
+    return [(tuple(a), tuple(b)) for a, b in out.tolist()]
+
+
+RING_SIMPLIFY_MM = 0.005
+
+
+def concentric(polys, interval, phase=0.0):
+    """Rings filling shapely ``polys`` (bed mm), ``interval`` apart, as
+    closed paths: shape by shape, nearest next, each from its outline inwards.
+    The first ring is ``interval / 2 + phase`` inside the outline, so its
+    line's edge lies on it as a hatch line's does. Mitred, so a square pad
+    keeps its corners."""
+    from shapely.geometry import Polygon as _Poly
+    pieces = []
+    for p in polys:
+        pieces += [g for g in getattr(p, "geoms", [p])
+                   if isinstance(g, _Poly) and not g.is_empty]
+    # A round pad from the Gerber is a 64-sided circle, and every ring of it
+    # kept them all: brain's top mask came to 440 000 points and a 32 MB
+    # file, built while the window froze (2026-11-23). Drawn to RING_SIMPLIFY_MM
+    # first - far finer than the beam - each ring is a fraction of that.
+    pieces = [q for p in pieces
+              for q in getattr(p.simplify(RING_SIMPLIFY_MM).buffer(0), "geoms",
+                               [p.simplify(RING_SIMPLIFY_MM).buffer(0)])
+              if isinstance(q, _Poly) and not q.is_empty]
+    out, at = [], (0.0, 0.0)
+    left = list(pieces)
+    while left:
+        i = min(range(len(left)), key=lambda k: math.dist(
+            at, left[k].exterior.coords[0]))
+        p = left.pop(i)
+        rings = []
+        d = interval / 2 + phase
+        while True:
+            g = p.buffer(-d, join_style=2, mitre_limit=4.0)
+            if g.is_empty:
+                break
+            for q in getattr(g, "geoms", [g]):
+                rings.append(list(q.exterior.coords))
+                rings += [list(r.coords) for r in q.interiors]
+            d += interval
+        if not rings:                   # thinner than a step: one line on it
+            rings.append(list(p.exterior.coords))
+        out += rings
+        at = rings[-1][-1]
+    return out
 
 
 def fill_job(shapes, outline, recipe=SPHAWES_REMOVE_MASK, base_angle=0.0, *,
@@ -822,7 +1060,20 @@ def fill_job(shapes, outline, recipe=SPHAWES_REMOVE_MASK, base_angle=0.0, *,
     s_val, feed = round(recipe.power * 10), round(recipe.speed * 60)
     body, secs, timeline = [], 0.0, []
     cached = {}
+    rings = getattr(recipe, "pattern", "hatch") == "concentric"
     for k in range(recipe.passes):
+        if rings:
+            phase = recipe.interval / 2 * (k % 2)
+            if phase not in cached:
+                paths = concentric(shapes, recipe.interval, phase)
+                cached[phase] = (_passes(paths, recipe.power, recipe.speed, 1)
+                                 if write else [],
+                                 _draw_seconds(paths, recipe.speed))
+            lines_k, dt = cached[phase]
+            body += lines_k
+            timeline.append((secs, secs + dt, 0, k))
+            secs += dt
+            continue
         ang = base_angle + (90.0 * (k % 2) if recipe.cross_hatch else 0.0)
         if ang not in cached:
             segs = hatch(shapes, recipe.interval, ang, recipe.one_way)
@@ -1495,6 +1746,30 @@ def _isolation_anchors(art, origin, recipe, step=2.0):
             if run >= step:
                 out.append(b)
                 run = 0.0
+    return out
+
+
+RING_GAP_MM = 0.8        # from a hole's edge to its ring: room for the find's error
+RING_WIDTH_MM = 0.4
+
+
+def rings_round_holes(holes, *, gap=RING_GAP_MM, width=RING_WIDTH_MM):
+    """A thin ring round each of ``holes`` ((x, y, d), bed mm), clear of its
+    edge: what a solder mask that hides the pads is lined up on. The laser
+    burns the ring through the mask, the camera sees where it landed, and the
+    hole in its middle says where it should have. Returns [(ring, pieces)]:
+    the ring whole, for the camera, and as two halves without a hole in them,
+    for the fill."""
+    from shapely.geometry import Point, box
+    out = []
+    for x, y, d in holes:
+        r0 = d / 2 + gap
+        ring = Point(x, y).buffer(r0 + width, quad_segs=24).difference(
+            Point(x, y).buffer(r0, quad_segs=24))
+        big = r0 + width + 1
+        halves = [ring.intersection(box(x - big, y - big, x, y + big)),
+                  ring.intersection(box(x, y - big, x + big, y + big))]
+        out.append((ring, [h for h in halves if not h.is_empty]))
     return out
 
 

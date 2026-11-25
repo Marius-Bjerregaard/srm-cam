@@ -1228,6 +1228,8 @@ class MainWindow(QMainWindow):
                                   "show the build area, set the design rules "
                                   "for how the board is made, and send it "
                                   "here.")
+        self.discord_act = self._act(h, "Join the Discord…",
+                                     self.action_join_discord)
         self._act(h, "Give feedback…",
                   lambda: QDesktopServices.openUrl(QUrl(FEEDBACK_URL)))
         h.addSeparator()
@@ -2301,7 +2303,7 @@ class MainWindow(QMainWindow):
             if self._iso_worker is None:
                 self.stage.set_busy("")
             if (self._stock_turn is not None and step.side != "top"
-                    and step.op != "fitdrill"):
+                    and step.op != "fitdrill" and not self._board_fitted(step)):
                 from gerber2rml.engine.fiducial import apply_to_toolpaths
                 paths = apply_to_toolpaths(paths, self._stock_turn)
             cuts, rapids = toolpath_segments(paths)
@@ -2338,8 +2340,27 @@ class MainWindow(QMainWindow):
         if self.inspector.stack.currentWidget() is self.inspector.step:
             self.inspector.step.est.set("~" + format_duration(secs))
 
+    # The steps that cut the board itself: on a board made elsewhere they
+    # follow its measured fit, like the holes of Drill only.
+    FITTED_OPS = ("traces", "drill", "cutout")
+
+    def _board_fitted(self, step):
+        """Is ``step`` cut through the fit of a board made elsewhere?"""
+        return (self._board_fit is not None and not self._double
+                and step is not None and step.op in self.FITTED_OPS)
+
     def _toolpaths_for(self, step):
-        """(paths, far_side_paths, cut_width) for one step, in the machine frame."""
+        """(paths, far_side_paths, cut_width) for one step, in the machine
+        frame: on a board made elsewhere, where its pads were measured."""
+        paths, far, width = self._toolpaths_design(step)
+        if self._board_fitted(step):
+            from gerber2rml.engine.fiducial import apply_to_toolpaths
+            paths = apply_to_toolpaths(paths, self._board_fit)
+        return paths, far, width
+
+    def _toolpaths_design(self, step):
+        """(paths, far_side_paths, cut_width) for one step, as the design
+        places the board."""
         from gerber2rml.engine.drill import drill_single_bit, drill_holes
         from gerber2rml.engine.cutout import cut_outline
         st = self.state
@@ -2718,11 +2739,11 @@ class MainWindow(QMainWindow):
                     self.stage.set_board(lay.bottom_copper, lay.outline,
                                          lay.holes, align_holes=lay.align_holes)
                     self.stage.set_pin_drag(self._pins_draggable())
-        elif (step is not None and step.op == "fitdrill"
-              and self._board_fit is not None):
+        elif self._board_fit is not None:
             # The board where its pads were measured, not where the design
-            # put it: the holes drawn, the drill path and a click-to-jog all
-            # have to agree with the copper on the bed.
+            # put it, on every page while the fit stands: the holes drawn,
+            # every cut (``_toolpaths_for``) and a click-to-jog all have to
+            # agree with the copper on the bed.
             from gerber2rml.engine.boardfit import warp_holes
             t = self._board_fit
             self.stage.set_pin_drag(False)
@@ -5125,8 +5146,18 @@ class MainWindow(QMainWindow):
         if transform == self._board_fit:
             return
         self._board_fit = transform
-        self._paths_cache.pop("fitdrill", None)
+        self._paths_cache = {}          # every cut follows the fit
         self.refresh_preview()
+
+    def _fitted_board(self):
+        """The board moved onto the fit of a board made elsewhere."""
+        from dataclasses import replace
+        from gerber2rml.engine.boardfit import warp_holes
+        b, t = self.state.board, self._board_fit
+        return replace(b, copper=self._warp_geom(b.copper, t),
+                       outline=self._warp_geom(b.outline, t),
+                       copper_top=self._warp_geom(b.copper_top, t),
+                       holes=warp_holes(b.holes, t))
 
     @staticmethod
     def _warp_geom(g, t):
@@ -5619,9 +5650,20 @@ class MainWindow(QMainWindow):
                 st.drill = self.cutting_drill()
                 st.cutout = self.cutting_cutout()
                 try:
-                    written = st.export(out_dir, level=level,
-                                        stock=self.declared_stock(),
-                                        traces=not self.laser_method())
+                    if self._board_fit is not None:
+                        # A board made elsewhere: every file is cut where
+                        # its pads were measured, as the stage shows it.
+                        from gerber2rml.cli import write_jobs
+                        written = write_jobs(
+                            self._fitted_board(), out_dir, st.name,
+                            trace=st.trace, drill=st.drill, cutout=st.cutout,
+                            mirror=st.mirror, machine=st.machine, level=level,
+                            stock=self.declared_stock(),
+                            traces=not self.laser_method())
+                    else:
+                        written = st.export(out_dir, level=level,
+                                            stock=self.declared_stock(),
+                                            traces=not self.laser_method())
                 finally:
                     st.trace, st.drill, st.cutout = keep
         except Exception as e:
@@ -6250,18 +6292,26 @@ class MainWindow(QMainWindow):
                 raise xtool.TracesError(notes[0] if notes else "No copper on this board.")
             return arts[0]
         if kind == "mask":
-            mirror = bool(st.mirror) or self._double
-            art = soldermask.build_mask(m.gerber_dir, shrink=self._mask_shrink,
-                                        mirror=mirror)
+            # Either face: the top one (F.Mask) as drawn, turned over on the
+            # bed like its copper; the bottom one mirrored like the mill's.
+            side = side or "bottom"
+            mirror = (bool(st.mirror) or self._double) if side == "bottom" else False
+            art = soldermask.build_mask(m.gerber_dir, side=side,
+                                        shrink=self._mask_shrink, mirror=mirror)
             try:
                 feats = xtool.drill_features(m.gerber_dir, mirror,
                                              self._raw_outline(m.gerber_dir))
             except Exception:                       # noqa: BLE001 - Align only
                 feats = []
+            openings, holes_only = xtool.drop_hole_only(art.openings, feats)
+            notes = art.warnings() + ([
+                f"{holes_only} opening{'s' if holes_only != 1 else ''} over a bare "
+                f"hole (a mounting hole) left out: the beam would only go "
+                f"through it."] if holes_only else [])
             return xtool.LaserArt(
-                kind="mask", apertures=art.openings, outline=art.outline,
-                mirrored=art.mirrored, notes=art.warnings(), features=feats,
-                note=f"shrunk {art.shrink:g} mm a side")
+                kind="mask", apertures=openings, outline=art.outline,
+                mirrored=art.mirrored, notes=notes, features=feats,
+                side=side, note=f"shrunk {art.shrink:g} mm a side")
         if kind == "silk":
             art = silkscreen.build_silk(m.gerber_dir)
             try:
@@ -7302,12 +7352,22 @@ class MainWindow(QMainWindow):
         kicadsetup.setup(self)
 
     def maybe_offer_kicad_plugin(self):
-        """Launch-time offer, once per plugin version. Called by app.py."""
-        from gerber2rml.gui2 import kicadsetup
+        """Launch-time offers, one after the other: the Discord invite (once
+        per invite round), then the KiCad buttons (once per plugin version,
+        when KiCad is here). Called by app.py."""
+        from gerber2rml.gui2 import community, kicadsetup
+        try:
+            community.maybe_invite(self)
+        except Exception:                       # noqa: BLE001 - a nicety
+            pass
         try:
             kicadsetup.maybe_offer(self)
         except Exception:                       # noqa: BLE001 - a nicety
             pass
+
+    def action_join_discord(self):
+        from gerber2rml.gui2 import community
+        community.open_discord(self)
 
     # ------------------------------------------------------------ updates
     def action_check_updates(self):

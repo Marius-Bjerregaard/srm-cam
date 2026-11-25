@@ -494,10 +494,119 @@ def test_on_a_blank_the_calibration_corrects_the_camera_and_moves_nothing(
 
 
 
-def test_drilled_holes_need_three_quarters_found_stencils_more():
+def test_drilled_holes_need_over_half_found_stencils_more():
     a = cam.Alignment(dx=0.1, dy=-0.3, turn=0.0, found=42, total=52, score=0.33)
     assert not a.ok                                  # 81 % < 85 %: a stencil
     a.need = cam.DRILLED_NEED
     assert a.ok                                      # a drilled board: enough
-    a.found = 35                                     # 67 %: too few either way
-    assert not a.ok
+    # Under solder mask ink: the env board's true place matched 131 of 205.
+    inked = cam.Alignment(dx=0, dy=0, turn=0.6, found=131, total=205,
+                          score=0.25, need=cam.DRILLED_NEED)
+    assert inked.ok
+    inked.found = 71                                 # its best wrong place: 35 %
+    assert not inked.ok
+
+
+def test_traces_line_up_measures_each_mark_against_its_own_hole():
+    """As the mask's test fire (2026-11-23): marks the camera shows 0.3 mm
+    off and holes really 0.4 mm off the job - the fit moves the job by the
+    holes' error only, and gives the camera's own."""
+    import numpy as np
+    from shapely.geometry import Point
+    px, size = 16, 60
+    yy, xx = np.mgrid[0:size * px, 0:size * px] / px
+    before = np.zeros((size * px, size * px, 3), np.uint8)
+    before[...] = (200, 140, 100)                       # bare copper
+    cam_err, job_err = (0.3, -0.2), (0.4, 0.1)
+    tests = []
+    for hx, hy in ((10, 10), (50, 12), (30, 45), (12, 48)):
+        tx, ty = hx + job_err[0], hy + job_err[1]           # where it really is
+        before[(xx - tx) ** 2 + (yy - ty) ** 2 <= 0.4 ** 2] = (15, 15, 15)
+        mark = Point(hx + 1.6, hy).buffer(0.6)              # isolation beside it
+        tests.append((mark, (hx, hy, 0.8)))
+    after = before.copy()
+    for mark, _h in tests:
+        c = mark.centroid
+        m = (xx - c.x - cam_err[0]) ** 2 + (yy - c.y - cam_err[1]) ** 2 <= 0.6 ** 2
+        after[m] = (90, 70, 60)
+    fit = cam.fit_marks_to_holes(before, after, px, tests)
+    assert fit is not None and fit.used == 4
+    assert (fit.dx, fit.dy) == pytest.approx((job_err[0] - cam_err[0],
+                                              job_err[1] - cam_err[1]), abs=0.06)
+    assert fit.camera == pytest.approx(cam_err, abs=0.06)
+    assert abs(fit.turn) < 0.1
+
+
+class _LidLaser(xtool.F1Ultra):
+    """The laser's own class, its HTTP faked: a lid that opens on cue."""
+
+    def __init__(self, open_after=None):
+        super().__init__()
+        self.sent, self.polls, self.open_after = [], 0, open_after
+
+    def _req(self, method, path, body=None, ctype="application/json", timeout=None):
+        import json as _j
+        if path == "/peripheral/gap":
+            self.polls += 1
+            is_open = self.open_after is not None and self.polls > self.open_after
+            return _j.dumps({"code": 0, "data": {"state": "on" if is_open else "off"}})
+        self.sent.append(path)
+        if path.startswith("/device/runningStatus") or "mode" in path:
+            return _j.dumps({"code": 0, "data": {"curMode": {"mode": "Work"}}, "mode": "Work"})
+        return _j.dumps({"code": 0, "msg": "Success", "result": "ok"})
+
+    def _raw(self, port, path, *a, **k):
+        self.sent.append(path)          # never the real machine
+        return b""
+
+    def mode(self):
+        return "Work"
+
+
+def test_a_job_is_refused_with_the_lid_open():
+    """2026-11-23: the lid opened during a test fire and the fiber kept
+    firing. Shut: it runs. Open: refused, nothing sent."""
+    shut = _LidLaser()
+    shut.run("G1X1Y1")
+    assert any("processing/upload" in s for s in shut.sent)
+    open_ = _LidLaser(open_after=0)
+    with pytest.raises(xtool.LaserError, match="lid is open"):
+        open_.run("G1X1Y1")
+    assert not any("processing/upload" in s for s in open_.sent)
+    assert open_.lid_open() is True and shut.lid_open() is False
+
+
+def test_opening_the_lid_stops_a_running_job(monkeypatch):
+    monkeypatch.setattr(xtool.time, "sleep", lambda s: None)
+    l = _LidLaser(open_after=3)
+    with pytest.raises(xtool.LaserError, match="lid was opened"):
+        l.wait(60)
+    assert any("processing/stop" in s for s in l.sent)
+    assert any("M5" in s for s in l.sent)
+
+
+def test_a_frame_may_run_with_the_lid_open():
+    l = _LidLaser(open_after=0)
+    l.frame("G1X1Y1")                   # blue, watched with the lid open
+    assert any("gcodeType=frame" in s for s in l.sent)
+
+
+def test_a_connection_windows_refuses_is_said_in_words(monkeypatch):
+    """WinError 10013: the PC blocked it, not a laser that is off."""
+    import http.client
+    from gerber2rml.engine import xtool
+
+    class _Refused(http.client.HTTPConnection):
+        def request(self, *a, **kw):
+            e = PermissionError(13, "An attempt was made to access a socket "
+                                    "in a way forbidden by its access permissions")
+            e.winerror = 10013
+            raise e
+    monkeypatch.setattr(xtool.http.client, "HTTPConnection", _Refused)
+    import pytest
+    with pytest.raises(xtool.LaserError) as got:
+        xtool.F1Ultra()._req("GET", "/device/machineInfo")
+    assert "Windows blocked" in str(got.value) and "VPN" in str(got.value)
+    with pytest.raises(xtool.LaserError) as got:
+        xtool.F1Ultra()._raw(8329, "/camera/snap")
+    assert "Windows blocked" in str(got.value)

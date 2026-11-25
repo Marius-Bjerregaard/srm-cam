@@ -630,11 +630,13 @@ def test_a_laser_board_is_set_up_as_the_mill_runs_it_and_put_back(
         setup, page = w.inspector.setup, w.autorun_page
         setup.double.setChecked(True)
         before = _fingerprint(w)
+        levelled = page.level_chk.isChecked()   # off by default (upstream abda349)
 
         def at_summary(sheet):
             assert w.method_id() == fab.LASER and w.laser_method()
             assert not w._double                        # one side, on the mill
-            assert page.level_chk.isChecked()   # the holes must go through
+            # The levelling tick is left as it was set (upstream 8034564).
+            assert page.level_chk.isChecked() == levelled
             return "cancel"
         hands = Hands(answers={"method": _pick(fab.LASER),
                                "sheet": _size(150, 124)},
@@ -645,7 +647,7 @@ def test_a_laser_board_is_set_up_as_the_mill_runs_it_and_put_back(
         assert hands.seen[-1] == "summary"
         assert _fingerprint(w) == before
         assert w._double and setup.double.isChecked()
-        assert page.level_chk.isChecked()
+        assert page.level_chk.isChecked() == levelled
     finally:
         _close(w)
 

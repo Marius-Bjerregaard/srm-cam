@@ -55,11 +55,15 @@ def job_builder(folder):
                 raise xtool.TracesError(f"No copper Gerber in {folder}.")
             return max(faces, key=lambda t: (t[0], t[1]))[2]
         if kind == "mask":
-            art = soldermask.build_mask(folder, mirror=True)
-            return xtool.LaserArt(kind="mask", apertures=art.openings,
+            side = side or "bottom"
+            bottom = side == "bottom"
+            art = soldermask.build_mask(folder, side=side, mirror=bottom)
+            feats = features(bottom)
+            openings, _n = xtool.drop_hole_only(art.openings, feats)
+            return xtool.LaserArt(kind="mask", apertures=openings,
                                   outline=art.outline, mirrored=art.mirrored,
-                                  notes=art.warnings(), features=features(True),
-                                  note=f"shrunk {art.shrink:g} mm a side")
+                                  notes=art.warnings(), features=feats,
+                                  side=side, note=f"shrunk {art.shrink:g} mm a side")
         if kind == "silk":
             art = silkscreen.build_silk(folder)
             return xtool.LaserArt(kind="silk", apertures=art.shapes,
