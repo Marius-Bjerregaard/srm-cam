@@ -1,5 +1,13 @@
 # SRM-CAM
 
+> **This is a fork.** It is Marius Bjerregaard's version of
+> [SRM-CAM by Mads Rudolph](https://github.com/MadsRudolph/srm-cam), with
+> changes of its own; releases and updates come from
+> [this repository](https://github.com/Marius-Bjerregaard/srm-cam/releases).
+> The user guide and the [SRM-CAM Discord](https://discord.gg/JUVbzanj6B)
+> belong to the original project: say that you run the fork, and report
+> what only happens in the fork here, not to Mads.
+
 [![tests](https://github.com/MadsRudolph/srm-cam/actions/workflows/tests.yml/badge.svg)](https://github.com/MadsRudolph/srm-cam/actions/workflows/tests.yml)
 [![build installer](https://github.com/MadsRudolph/srm-cam/actions/workflows/build.yml/badge.svg)](https://github.com/MadsRudolph/srm-cam/actions/workflows/build.yml)
 

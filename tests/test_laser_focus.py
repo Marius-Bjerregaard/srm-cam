@@ -627,6 +627,8 @@ def test_a_reading_off_the_others_is_not_kept_as_the_map(qt_app, monkeypatch):
     assert page._focus_map is None
     assert "off the surface the other points make" in page.status.text()
     page.close()
+
+
 def test_stop_ends_a_focus_map_between_points(qt_app, monkeypatch):
     """A focus map pressed by mistake (2026-11-22) ran on: STOP only stopped
     jobs on the machine, and the map is the page walking the dot point by

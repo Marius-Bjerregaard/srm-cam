@@ -1149,6 +1149,10 @@ class TracesRecipe:
     lines_per_cm: float = DEFAULT_TRACE_DENSITY
     rest_s: float = 0.0
     spot_drills: bool = True
+    # Burn the drill centres THROUGH the board, as pilot holes, instead of
+    # marking them in the copper: an option, and only with the fin plate
+    # under the board, so the beam is out of focus once it is through.
+    drill_through: bool = False
     cross_hatch: bool = True
     one_way: bool = True
     mark_outline: bool = False
@@ -1526,9 +1530,13 @@ def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
         art._ring_cache = cache
 
     if key not in cache:
-        spots = (_drill_spots(art.drills)
-                 if recipe.spot_drills and art.drills else None)
-        cu = art.copper.difference(spots) if spots is not None else art.copper
+        # The drill centres are NOT cut out of the copper here: they were,
+        # and each got the isolation's own rings inside a 0.5 mm dot - the
+        # innermost a few hundredths across, all on one spot, at every pass
+        # and edge pass. That burned through the board at every footprint
+        # hole (2026-11-20). The centres are marked on their own, lightly
+        # (spot_rings, SPOT_PASSES).
+        cu = art.copper
         clip = None
         if only_key:
             sel = [art.apertures[k] for k in only_key
@@ -1575,6 +1583,65 @@ def traces_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
     outline = [to_bed(list(r.coords), origin, h)
                for r in outline_rings(art.outline)]
     return bed_groups, outline
+
+
+# A drill centre is MARKED in the copper, not burned through the board: one
+# ring at the dot's edge, this many passes - a circle the drill finds, where
+# the isolation's 20 passes over the dot's own tiny rings burned through the
+# board (2026-11-20). Not yet measured on the machine: if the ring does not
+# show in the copper, raise it a pass or two, never to the isolation's.
+SPOT_PASSES = 3
+
+
+def spot_rings(art, origin, recipe=DEFAULT_TRACES_RECIPE, region=None,
+               only=None):
+    """The drill centres that lie on copper, as rings in bed mm.
+
+    Marked (the default): one ring per centre, at the dot's edge half a
+    kerf in - a circle the drill finds. ``recipe.drill_through``: rings
+    from that edge in to the middle, a stepover apart, which the run then
+    gives every pass - a pilot hole burned through the board.
+
+    ``region`` (bed mm) keeps the centres inside it; ``only`` (aperture
+    indices) the ones on the selected trenches - a dot is an aperture of
+    its own (traces_apertures). [] when the recipe does not etch them."""
+    if not (recipe.spot_drills and art.drills) or art.copper is None:
+        return []
+    spots = _drill_spots(art.drills)
+    if spots is None:
+        return []
+    from shapely.geometry import LineString
+    from shapely.ops import unary_union
+    from gerber2rml.engine import soldermask
+    picked = None
+    if only:
+        sel = [art.apertures[k] for k in only if 0 <= k < len(art.apertures)]
+        picked = unary_union(sel) if sel else None
+        if picked is None:
+            return []
+    _, h = art.size
+    rings = []
+    for poly in soldermask._polygons(spots.intersection(art.copper)):
+        if picked is not None and not picked.intersects(poly):
+            continue
+        d = recipe.kerf / 2.0
+        while True:
+            inner = poly.buffer(-d)
+            parts = soldermask._polygons(inner) if not inner.is_empty else []
+            if not parts:
+                if d == recipe.kerf / 2.0:      # smaller than the kerf: its edge
+                    parts = soldermask._polygons(poly)
+                else:
+                    break
+            for part in parts:
+                ring = to_bed(list(part.exterior.coords), origin, h)
+                if region is None or region.contains(
+                        LineString(ring).centroid):
+                    rings.append(ring)
+            if not recipe.drill_through:
+                break
+            d += recipe.stepover
+    return _nearest_order(rings) if rings else []
 
 
 def edge_rings(rings, radius, centre=FIELD_CENTRE):
@@ -1675,6 +1742,23 @@ def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
                 body += _passes(ring_order, recipe.power, recipe.speed, 1)
             timeline.append((secs, secs + edge_s, 0, recipe.passes + rnd))
             secs += edge_s
+    # The drill centres: marked, after the isolation, SPOT_PASSES times - or
+    # burned through (drill_through). Not on a rework (a second go at
+    # copper); a focus band does the ones inside it, a selection the ones on
+    # its trenches.
+    spots = ([] if rework else
+             spot_rings(art, origin, recipe, region=region, only=only))
+    if spots:
+        spot_s = _draw_seconds(spots, recipe.speed)
+        # Through the board: as many passes as the isolation has - what
+        # burned through when it was not meant to.
+        for rnd in range(recipe.passes if recipe.drill_through
+                         else SPOT_PASSES):
+            if write:
+                body += _passes(spots, recipe.power, recipe.speed, 1)
+            timeline.append((secs, secs + spot_s, 0,
+                             recipe.passes + recipe.edge_passes + rnd))
+            secs += spot_s
     if outline and recipe.mark_outline:
         if write:
             body += _passes(outline, recipe.mark_power, recipe.speed, 1)
@@ -1682,8 +1766,10 @@ def traces_job(art, origin, recipe=DEFAULT_TRACES_RECIPE, only=None,
         timeline.append((secs, secs + dt, -1, recipe.passes))
         secs += dt
     lines = _head("fiber", recipe.frequency, recipe.power / 100) + body + _TAIL
-    return Job(text="\r\n".join(lines) if write else "", zones=[len(all_rings)], seconds=secs,
-               passes=recipe.passes, zone_paths=[all_rings], timeline=timeline)
+    return Job(text="\r\n".join(lines) if write else "",
+               zones=[len(all_rings) + len(spots)], seconds=secs,
+               passes=recipe.passes, zone_paths=[all_rings + spots],
+               timeline=timeline)
 
 
 # ---------------------------------------------------------------------------

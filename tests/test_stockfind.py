@@ -331,6 +331,8 @@ def test_a_clean_miss_goes_one_step_lower_and_finds_it(monkeypatch):
     ser, seek = _seek(monkeypatch, ["E 900 NOTOUCH", "R 900 0 0 -38000"])
     assert seek() == -38000
     assert _lowered(ser) == ["N 0 0 -%d -1" % stockfind.DROP_STEP_UM]
+
+
 def test_copper_top_same_bit_and_stale():
     """The first touch steps fast down to the highest the copper could be:
     1 mm over a height measured with this bit, else the lab's copper plus

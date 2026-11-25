@@ -10,6 +10,11 @@ from PySide6.QtGui import QDesktopServices
 from gerber2rml.gui2 import dialogs, tier
 
 DISCORD_URL = "https://discord.gg/JUVbzanj6B"
+# This build is a fork: the Discord is the original SRM-CAM's, run by Mads.
+FORK_NOTE = ("This is a fork of SRM-CAM (github.com/Marius-Bjerregaard/"
+             "srm-cam), not Mads Rudolph's own version. The Discord is the "
+             "original project's: say which version you run, and report "
+             "what only happens in this fork to the fork, not to Mads.")
 SEEN_KEY = "community/discord_invite_round"
 INVITE_ROUND = 1
 
@@ -45,6 +50,7 @@ def maybe_invite(parent, settings=None, opener=None):
     d.say("New releases are announced and explained with pictures in "
           "#announcements, and you can show what you made, report a bug, "
           "or ask for a feature.")
+    d.say(FORK_NOTE, small=True)
     d.say("You can join later from Help ▸ Join the Discord.", small=True)
     d.setObjectName("discordInvite")
     out = {"go": False}

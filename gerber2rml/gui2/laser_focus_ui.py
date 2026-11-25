@@ -218,9 +218,10 @@ Stopped = xtool.Stopped          # STOP was pressed while the dot was measuring
 
 
 def _stop_pressed(page):
+    """STOP on the page, by either flag it sets."""
     ev = getattr(page, "_stop_event", None)
-    return getattr(page, "_stop_requested", False) or (
-        ev is not None and ev.is_set())
+    return bool(getattr(page, "_stop_requested", False)
+                or (ev is not None and ev.is_set()))
 
 
 def _measure_or_stop(page, points, progress):
@@ -295,7 +296,7 @@ def measure(page):
     ref = load_reference()
 
     def work(progress):
-        raw = _measure_or_stop(page, points, progress)   # a part map is not a map
+        raw = _measure_or_stop(page, points, progress)
         # Checked as it will be used: the raw readings carry the machine's
         # own slope, up to 1.3 mm on a flat sheet.
         lf.check_map(lf.corrected(raw, ref))

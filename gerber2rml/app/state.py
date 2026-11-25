@@ -131,10 +131,16 @@ class ProjectState:
             m.place_x, m.place_y = x, y
             self._sync()
 
-    def set_rotation(self, angle):
-        """Turn the current board to ``angle`` degrees (snapped to 0/90/180/
-        270); recomputes ``board`` without re-reading the Gerbers."""
-        self.rotate = int(round(angle / 90.0)) * 90 % 360
+    def set_rotation(self, angle, fine=False):
+        """Turn the current board to ``angle`` degrees CCW - snapped to 0/90/
+        180/270, or, ``fine``, to the nearest tenth of a degree (turned with
+        the mouse, Control held). Recomputes ``board`` without re-reading the
+        Gerbers; the geometry (loader.rotate_board) takes any angle."""
+        if fine:
+            a = round(float(angle), 1) % 360.0
+            self.rotate = int(a) if a == int(a) else a
+        else:
+            self.rotate = int(round(angle / 90.0)) * 90 % 360
         if self.boards:
             self.boards[self.current].rotate = self.rotate
             self._sync()

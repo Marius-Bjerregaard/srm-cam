@@ -425,6 +425,23 @@ def _copper_to_shapely(b_cu_layer) -> object:
     return unary_union(shapes)
 
 
+def _with_windows(outer, polys):
+    """``outer`` with every other closed loop inside it cut out of it as a
+    window. polygonize already gives a loop nested in another as a hole of
+    it; this makes sure of the ones it gives as separate faces only."""
+    inner = [p for p in polys if p is not outer and outer.contains(
+        p.representative_point()) and p.area < outer.area]
+    holes = [h for h in inner if not any(
+        h is not o and o.contains(h.representative_point()) and o.area > h.area
+        for o in inner)]
+    shape = outer
+    for h in holes:
+        shape = shape.difference(Polygon(h.exterior))
+    if shape.geom_type == "MultiPolygon":
+        shape = max(shape.geoms, key=lambda p: p.area)
+    return shape
+
+
 def _outline_to_shapely(outline_layer) -> object:
     """Convert Edge.Cuts lines/arcs to a board outline polygon.
 
@@ -459,18 +476,29 @@ def _outline_to_shapely(outline_layer) -> object:
     if not edge_lines:
         return Point(0, 0).buffer(0)
 
-    polys = list(polygonize(edge_lines))
-    if polys:
-        # Return the largest polygon (boards with slots may yield multiple)
-        return max(polys, key=lambda p: p.area)
-
-    # Rounded corners: arc linearisation leaves sub-micron endpoint gaps that
-    # polygonize won't node. Snap to a fine grid and retry before giving up.
+    # The outline is the polygon that spans ALL of Edge.Cuts. A window drawn
+    # inside the board out of straight lines closes at once, while the outer
+    # edge, linearised arcs and all, only closes once snapped - and taking
+    # the largest polygon of the first attempt that closed anything made the
+    # window the board (an octagonal cut-out became "the outline", the board
+    # round it was lost; 2026-11-20). So each attempt is judged by whether its
+    # largest polygon reaches every edge line; that one, with the windows
+    # polygonize leaves as its holes, is the board.
     merged = unary_union(edge_lines)
-    for grid in (1e-4, 1e-3, 1e-2):
-        polys = list(polygonize([set_precision(merged, grid)]))
-        if polys:
-            return max(polys, key=lambda p: p.area)
+    extent = merged.bounds
+    best = None
+    for grid in (None, 1e-4, 1e-3, 1e-2):
+        geom = merged if grid is None else set_precision(merged, grid)
+        polys = list(polygonize([geom] if grid is not None else edge_lines))
+        if not polys:
+            continue
+        top = max(polys, key=lambda p: p.area)
+        if best is None or top.area > best.area:
+            best = top
+        if all(abs(a - b) < 0.05 for a, b in zip(top.bounds, extent)):
+            return _with_windows(top, polys)
+    if best is not None:
+        return best
 
     # Fallback: buffer union of edge lines to produce a filled region
     buffered = merged.buffer(_OUTLINE_FALLBACK_STROKE_MM)  # thin stroke to create a filled area
