@@ -1647,7 +1647,15 @@ class AutoRunPage(inspector.Page):
         out = []
         only = getattr(self, "_only", None)
         top = {k for k, _l in src.top_steps()} if only else set()
+        # Started part-way: the steps it skips are not in the time. Counted
+        # until the run reached them, they made a restart at the cut-out
+        # show the whole board's time.
+        skip = set() if only else ar.skipped_by_start(
+            self.start_box.currentData(), src.bottom_steps(),
+            src.top_steps())
         for key, label in self._plan_rows():
+            if key in skip:
+                continue
             if only and key != only and key not in (
                     ("stock", "stock_top", "fiducials", "level_top")
                     if only in top else ("stock", "level")):

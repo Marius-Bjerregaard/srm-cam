@@ -137,3 +137,43 @@ def test_a_finished_run_leaves_one_line_in_place_of_the_rows(page):
     assert page.progress_head.isHidden()
     assert all(v.isHidden() for _n, v in page._progress_rows.values())
     assert page.progress.value() == 1000 and page.progress_pct.text() == "100 %"
+
+
+def test_a_run_started_part_way_is_timed_without_what_it_skips(page):
+    """'Cut out the board' after a stop said the whole board's 26 minutes:
+    the steps it skips were counted until the run reached them."""
+    from gerber2rml.engine import autorun as ar
+    from gerber2rml.gui2.autorun import WindowSource
+    src = WindowSource(page.ctl, page._gui)
+    whole = page._estimates(src)
+    cut = [k for k, _l, _s in whole if "cutout" in k][0]
+    page.start_box.setCurrentIndex(page.start_box.findData(cut))
+    part = page._estimates(src)
+    keys = [k for k, _l, _s in part]
+    assert keys == ["stock", "level", cut]          # found and probed, then cut
+    assert sum(s for *_x, s in part) < sum(s for *_x, s in whole) / 2
+    page.start_box.setCurrentIndex(page.start_box.findData(ar.START_AT_CHECK))
+    assert [k for k, _l, _s in page._estimates(src)] == keys
+    page.start_box.setCurrentIndex(0)
+    assert page._estimates(src) == whole
+
+
+def test_the_steps_a_start_skips_follow_the_run():
+    from gerber2rml.engine import autorun as ar
+    bottom = [("drill_run", "Drill"), ("traces_run", "Traces"),
+              ("cutout_run", "Cut out")]
+    top = [("top_traces_run", "Top traces"), ("top_cutout_run", "Cut out")]
+    f = ar.skipped_by_start
+    assert f(None, bottom, top) == set()
+    assert f("traces_run", bottom, top) == {"drill_run"}
+    assert f("top_cutout_run", bottom, top) == {
+        "drill_run", "traces_run", "cutout_run", "level", "flip",
+        "top_traces_run"}
+    assert f(ar.START_AT_FIDUCIALS, bottom, top) == {
+        "drill_run", "traces_run", "cutout_run", "level", "flip"}
+    assert f(ar.START_AT_CHECK, bottom, []) == {"drill_run", "traces_run"}
+    assert f(ar.START_AT_CHECK, bottom, top) == {
+        "drill_run", "traces_run", "cutout_run", "level", "flip",
+        "top_traces_run"}
+    assert f(ar.START_AT_CHECK, bottom[:2], []) == {"drill_run", "traces_run"}
+    assert f("no_such_step", bottom, top) == set()

@@ -883,3 +883,34 @@ def test_the_line_up_says_where_the_board_was_and_how_well_it_fits():
     assert [h["n"] for h in r["holes"]] == [1, 2]
     said = [n for n in notes if n.startswith("Lined up with the board's 2")]
     assert said and "X -0.6" in said[0] and "Fit: worst" in said[0]
+
+
+@pytest.mark.parametrize("double,start_at", [
+    (False, None), (False, "traces"), (False, "cutout"),
+    (False, START_AT_CHECK),
+    (True, "traces"), (True, "cutout"), (True, START_AT_FIDUCIALS),
+    (True, START_AT_CHECK)])
+def test_the_time_estimate_skips_what_the_run_skips(double, start_at,
+                                                    monkeypatch):
+    """skipped_by_start is what the run's estimate leaves out: it has to be
+    exactly what the run then does not do."""
+    from gerber2rml.engine.autorun import skipped_by_start
+    m, ser, board, log, run = _run(double, start_at=start_at)
+
+    def fiducials():                # the simulated sheet is not drilled
+        run._step("fiducials", "running")
+        board.set_top_fit(Transform(theta=0.0, scale=1.0, tx=0.0, ty=0.0))
+        run._step("fiducials", "done")
+    monkeypatch.setattr(run, "_fiducials", fiducials)
+    log.check = lambda label, deeper: ("go", 0.0)
+    log.flip = lambda: (m.flip(), True)[1]
+    plan = ["stock", "level"] + [k for k, _l in board.bottom_steps()]
+    if double:
+        plan += ["flip", "stock_top", "fiducials", "level_top"] + [
+            k for k, _l in board.top_steps()]
+    skip = skipped_by_start(start_at, board.bottom_steps(), board.top_steps())
+    if skip & {"flip"}:
+        m.flip()                    # started on the top: it is turned over
+    assert run.run() is True
+    done = [k for k, s in log.steps if s == "done"]
+    assert done == [k for k in plan if k not in skip]

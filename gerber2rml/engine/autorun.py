@@ -303,6 +303,33 @@ class Events:
         return ("go", 0.0)
 
 
+def skipped_by_start(start_at, bottom, top):
+    """The keys of the steps a run started at ``start_at`` does not do, by
+    the same rules as :meth:`AutoRun._sequence` and :meth:`AutoRun._jobs`:
+    for the time estimate, which counted them all - "Cut out the board"
+    after a stop said the 26 minutes of the whole board (2026-11-25).
+
+    ``bottom`` and ``top`` are the sides' ``[(key, label)]`` in run order.
+    Started on the top (a top step, the fiducials, or the check of a
+    two-sided board) the bottom, its probing and the flip are not done.
+    The stock is always found again, and the face's probing is done."""
+    if start_at is None:
+        return set()
+    bk, tk = [k for k, _l in bottom], [k for k, _l in top]
+    at_check = start_at == START_AT_CHECK
+    if start_at == START_AT_FIDUCIALS:
+        return set(bk) | {"level", "flip"} if tk else set()
+    if not at_check and start_at not in bk + tk:
+        return set()                    # the run refuses it
+    on_top = (at_check and bool(tk)) or start_at in tk
+    out = set(bk) | {"level", "flip"} if on_top else set()
+    for k in (tk if on_top else bk):
+        if k == start_at or (at_check and "cutout" in k):
+            break
+        out.add(k)
+    return out
+
+
 def fills_stock(bw, bh, sw, sh, tol=SHEET_EDGE_MM):
     """True when a ``bw`` x ``bh`` board is the ``sw`` x ``sh`` piece of stock
     itself: each side within ``tol``, the same tolerance the cut-out uses to
