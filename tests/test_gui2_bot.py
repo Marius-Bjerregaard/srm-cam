@@ -594,7 +594,7 @@ def test_how_it_is_made_lands_and_brings_its_tool_with_it(qt_app,
         setup = w.inspector.setup
         w.action_method(fab.BALL, "kicad")
         before = _fingerprint(w)
-        assert abs(w.state.trace.effective_diameter() - 0.44) < 1e-9
+        assert abs(w.state.trace.effective_diameter() - 0.505) < 1e-3
 
         def at_summary(sheet):
             assert w.method_id() == fab.FLAT

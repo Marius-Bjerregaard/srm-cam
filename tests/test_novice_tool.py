@@ -58,6 +58,7 @@ def test_a_ball_mills_channel_follows_its_diameter_and_depth(win):
     s = win.inspector.setup
     s.sync()
     assert s.bit_dia.value() == pytest.approx(0.8)
-    assert win.state.trace.effective_diameter() == pytest.approx(0.44)
+    assert win.state.trace.effective_diameter() == pytest.approx(0.505,
+                                                                 abs=0.001)
     s.bit_dia.setValue(1.0)
-    assert 0.44 < win.state.trace.effective_diameter() < 1.0
+    assert 0.505 < win.state.trace.effective_diameter() < 1.0

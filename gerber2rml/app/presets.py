@@ -37,9 +37,12 @@ BUILTIN_PRESETS = {
     # cuts a channel about 0.44 mm wide at the copper top (TraceJob.ball_width
     # works that out from the ball's own 0.8), which keeps pads their drawn size. Gaps under 0.44 get one middle cut, which
     # trims those pads. Measured on the mill, 4 Nov 2026: docs/bit-capabilities.md.
+    # The profile cuts 0.11 mm: at 0.08 the copper was not cut through all
+    # over a sheet (the lab mill, 2026-11-26). The channel is then worked
+    # out as about 0.51 mm - not measured at this depth.
     "SRM-20 0.8 mm ball mill: fine SMD traces + 0.8/1.0 drill + cutout": {
         "trace":  {"tool_type": "ball", "bit_diameter": 0.8,
-                   "cut_depth": 0.08, "offsets": 1,
+                   "cut_depth": 0.11, "offsets": 1,
                    "stepover": 0.5, "xy_feed": 3.0, "plunge_feed": 0.5,
                    "travel_z": 2.0, "cut_pinches": True},
         "drill":  {"bit_diameter": 0.8, "cut_depth": 0.6, "total_depth": 2.0,

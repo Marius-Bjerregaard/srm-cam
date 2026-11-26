@@ -1,4 +1,6 @@
 """Test presets: built-in, repo example, and user presets."""
+import pytest
+
 from gerber2rml.app.presets import load_presets, apply_preset, save_user_preset, BUILTIN_PRESETS
 from gerber2rml.app.state import ProjectState
 
@@ -17,7 +19,9 @@ def test_ball_mill_preset_holds_the_measured_settings():
     ball = BUILTIN_PRESETS[list(BUILTIN_PRESETS)[1]]
     assert ball["trace"]["tool_type"] == "ball"     # the ball's own size...
     assert ball["trace"]["bit_diameter"] == 0.8     # ...its channel worked out
-    assert ball["trace"]["cut_depth"] == 0.08
+    # 0.08 was the depth measured on 4 Nov; it did not come through the
+    # copper everywhere on a real sheet, so the profile cuts 0.11.
+    assert ball["trace"]["cut_depth"] == 0.11
     assert ball["trace"]["cut_pinches"] is True
     assert ball["drill"]["bit_diameter"] == 0.8     # real holes and outline
     assert ball["drill"]["total_depth"] == 2.0
@@ -29,7 +33,8 @@ def test_ball_mill_preset_applies_every_field():
     st = ProjectState()
     apply_preset(st, BUILTIN_PRESETS[list(BUILTIN_PRESETS)[1]])
     assert st.trace.tool_type == "ball"
-    assert abs(st.trace.effective_diameter() - 0.44) < 1e-9   # as measured
+    # Deeper than the measured 0.08 mm, so wider than its 0.44 mm channel.
+    assert st.trace.effective_diameter() == pytest.approx(0.505, abs=0.001)
     assert st.trace.cut_pinches is True
     assert st.drill.bit_diameter == 0.8
     assert st.cutout.bit_diameter == 0.8
