@@ -33,6 +33,7 @@ import re
 import select
 import subprocess
 import threading
+import time
 from collections import deque
 from ctypes import wintypes
 from pathlib import Path
@@ -210,6 +211,32 @@ class SpoolPrinter:
             return len(self._jobs(h)) == 0
         finally:
             _ws.ClosePrinter(h)
+
+
+# How long a run about to start waits for cleared jobs to really be gone.
+CLEAR_WAIT_S = 10.0
+
+
+def clear_queue(printer, wait_s=None, poll_s=0.25):
+    """Purge ``printer`` and wait until its queue is really empty.
+
+    A job that was on its way to the mill when it was cancelled - a run
+    stopped mid-cut, to be cut again deeper - does not leave the queue at
+    once: Windows shows it as "Deleting" and CUPS as cancelling until the
+    driver lets go of the mill's USB, a few seconds. ``purge()`` looks once,
+    straight away (STOP cannot wait), so the next run was told "the old jobs
+    could not be cleared" about a job that was already going. True when the
+    queue is empty; raises :class:`SpoolError` if it cannot be read.
+    """
+    wait_s = CLEAR_WAIT_S if wait_s is None else wait_s
+    if printer.purge():
+        return True
+    end = time.monotonic() + wait_s
+    while time.monotonic() < end:
+        time.sleep(poll_s)
+        if not printer.pending():
+            return True
+    return False
 
 
 # --- macOS: the mill as a raw CUPS queue ----------------------------------

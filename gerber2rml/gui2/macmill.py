@@ -93,13 +93,16 @@ def preflight(parent, printer, run=None):
                         f"SRM-20 queue. They would cut before this run. "
                         f"Clear them?", "Clear them"):
                 return False
-            if not printer.purge():
+            if not _busy(lambda: rmlspool.clear_queue(printer)):
                 dialogs.report_error(
                     parent, "The old jobs could not be cleared",
                     rmlspool.SpoolError("jobs still queued"),
-                    "Someone else's jobs need an administrator to remove: "
-                    "open System Settings ▸ Printers & Scanners ▸ SRM-20 ▸ "
-                    "Open Print Queue and delete them.")
+                    "A job that was being sent when a run was stopped can "
+                    "hang until the mill lets go of it: switch the mill off "
+                    "and on, then start again. Someone else's jobs need an "
+                    "administrator to remove: open System Settings ▸ "
+                    "Printers & Scanners ▸ SRM-20 ▸ Open Print Queue and "
+                    "delete them.")
                 return False
     except rmlspool.SpoolError as e:
         dialogs.report_error(parent, "The SRM-20 queue could not be read", e,

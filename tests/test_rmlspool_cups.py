@@ -132,6 +132,43 @@ def test_purge_reports_jobs_it_could_not_remove():
     assert CupsPrinter("SRM-20", run=q).purge() is False
 
 
+class SlowQueue(Queue):
+    """A job that was printing when it was cancelled: ``cancel`` is taken,
+    and the job is still listed for the next few looks."""
+
+    def __init__(self, jobs, looks):
+        super().__init__(jobs)
+        self.looks = looks
+
+    def __call__(self, argv, **kw):
+        if argv[0] == "cancel":
+            self.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        if argv[0] == "lpstat":
+            self.looks -= 1
+            if self.looks <= 0:
+                self.jobs = []
+        return super().__call__(argv, **kw)
+
+
+def test_clearing_waits_for_a_job_that_is_on_its_way_out(monkeypatch):
+    """A run stopped mid-cut, then started again to cut deeper: the stopped
+    job was still listed when the queue was looked at straight after the
+    cancel, and the new run was refused with "could not be cleared"."""
+    monkeypatch.setattr(rmlspool.time, "sleep", lambda _s: None)
+    q = SlowQueue([7], looks=4)
+    p = CupsPrinter("SRM-20", run=q)
+    assert p.purge() is False               # what the run used to go by
+    assert rmlspool.clear_queue(p) is True
+    assert q.jobs == []
+
+
+def test_clearing_gives_up_on_a_job_that_stays():
+    q = Queue([7], cancel_works=False)
+    assert rmlspool.clear_queue(CupsPrinter("SRM-20", run=q),
+                                wait_s=0.05, poll_s=0.01) is False
+
+
 LPINFO = ("network ipp\n"
           "direct usb://Brother/HL-1110?serial=X\n"
           "direct usb://Roland%20DG/SRM-20?serial=ZHA1234\n"

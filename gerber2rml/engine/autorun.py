@@ -46,7 +46,7 @@ from gerber2rml.engine.fiducial import (Transform, apply_to_toolpaths,
                                         fit_transform, residuals)
 from gerber2rml.engine.leadin import fast_approach
 from gerber2rml.engine.leveling import HeightMap, apply_leveling, probe_points
-from gerber2rml.engine.runner import JobRunner, RunStopped
+from gerber2rml.engine.runner import JobNotRun, JobRunner, RunStopped
 from gerber2rml.engine.spi_probe import ProbeError
 from gerber2rml.engine.select import clip_toolpaths_to_regions
 from gerber2rml.toolpath import Move
@@ -131,6 +131,68 @@ def cut_zone(paths, grow):
     if not parts:
         return None
     return unary_union(parts).buffer(grow, 8)
+
+
+TOUCH_CLEAR_MM = 2.0         # the height touch stays this far off any cut
+
+
+def connected_touch(stock, cuts, near, clear=TOUCH_CLEAR_MM, free=None,
+                    step=1.0):
+    """Where to touch a board that is already cut, for the copper's height:
+    ``((x, y), proven)``, or None when there is no spot at all.
+
+    The probe feels the copper through the clip, and the clip is on the
+    stock's edge. Copper the isolation has cut round is an island: the bit
+    comes down on it, nothing reads, and the head keeps going - into the
+    board (the lab mill, 2026-11-26, a board put back for rework). So the
+    ``stock`` (x0, y0, x1, y1) is taken with the ``cuts`` (a shape, the cut's
+    own width) milled out of it, and the spot is put on copper that still
+    runs to the stock's edge, ``clear`` mm from every cut and from the edge,
+    as near ``near`` - the usual spot - as there is one. ``free(x, y)`` says
+    no to a spot for any other reason (a clamp, the bracket).
+
+    ``proven`` is False when no copper that reaches the edge has room for
+    it: the spot is then on the biggest piece there is, a guess."""
+    from shapely.geometry import Point, box
+    from shapely.ops import unary_union
+    from shapely.prepared import prep
+    sheet = box(*stock)
+    copper = sheet if cuts is None or cuts.is_empty else sheet.difference(cuts)
+    parts = [g for g in getattr(copper, "geoms", [copper])
+             if g.geom_type == "Polygon" and not g.is_empty]
+    if not parts:
+        return None
+    edge = sheet.exterior
+    joined = [g for g in parts if g.distance(edge) < 1e-6]
+    free = free or (lambda _x, _y: True)
+
+    def spot(shape):
+        room = shape.buffer(-clear)
+        if room.is_empty:
+            return None
+        if room.covers(Point(near)) and free(*near):
+            return (float(near[0]), float(near[1]))
+        inside = prep(room)
+        x0, y0, x1, y1 = room.bounds
+        best = None
+        y = y0
+        while y <= y1 + 1e-9:
+            x = x0
+            while x <= x1 + 1e-9:
+                if inside.covers(Point(x, y)) and free(x, y):
+                    d = math.dist((x, y), near)
+                    if best is None or d < best[0]:
+                        best = (d, (round(x, 3), round(y, 3)))
+                x += step
+            y += step
+        return best[1] if best else None
+
+    if joined:
+        at = spot(unary_union(joined))
+        if at is not None:
+            return at, True
+    at = spot(max(parts, key=lambda g: g.area))
+    return None if at is None else (at, False)
 
 
 def level_targets(points, zones, reach=None):
@@ -413,7 +475,7 @@ class AutoRun:
                  runner_opts=None, level=True, surface_hint=None,
                  datum=None, check_cut=True, start_at=None, keepout=None,
                  arms=None, leave_under=False, nogo=None, level_margin=2.0,
-                 only=None, realign=False):
+                 only=None, realign=False, prior=None):
         self.ser, self.printer = ser, printer
         self.src, self.ev = source, events
         self.click, self.size = click_mm, stock_mm
@@ -466,6 +528,13 @@ class AutoRun:
         # drilled: find them and fit the job onto where they really are,
         # before anything is cut (:meth:`_realign`).
         self.realign = bool(realign)
+        # What the last run measured, for a board that has not moved since
+        # and is only looked at and cut again (Start at: Rework): ``{"pose":
+        # StockPose, "z_surf": mm, "level": (rows, nx, ny) or None}``. The
+        # board is then not touched at all - its copper is in islands now,
+        # and a touch on one reads nothing (connected_touch).
+        self.prior = prior
+        self.level_rows = None       # (rows, nx, ny) of the bottom's map
         self.pose = self.pose_top = None
         self.rotation = None
         self.fit = None
@@ -696,7 +765,11 @@ class AutoRun:
                 # turned here (t). Without it a double-sided board stopped
                 # at the bottom's check got the top's - the fit, then t.
                 self.src.holes_side = "top" if t is None else "bottom"
-                self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
+                try:
+                    self._job(HOLES_AGAIN, "Holes again", t, hmap, float(mm))
+                except JobNotRun as e:
+                    self.ev.note("%s. Check the mill is on and its lid "
+                                 "shut, then ask again." % str(e).capitalize())
                 continue
             if what != "again":
                 return
@@ -704,7 +777,16 @@ class AutoRun:
             self.ev.note("%s again%s, %.2f mm deeper…" % (
                 traces[1], " in %d boxes" % len(boxes) if boxes
                 else "", deeper))
-            self._job(traces[0], traces[1], t, hmap, deeper, boxes)
+            try:
+                self._job(traces[0], traces[1], t, hmap, deeper, boxes)
+            except JobNotRun as e:
+                # Not cut, so not deeper either: the next recut is asked
+                # for from the depth the board really has.
+                deeper -= float(mm)
+                self.ev.note("%s. The traces are as deep as before (%.2f mm "
+                             "deeper than the first pass). Check the mill is "
+                             "on and its lid shut, then ask for the recut "
+                             "again." % (str(e).capitalize(), deeper))
 
     def _step(self, key, state):
         self.ev.step(key, state)
@@ -720,8 +802,23 @@ class AutoRun:
         return out
 
     # -- stock ---------------------------------------------------------------
+    def _reuses(self):
+        """Is this run a rework on the last run's own measurements?"""
+        return (self.prior is not None and self.start_at == START_AT_CHECK
+                and self.datum is not None and not self.double
+                and self.only is None and not self.realign)
+
     def _find_stock(self, key, again=False):
         def go():
+            if not again and self._reuses():
+                pose = self.pose = self.prior["pose"]
+                self.ev.stock(pose)
+                self.ev.note("Rework on the last run's measurements: the "
+                             "copper is at Z %.2f mm as it was found then, "
+                             "and the board is not touched again. Changed "
+                             "the bit, or moved the board? Stop, and untick "
+                             "that under Start at." % pose.z)
+                return pose
             click = self.click
             if again:
                 # Flipped in place: the middle of the stock is still about
@@ -737,6 +834,8 @@ class AutoRun:
                 tx, ty = self._touch_off_holes(
                     *stockfind.datum_touch(self.datum[:2], self.datum[2],
                                            self.size), again)
+                if not again:
+                    tx, ty = self._touch_on_joined(tx, ty)
                 self._nogo_point(tx, ty, "the spot where the copper is "
                                          "touched to find its height")
                 self._hop(tx, ty)
@@ -856,6 +955,62 @@ class AutoRun:
         self.ev.note("The spot where the copper is touched is on one of the "
                      "board's holes, and there is no free spot near it.")
         return tx, ty
+
+    def _touch_on_joined(self, tx, ty):
+        """The height touch on a board that may be cut already - a run
+        started part-way, one step sent alone, a board lined up again -
+        moved onto copper the clip still reaches (:func:`connected_touch`).
+        A fresh sheet is touched where it always was."""
+        if (self.start_at is None and self.only is None
+                and not self.realign) or self.double:
+            return tx, ty
+        from shapely.ops import unary_union
+        try:
+            # _touch_off_holes has laid the board on the bracket's outline.
+            shapes = [cut_zone(self.src.toolpaths(key)[0], self.bit / 2.0)
+                      for key, _label in self.src.bottom_steps()]
+            shapes = [z for z in shapes if z is not None]
+            cuts = unary_union(shapes) if shapes else None
+        except Exception as e:               # noqa: BLE001 - not worth a run
+            self.ev.note("Could not work out where the board is cut (%s); "
+                         "touching the usual spot." % e)
+            return tx, ty
+        if cuts is None:
+            return tx, ty
+        x0, y0 = stockfind.datum_outline(self.datum[:2], self.datum[2],
+                                         self.size)
+        w, h = self.size
+
+        def free(x, y):
+            if self.nogo and self._in_nogo(x, y):
+                return False
+            if self.keepout is not None:
+                g = self.bit + 1.5
+                k = self.keepout
+                if k[0] - g < x < k[2] + g and k[1] - g < y < k[3] + g:
+                    return False
+            return True
+
+        found = connected_touch((x0, y0, x0 + w, y0 + h), cuts, (tx, ty),
+                                free=free)
+        if found is None:
+            raise RunFailed(
+                "the board is cut already, and there is no copper left on "
+                "the stock to touch for its height that is %.0f mm clear of "
+                "the cuts. Nothing was touched." % TOUCH_CLEAR_MM)
+        (x, y), proven = found
+        if not proven:
+            self.ev.note("The board is cut already, and no copper that runs "
+                         "to the stock's edge has room for the touch: "
+                         "touching the biggest piece, at X %.1f, Y %.1f. Put "
+                         "the clip on that piece, and keep a hand at STOP."
+                         % (x, y))
+        elif (x, y) != (tx, ty):
+            self.ev.note("The board is cut already: touching the copper at "
+                         "X %.1f, Y %.1f, where it still runs to the stock's "
+                         "edge and the clip, %.0f mm clear of the cuts."
+                         % (x, y, TOUCH_CLEAR_MM))
+        return x, y
 
     def _find_by_edges(self, click, again):
         # A sheet that is drilled already - the flipped side, or one put
@@ -1378,6 +1533,22 @@ class AutoRun:
 
     # -- the surface -----------------------------------------------------------
     def _level(self, key, side, t):
+        if side == "bottom" and self._reuses():
+            def again():
+                self.z_surf = self.prior["z_surf"]
+                level = self.prior.get("level")
+                if not level:
+                    self.ev.note("Z zero is the copper as the last run "
+                                 "found it; no surface map.")
+                    return None
+                rows, nx, ny = level
+                self.level_rows = level
+                self.ev.note("Using the surface map the last run probed "
+                             "(%d points)." % len(rows))
+                # In the bracket the stock is square to the bed (the turn
+                # is taken as 0), so the points are on their grid as touched.
+                return HeightMap.from_points(rows, nx, ny)
+            return self._guard(key, again)
         if not self.do_level:
             return self._guard(key, lambda: self._flat(side))
 
@@ -1540,6 +1711,8 @@ class AutoRun:
             self.z_surf = z0 / 1000.0
             self.ev.note("Surface probed: %.2f mm from flat." % spread)
             self.ev.level(side, rows, nx, ny)
+            if side == "bottom":
+                self.level_rows = (rows, nx, ny)
             if not t:
                 return HeightMap.from_points(rows, nx, ny)
             # Turned (a found angle, a realign fit): the touched points are

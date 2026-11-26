@@ -73,6 +73,11 @@ def test_run_it_all_cuts_a_single_sided_board_on_the_simulator(win, qt_app):
     assert win.level_page.height_map(side="bottom") is not None
     sent = sorted(p.name for p in page.run_dir.glob("*.nc"))
     assert len(sent) == 3 and (page.run_dir / "run.log").exists()
+    # Its first line says which version wrote it.
+    from gerber2rml import __version__
+    first = (page.run_dir / "run.log").read_text(
+        encoding="utf-8").splitlines()[0]
+    assert "SRM-CAM %s on " % __version__ in first
     # The design on the stage is turned with the stock, like the cuts.
     import math
     assert abs(math.degrees(win._stock_turn.theta) - 1.2) < 0.05

@@ -54,8 +54,10 @@ def _redirect_output():
     # anything; faulthandler still writes every thread's stack to the log.
     import datetime
     import faulthandler
-    f.write("\n=== SRM-CAM started %s ===\n"
-            % datetime.datetime.now().isoformat(timespec="seconds"))
+    from gerber2rml import __version__
+    f.write("\n=== SRM-CAM %s started %s ===\n"
+            % (__version__,
+               datetime.datetime.now().isoformat(timespec="seconds")))
     faulthandler.enable(file=f, all_threads=True)
     return path
 

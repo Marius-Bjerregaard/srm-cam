@@ -70,6 +70,7 @@ def test_old_jobs_kept_stop_the_run(answers):
     assert not p.purged
 
 
-def test_old_jobs_that_will_not_clear_stop_the_run(answers):
+def test_old_jobs_that_will_not_clear_stop_the_run(answers, monkeypatch):
+    monkeypatch.setattr(rmlspool, "CLEAR_WAIT_S", 0.0)
     assert macmill.preflight(None, Printer(jobs=1, purge_ok=False)) is False
     assert answers["errors"]

@@ -27,6 +27,17 @@ class RunStopped(RuntimeError):
     """The run was stopped - by the operator, or by the machine."""
 
 
+class JobNotRun(RunStopped):
+    """The job left the print queue and the mill never moved: it was not
+    run, and nothing was cut by it.
+
+    This used to count as finished - "the mill stopped at ..., not at the
+    program's end" - and the run went on. On the lab mill, 2026-11-26, a
+    second recut of the traces went that way: the board was not cut, the
+    run said it had been, and the next recut would have been asked for on
+    top of a depth that was never there."""
+
+
 def program_end(rml_text):
     """The last commanded (x, y) of an RML program, in RML units (0.01 mm),
     or None."""
@@ -43,6 +54,19 @@ def program_end(rml_text):
         except ValueError:
             continue
     return last
+
+
+def status_words(st):
+    """What the mill says of itself, for a message: "paused, lid open
+    (status 0x00020020)" - or "nothing unusual (status 0x...)"."""
+    if not st:
+        return "no status read"
+    said = [text for key, text in (("paused", "paused"), ("cover", "lid open"),
+                                   ("error", "error"), ("fatal", "fatal error"),
+                                   ("cmderr", "last command refused"))
+            if st.get(key)]
+    return "%s (status 0x%08X)" % (", ".join(said) or "nothing unusual",
+                                   st.get("system", 0) & 0xFFFFFFFF)
 
 
 class JobRunner:
@@ -93,12 +117,19 @@ class JobRunner:
     # No status and no position for this long: the link is gone, and a job
     # nobody can see is not one that is "done".
     BLIND_S = 30.0
+    # A job that ends away from its program's end without the head ever
+    # having been this far from where it started was not run (JobNotRun).
+    NOT_RUN_MM = 3.0
+    # Paused by itself for this long before the run tells it to carry on.
+    HELD_S = 3.0
 
     def _watch(self, name, end_mm, timeout_s, progress):
         t0 = time.monotonic()
         still_since = None
         paused = False
         last_pos, settled_since = None, time.monotonic()
+        first_pos, moved = None, False      # did the mill ever start?
+        held_since, resumed = None, False   # paused, and not by this run
         stalled_since, stall_told = None, False
         blind_since = None
         while True:
@@ -122,6 +153,22 @@ class JobRunner:
                                  "Cancel there to clear it. Without VPanel, "
                                  "Machine ▸ The mill's settings… reads and "
                                  "sets the command set")
+            # Paused, and this run did not ask for it: what the mill does by
+            # itself after its lid was opened, and where VPanel would show
+            # Continue. A paused mill takes no data - the job sits in the
+            # print queue and is never cut (a second recut after a look at
+            # the board, twice in the lab, on a Mac and on Windows). With
+            # the lid shut again the run presses Continue, once.
+            if st.get("paused") and not paused and not st.get("cover"):
+                held_since = held_since or time.monotonic()
+                if (not resumed
+                        and time.monotonic() - held_since >= self.HELD_S):
+                    resumed = True
+                    self.note("%s: the mill is paused, as after its lid was "
+                              "opened - telling it to carry on." % name)
+                    spi_probe.resume_job(self.ser)
+            else:
+                held_since = None
             pos = spi_probe.query_position(self.ser)
             if progress is not None and pos:
                 progress(pos)
@@ -140,6 +187,13 @@ class JobRunner:
             else:
                 blind_since = None
             moving = bool(st.get("moving"))
+            if pos is not None:
+                # Away from where it stood by more than NOT_RUN_MM. Not the
+                # "moving" bit, and not any movement at all: that day the
+                # head went from the run's view position (Y 150) to the
+                # mill's own (Y 152.4) by itself while the job was lost.
+                first_pos = first_pos or pos[:3]
+                moved = moved or math.dist(pos[:3], first_pos) > self.NOT_RUN_MM
             queued = self.printer.pending()
             if queued and not moving and not paused:
                 stalled_since = stalled_since or time.monotonic()
@@ -149,8 +203,9 @@ class JobRunner:
                     self.note(
                         "%s: the job has waited in the print queue for %d s "
                         "and the mill has not moved. Is it switched on, its "
-                        "USB cable in, and the queue not paused?"
-                        % (name, self.stall_s))
+                        "USB cable in, and the queue not paused? The mill "
+                        "reports: %s."
+                        % (name, self.stall_s, status_words(st)))
             else:
                 stalled_since = None
             at_end = (end_mm is None or pos is None or
@@ -167,6 +222,17 @@ class JobRunner:
                 settled_since = time.monotonic()
                 last_pos = pos[:3] if pos else last_pos
             elif time.monotonic() - settled_since >= self.settled_s:
+                if not moved:
+                    # Nothing to stop: the queue is empty and the mill is
+                    # standing where it stood. Purged all the same, in case
+                    # the job is only late.
+                    self.stop()
+                    raise JobNotRun(
+                        "the mill did not run %s: the job left the print "
+                        "queue and the head never moved (it stands at X "
+                        "%.2f, Y %.2f, Z %.2f; the mill reports: %s). "
+                        "Nothing was cut by it"
+                        % ((name,) + tuple(pos[:3]) + (status_words(st),)))
                 self.note(
                     "%s: the mill stopped at X %.2f, Y %.2f, Z %.2f, not at the "
                     "program's end (X %.2f, Y %.2f). Check the job finished."

@@ -826,6 +826,21 @@ class AutoRunPage(inspector.Page):
             "photo of the board, laid on the bed, shows where they are. "
             "The run stops at the check with these boxes ready.")
         rl.addWidget(self.rework_hint)
+        # The last run's own measurements, for a board that has not moved:
+        # shown only when there are some for this board (_sync_rework_tools).
+        self._prior = None
+        self.reuse_chk = QCheckBox(
+            "Use the heights the last run measured (same bit, board not "
+            "moved)")
+        self.reuse_chk.setChecked(True)
+        self.reuse_chk.setToolTip(
+            "The board is not touched again: the copper's height and the "
+            "surface map are the last run's. A board that is cut has copper "
+            "in islands the probe cannot feel. Untick after changing the "
+            "bit or moving the board; it is then touched where the copper "
+            "still runs to the stock's edge.")
+        self.reuse_chk.setVisible(False)
+        rl.addWidget(self.reuse_chk)
         self.photo_phone_btn = widgets.button(
             "Photo from the phone…",
             on=lambda: self.ctl.action_phone_photo(),
@@ -1588,6 +1603,7 @@ class AutoRunPage(inspector.Page):
         run's that waited while the mill was off - would cut before this
         run's frame check, at whatever origin is set. The Mac has always
         asked (macmill.preflight); Windows sent behind them. True to go on."""
+        from PySide6.QtWidgets import QApplication
         from gerber2rml.engine import rmlspool
         from gerber2rml.gui2 import dialogs
         try:
@@ -1609,16 +1625,25 @@ class AutoRunPage(inspector.Page):
         d.act("Clear them", kind="primary", on=d.accept, default=True)
         if not d.exec():
             return False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            ok = printer.purge()
+            # Waits for a job that is on its way out: one a stopped run was
+            # still sending shows as "Deleting" for a few seconds.
+            ok = rmlspool.clear_queue(printer)
         except rmlspool.SpoolError as e:
             ok, why = False, e
         else:
             why = rmlspool.SpoolError("jobs still queued")
+        finally:
+            QApplication.restoreOverrideCursor()
         if not ok:
             dialogs.report_error(self.window(), "The old jobs could not be "
                                  "cleared", why,
-                                 "Someone else's jobs need an administrator "
+                                 "A job that was being sent when a run was "
+                                 "stopped can hang until the mill lets go of "
+                                 "it: switch the mill off and on, then start "
+                                 "again. Someone else's jobs need an "
+                                 "administrator "
                                  "to remove: open the SRM-20 in Windows' "
                                  "Printers & scanners, then Open print queue, "
                                  "and cancel them there.")
@@ -2030,6 +2055,16 @@ class AutoRunPage(inspector.Page):
         except ValueError:
             hint = None
 
+        # A rework on what the last run measured: the same board, in the
+        # same bracket, the same size typed, the same bit - and not unticked.
+        board = ctl.state.board
+        kept = self._prior
+        prior = None
+        if (kept is not None and start_at == ar.START_AT_CHECK
+                and self.reuse_chk.isChecked() and kept["board"] is board
+                and kept["key"] == (datum, tuple(size), bit, port)):
+            prior = kept
+
         def work():
             from gerber2rml.engine import spi_probe
             ser = None
@@ -2052,10 +2087,17 @@ class AutoRunPage(inspector.Page):
                                  check_cut=check_cut,
                                  start_at=start_at, nogo=nogo,
                                  level_margin=level_margin,
-                                 only=only_keys, realign=realign)
+                                 only=only_keys, realign=realign,
+                                 prior=prior)
                 try:
                     ok = run.run()
                 finally:
+                    if (run.pose is not None and run.z_surf is not None
+                            and datum is not None and not ctl._double):
+                        self._prior = {
+                            "pose": run.pose, "z_surf": run.z_surf,
+                            "level": run.level_rows, "board": board,
+                            "key": (datum, tuple(size), bit, port)}
                     if run.pose is not None:
                         # The bed does not move: next time, drop straight
                         # to just above this instead of feeling down from
@@ -2109,6 +2151,12 @@ class AutoRunPage(inspector.Page):
             self.run_dir = None
         self._jobs_sent = 0
         self.made_btns["files"].setEnabled(self.run_dir is not None)
+        # First line of every run.log: a log sent in from another computer
+        # did not say which version had written it (2026-11-26).
+        import platform
+        from gerber2rml import __version__
+        self._log("SRM-CAM %s on %s %s" % (__version__, platform.system(),
+                                           platform.release()))
 
     def _log(self, text):
         if getattr(self, "run_dir", None) is None:
@@ -2519,9 +2567,13 @@ class AutoRunPage(inspector.Page):
     def _sync_rework_tools(self, *_):
         """The boxes and the photo buttons: there while the run waits at
         the check, and beforehand when the run is to start at Rework."""
+        at_rework = self.start_box.currentData() == ar.START_AT_CHECK
         self.rework_tools.setVisible(
-            not self.check_box.isHidden()
-            or self.start_box.currentData() == ar.START_AT_CHECK)
+            not self.check_box.isHidden() or at_rework)
+        self.reuse_chk.setVisible(
+            at_rework and self.check_box.isHidden()
+            and self._prior is not None
+            and self._prior["board"] is self.ctl.state.board)
 
     def _answer(self, what, mm, boxes=None):
         self._clock_wait(False)
